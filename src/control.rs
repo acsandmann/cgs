@@ -209,7 +209,7 @@ native_control!(Checkbox, NSButton, ns_button);
 pub(crate) fn header_menu_style(button: &NSPopUpButton) {
     button.setControlSize(NSControlSize::Regular);
     button.setBezelStyle(action_button_bezel());
-    button.setFont(Some(&crate::Font::section_title()));
+    button.setFont(Some(&crate::Font::body()));
     if let Some(menu) = button.menu() {
         unsafe {
             menu.setFont(Some(&crate::Font::body()));
@@ -235,6 +235,22 @@ impl Popup {
         let header = crate::MenuItem::new(ui, "");
         header.ns_menu_item().setImage(crate::Symbol::named("ellipsis").as_deref());
         menu.ns_menu().insertItem_atIndex(header.ns_menu_item(), 0);
+        let mut popup = Self::new(ui);
+        popup.native.setPullsDown(true);
+        if let Some(cell) =
+            popup.native.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok())
+        {
+            cell.setArrowPosition(NSPopUpArrowPosition::NoArrow);
+        }
+        popup.native.setMenu(Some(menu.ns_menu()));
+        popup.native.setControlSize(NSControlSize::Small);
+        popup.accessibility_label(label);
+        popup.menu = Some(menu);
+        popup
+    }
+
+    /// Native pull-down menu for toolbar filters that have no placeholder row.
+    pub fn toolbar_menu(ui: &Ui, label: &str, menu: crate::Menu) -> Self {
         let mut popup = Self::new(ui);
         popup.native.setPullsDown(true);
         if let Some(cell) =

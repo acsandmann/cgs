@@ -233,13 +233,9 @@ pub struct HeaderControls {
 }
 impl HeaderControls {
     pub fn new(ui: &Ui, label: &str, symbol: &str, menu: Menu, search: SearchField) -> Self {
-        let menu = Popup::actions(ui, label, menu).toolbar_style();
+        let menu = Popup::toolbar_menu(ui, label, menu).toolbar_style();
         let button = menu.ns_popup_button();
         let image = Symbol::header(symbol);
-        if let Some(header) = button.menu().and_then(|menu| menu.itemAtIndex(0)) {
-            header.setImage(image.as_deref());
-            header.setHidden(true);
-        }
         button.setImage(image.as_deref());
         button.setImagePosition(NSCellImagePosition::ImageOnly);
         button.setBordered(false);
