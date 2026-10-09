@@ -28,10 +28,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # The version check only needs the commit immediately before this push.
+          fetch-depth: 2
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-stable
+          add-job-id-key: false
 
       - name: Check whether version changed
         id: version
@@ -136,6 +143,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-stable
+          add-job-id-key: false
 
       - name: Verify release version
         env:
