@@ -238,8 +238,13 @@ impl HeaderControls {
         let image = Symbol::header(symbol);
         button.setImage(image.as_deref());
         button.setImagePosition(NSCellImagePosition::ImageOnly);
-        if let Some(cell) = button.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok()) {
+        let display = MenuItem::new(ui, "");
+        display.ns_menu_item().setImage(image.as_deref());
+        if let Some(cell) = button.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok())
+        {
             cell.setUsesItemFromMenu(false);
+            cell.setMenuItem(Some(display.ns_menu_item()));
+            cell.setAltersStateOfSelectedItem(false);
         }
         button.setBordered(false);
         menu.width(36.0);

@@ -92,7 +92,7 @@ jobs:
 
       - name: Verify package
         if: steps.version.outputs.changed == 'true'
-        run: cargo publish --package cgs --dry-run
+        run: cargo publish --package cgs --dry-run --allow-dirty
 
       - name: Create tag and GitHub release
         if: steps.version.outputs.changed == 'true'
@@ -192,4 +192,4 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --package cgs
+        run: cargo publish --package cgs --allow-dirty
