@@ -238,6 +238,9 @@ impl HeaderControls {
         let image = Symbol::header(symbol);
         button.setImage(image.as_deref());
         button.setImagePosition(NSCellImagePosition::ImageOnly);
+        if let Some(cell) = button.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok()) {
+            cell.setUsesItemFromMenu(false);
+        }
         button.setBordered(false);
         menu.width(36.0);
         menu.height(36.0);
