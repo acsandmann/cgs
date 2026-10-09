@@ -1,8 +1,8 @@
 [package]
 name = "cgs"
-version = "0.1.6"
-description = "a ui library for macos"
-license = "Apache-2.0"
+version = "0.1.7"
+description = "a ui library for macos built on appkit"
+license = "GPL-3.0"
 edition = "2024"
 
 [dependencies]
