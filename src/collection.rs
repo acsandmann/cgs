@@ -491,6 +491,18 @@ impl<T: 'static> Table<T> {
 
     pub fn selection(&self) -> Option<usize> { usize::try_from(self.native.selectedRow()).ok() }
 
+    /// A copy of the row at `index`, as last set.
+    pub fn row(&self, index: usize) -> Option<T>
+    where T: Clone {
+        self.rows.borrow().get(index).cloned()
+    }
+
+    /// A copy of the selected row.
+    pub fn selected_row(&self) -> Option<T>
+    where T: Clone {
+        self.row(self.selection()?)
+    }
+
     /// Headerless source-list styling for navigation and search results.
     pub fn source_list(self) -> Self {
         self.native.setHeaderView(None);
@@ -1144,6 +1156,19 @@ impl<T: 'static> SettingsList<T> {
 
     pub fn on_select(self, f: impl FnMut(Option<usize>) + 'static) -> Self {
         self.table.set_on_select(f);
+        self
+    }
+
+    /// A copy of a displayed row, without repeating its source's filtering.
+    pub fn row(&self, index: usize) -> Option<T>
+    where T: Clone {
+        self.table.row(index)
+    }
+
+    pub fn on_select_item(self, mut f: impl FnMut(Option<T>) + 'static) -> Self
+    where T: Clone {
+        let rows = self.table.rows.clone();
+        self.table.set_on_select(move |index| f(index.and_then(|i| rows.borrow().get(i).cloned())));
         self
     }
 

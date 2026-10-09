@@ -3,7 +3,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{
     NSApplication, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSWorkspace,
 };
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSString, NSURL};
 
 use crate::Ui;
 
@@ -30,6 +30,29 @@ impl Application {
         let url =
             workspace.URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))?;
         Some(workspace.iconForFile(&*url.path()?))
+    }
+
+    /// Open a URL (`https://…`) or file path with its default application.
+    pub fn open(target: &str) -> bool {
+        let Some(url) = Self::url(target) else {
+            return false;
+        };
+        NSWorkspace::sharedWorkspace().openURL(&url)
+    }
+
+    /// Select a file in a Finder window.
+    pub fn reveal(path: &str) {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        NSWorkspace::sharedWorkspace()
+            .activateFileViewerSelectingURLs(&NSArray::from_retained_slice(&[url]));
+    }
+
+    fn url(target: &str) -> Option<Retained<NSURL>> {
+        if target.contains("://") {
+            NSURL::URLWithString(&NSString::from_str(target))
+        } else {
+            Some(NSURL::fileURLWithPath(&NSString::from_str(target)))
+        }
     }
 
     /// Whether the event being handled is part of a left-button press or drag.

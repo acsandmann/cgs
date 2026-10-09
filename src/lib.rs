@@ -34,6 +34,11 @@ pub use text::*;
 pub use view::*;
 pub use window::*;
 
+/// Equal insets on every edge.
+pub const fn uniform_insets(value: f64) -> Insets {
+    Insets { top: value, left: value, bottom: value, right: value }
+}
+
 #[derive(Clone, Copy)]
 pub struct Ui {
     mtm: MainThreadMarker,
