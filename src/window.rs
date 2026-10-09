@@ -1,11 +1,11 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use block2::RcBlock;
 use objc2::rc::{Retained, Weak};
 use objc2::runtime::ProtocolObject;
-use objc2::{MainThreadOnly, Message, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{NSRectEdge, NSString, NSURL};
 
@@ -17,9 +17,20 @@ define_class!(
     #[unsafe(super(NSWindow))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsWindow"]
-    #[ivars = ()]
+    #[ivars = Cell<bool>]
     struct NativeWindow;
     impl NativeWindow {
+        #[unsafe(method(close))]
+        fn close_native(&self) {
+            if !self.ivars().replace(true) {
+                unsafe { let _: () = msg_send![super(self), close]; }
+            }
+        }
+        #[unsafe(method(orderWindow:relativeTo:))]
+        fn order(&self, mode: NSWindowOrderingMode, relative: isize) {
+            if mode != NSWindowOrderingMode::Out { self.ivars().set(false); }
+            unsafe { let _: () = msg_send![super(self), orderWindow: mode, relativeTo: relative]; }
+        }
         #[unsafe(method(cgsGoBack:))]
         fn go_back(&self, _sender: Option<&objc2::runtime::AnyObject>) {
             if let Some(item) = self.back_item() {
@@ -52,12 +63,12 @@ pub struct Window {
     native: Retained<NSWindow>,
     content: RefCell<Option<Box<dyn NativeView>>>,
     delegate: Option<Retained<DelegateBridge>>,
-    toolbar: Option<Rc<crate::Toolbar>>,
+    toolbar: OnceCell<Rc<crate::Toolbar>>,
 }
 impl Window {
     pub fn new(ui: &Ui) -> Self {
         let native: Retained<NativeWindow> = unsafe {
-            msg_send![super(NativeWindow::alloc(ui.mtm()).set_ivars(())),
+            msg_send![super(NativeWindow::alloc(ui.mtm()).set_ivars(Cell::new(false))),
                 initWithContentRect: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(800.0, 600.0)),
                 styleMask: NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable,
                 backing: NSBackingStoreType::Buffered,
@@ -72,7 +83,7 @@ impl Window {
             native,
             content: RefCell::new(None),
             delegate: None,
-            toolbar: None,
+            toolbar: OnceCell::new(),
         }
     }
 
@@ -105,7 +116,7 @@ impl Window {
             self.native.setContentViewController(None);
             self.native.setContentView(Some(content.ns_view()));
         }
-        if let Some(toolbar) = &self.toolbar {
+        if let Some(toolbar) = self.toolbar.get() {
             toolbar.attach(&self.native);
         }
         *self.content.borrow_mut() = Some(Box::new(content));
@@ -151,7 +162,11 @@ impl Window {
 impl Drop for Window {
     fn drop(&mut self) {
         self.native.setDelegate(None);
-        self.native.orderOut(None);
+        // End presentation before releasing Rust content; delegates cannot call back into it.
+        if let Some(parent) = self.native.sheetParent() {
+            parent.endSheet(&self.native);
+        }
+        self.native.close();
         self.native.setToolbar(None);
         self.native.setContentViewController(None);
         self.native.setContentView(None);
@@ -185,7 +200,7 @@ pub enum Appearance {
 pub struct SettingsWindow(Window);
 impl SettingsWindow {
     pub fn new(ui: &Ui, title: &str) -> Self {
-        let mut window = Window::new(ui)
+        let window = Window::new(ui)
             .title(title)
             .min_size(CGSize::new(
                 crate::Metrics::SIDEBAR_MIN_WIDTH + crate::Metrics::DETAIL_MIN_WIDTH,
@@ -198,9 +213,6 @@ impl SettingsWindow {
         window
             .native
             .setStyleMask(window.native.styleMask() | NSWindowStyleMask::FullSizeContentView);
-        let toolbar = crate::Toolbar::navigation(ui, "cgs.settings");
-        toolbar.attach(&window.native);
-        window.toolbar = Some(Rc::new(toolbar));
         Self(window)
     }
 
@@ -215,21 +227,37 @@ impl SettingsWindow {
         self.0.native.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         let toolbar = crate::Toolbar::navigation_title(ui, "cgs.settings.pages", Some(title));
         toolbar.attach(&self.0.native);
-        self.0.toolbar = Some(Rc::new(toolbar));
+        self.0.toolbar.take();
+        self.0.toolbar.set(Rc::new(toolbar)).ok();
         self
     }
 
-    pub fn toolbar(&self) -> &Rc<crate::Toolbar> { self.0.toolbar.as_ref().unwrap() }
+    pub fn toolbar(&self) -> &Rc<crate::Toolbar> {
+        self.0.toolbar.get_or_init(|| {
+            let toolbar = Rc::new(crate::Toolbar::navigation(
+                &Ui::new(self.0.native.mtm()),
+                "cgs.settings",
+            ));
+            toolbar.attach(&self.0.native);
+            toolbar
+        })
+    }
 
     pub fn content(self, content: impl NativeView) -> Self { Self(self.0.content(content)) }
 
-    pub fn show(&self) { self.0.show(); }
+    pub fn show(&self) {
+        self.toolbar();
+        self.0.show();
+    }
 
     pub fn hide(&self) { self.0.hide(); }
 
     pub fn close(&self) { self.0.close(); }
 
-    pub fn ns_window(&self) -> &NSWindow { self.0.ns_window() }
+    pub fn ns_window(&self) -> &NSWindow {
+        self.toolbar();
+        self.0.ns_window()
+    }
 
     pub fn on_close(self, f: impl FnMut() + 'static) -> Self { Self(self.0.on_close(f)) }
 
@@ -255,14 +283,12 @@ impl SettingsWindow {
 }
 pub struct Sheet {
     window: Window,
-    parent: RefCell<Weak<NSWindow>>,
     monitor: RefCell<Option<Retained<objc2::runtime::AnyObject>>>,
 }
 impl Sheet {
     pub fn new(ui: &Ui, title: &str, content: impl NativeView) -> Self {
         Self {
             window: Window::new(ui).title(title).content(content),
-            parent: RefCell::new(Weak::default()),
             monitor: RefCell::new(None),
         }
     }
@@ -280,7 +306,9 @@ impl Sheet {
         let Some(parent) = parent.0.load() else {
             return false;
         };
-        *self.parent.borrow_mut() = Weak::new(&parent);
+        if self.window.ns_window().sheetParent().is_some() {
+            return false;
+        }
         parent.beginSheet_completionHandler(self.window.ns_window(), None);
         self.install_dismissal_monitor();
         true
@@ -361,9 +389,10 @@ impl Sheet {
 
     pub fn end(&self) {
         self.remove_dismissal_monitor();
-        if let Some(parent) = self.parent.borrow().load() {
+        if let Some(parent) = self.window.ns_window().sheetParent() {
             parent.endSheet(self.window.ns_window());
         }
+        self.window.hide();
     }
 
     pub fn ns_window(&self) -> &NSWindow { self.window.ns_window() }
@@ -477,6 +506,7 @@ impl Drop for Popover {
     fn drop(&mut self) {
         self.native.setDelegate(None);
         self.native.close();
+        self.native.setContentViewController(None);
     }
 }
 pub struct HelpPopover(Popover);

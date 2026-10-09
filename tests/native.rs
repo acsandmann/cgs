@@ -664,6 +664,497 @@ fn cached_pages_keep_their_mount_and_release_on_clear(ui: &Ui) {
     assert!(host.ns_view().subviews().is_empty());
 }
 
+fn released_components_detach_borrowed_native_content(ui: &Ui) {
+    autoreleasepool(|_| {
+        let host = PageHost::new(ui);
+        // A legitimate native owner must not keep pages attached after the Rust host dies.
+        let native = host.ns_view().retain();
+        let controller = host.ns_view_controller().retain();
+        let first = Rc::new(ViewController::new(ui, Label::new(ui, "Cached")));
+        let child = Weak::new(first.ns_view_controller());
+        host.set_cached_page(first);
+        host.set_page(Label::new(ui, "Current"));
+        drop(host);
+        assert!(
+            native.subviews().is_empty(),
+            "host drop must unmount all pages"
+        );
+        assert!(controller.childViewControllers().is_empty());
+        assert!(
+            child
+                .load()
+                .is_none_or(|child| child.parentViewController().is_none())
+        );
+    });
+}
+
+fn replaced_footer_releases_native_content(ui: &Ui) {
+    autoreleasepool(|_| {
+        let (page, weak) = autoreleasepool(|_| {
+            let old = Label::new(ui, "Old footer");
+            let weak = Weak::new(old.ns_view());
+            (
+                SettingsPage::new(ui, "Footer")
+                    .bottom_bar(old)
+                    .bottom_bar(Label::new(ui, "New footer")),
+                weak,
+            )
+        });
+        assert!(
+            weak.load().is_none(),
+            "replacing a footer must release the old view"
+        );
+        drop(page);
+    });
+}
+
+fn replaced_status_releases_native_content(ui: &Ui) {
+    autoreleasepool(|_| {
+        let (status, weak) = autoreleasepool(|_| {
+            let old = Label::new(ui, "Old status");
+            let weak = Weak::new(old.ns_view());
+            (
+                StatusItem::new(ui)
+                    .content(old)
+                    .content(Label::new(ui, "New status")),
+                weak,
+            )
+        });
+        assert!(
+            weak.load().is_none(),
+            "replacing status content must release the old view"
+        );
+        drop(status);
+    });
+}
+
+fn toolbar_releases_disabled_actions_and_preserves_unchanged_controls(ui: &Ui) {
+    let window = SettingsWindow::new(ui, "Toolbar lifecycle");
+    let toolbar = window.toolbar();
+    let captured = Rc::new(());
+    let copy = captured.clone();
+    toolbar.set_back(Some((
+        "Back",
+        Box::new(move || {
+            let _ = &copy;
+        }),
+    )));
+    toolbar.set_back(None);
+    assert_eq!(
+        Rc::strong_count(&captured),
+        1,
+        "disabled action must release its captures"
+    );
+    let weak_toolbar = Rc::downgrade(toolbar);
+    let copy = captured.clone();
+    toolbar.set_back(Some((
+        "Back",
+        Box::new(move || {
+            let _ = &copy;
+            weak_toolbar.upgrade().unwrap().set_back(None);
+        }),
+    )));
+    let item = toolbar
+        .ns_toolbar()
+        .items()
+        .iter()
+        .find(|item| item.itemIdentifier().to_string() == "cgs.back")
+        .unwrap();
+    let target = item.target().unwrap();
+    unsafe {
+        let _: () = msg_send![&*target, invoke: &*item];
+    }
+    assert_eq!(
+        Rc::strong_count(&captured),
+        1,
+        "an action can clear itself during dispatch"
+    );
+    let controls = HeaderControls::new(
+        ui,
+        "Filter",
+        "line.3.horizontal.decrease",
+        Menu::new(ui).item(MenuItem::new(ui, "All")),
+        SearchField::new(ui),
+    );
+    toolbar.set_page_controls(ui, Some(&controls));
+    let items = toolbar.ns_toolbar().items();
+    toolbar.set_page_controls(ui, Some(&controls));
+    assert_eq!(items.len(), toolbar.ns_toolbar().items().len());
+    for (old, new) in items.iter().zip(toolbar.ns_toolbar().items()) {
+        assert!(
+            std::ptr::eq(&*old, &*new),
+            "unchanged controls must reuse toolbar items"
+        );
+    }
+    let old = autoreleasepool(|_| {
+        toolbar.set_navigation(ui, || {}, || {}, Rc::new(Menu::new(ui)));
+        let group = toolbar
+            .ns_toolbar()
+            .items()
+            .iter()
+            .find(|item| item.itemIdentifier().to_string() == "cgs.history")
+            .unwrap();
+        let weak = Weak::new(&*group);
+        toolbar.set_navigation(ui, || {}, || {}, Rc::new(Menu::new(ui)));
+        weak
+    });
+    assert!(
+        old.load().is_none(),
+        "reconfiguring history must release its previous group"
+    );
+    assert_eq!(
+        toolbar
+            .ns_toolbar()
+            .items()
+            .iter()
+            .filter(|item| item.itemIdentifier().to_string() == "cgs.history")
+            .count(),
+        1
+    );
+    assert!(
+        toolbar
+            .ns_toolbar()
+            .items()
+            .iter()
+            .any(|item| item.itemIdentifier().to_string() == "cgs.page-search")
+    );
+}
+
+fn window_close_is_idempotent_and_drop_does_not_dispatch(ui: &Ui) {
+    let calls = Rc::new(Cell::new(0));
+    let copy = calls.clone();
+    let window = Window::new(ui).on_close(move || copy.set(copy.get() + 1));
+    window.show();
+    window.ns_window().close();
+    window.close();
+    assert_eq!(calls.get(), 1);
+    window.show();
+    window.close();
+    assert_eq!(calls.get(), 2, "a reopened window must close normally");
+    drop(window);
+    assert_eq!(
+        calls.get(),
+        2,
+        "destruction must detach callbacks before closing"
+    );
+    let copy = calls.clone();
+    let window = Window::new(ui).on_close(move || copy.set(copy.get() + 1));
+    window.show();
+    drop(window);
+    assert_eq!(calls.get(), 2);
+}
+
+// Probe the public native boundary without extending any object's lifetime.
+fn probe(
+    probes: &mut Vec<(&'static str, Weak<AnyObject>)>,
+    name: &'static str,
+    object: &AnyObject,
+) {
+    probes.push((name, Weak::new(object)));
+}
+
+fn settle() {
+    autoreleasepool(|_| {
+        objc2_foundation::NSRunLoop::currentRunLoop().runUntilDate(
+            &objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.15),
+        );
+    });
+}
+
+fn settings_lifecycle(
+    ui: &Ui,
+    explicit_close: bool,
+    open: impl FnOnce(),
+) -> Vec<(&'static str, Weak<AnyObject>)> {
+    autoreleasepool(|_| {
+        let mut probes = Vec::new();
+        let host = Rc::new(PageHost::new(ui));
+        probe(&mut probes, "page host", host.ns_view());
+        probe(&mut probes, "host controller", host.ns_view_controller());
+        let sidebar = Sidebar::new(
+            ui,
+            (0..3)
+                .map(|id| SidebarItem {
+                    id,
+                    title: format!("Page {id}"),
+                    symbol: "gearshape".into(),
+                })
+                .collect(),
+        );
+        probe(&mut probes, "sidebar", sidebar.ns_view());
+        let window = SettingsWindow::new(ui, "cgs lifecycle")
+            .page_title(ui, Rc::new(Label::new(ui, "General")))
+            .content(NavigationSplitView::new(ui, sidebar, host.clone()))
+            .on_close(|| {});
+        probe(&mut probes, "window", window.ns_window());
+        probe(
+            &mut probes,
+            "window delegate",
+            (&*window.ns_window().delegate().unwrap()).as_ref(),
+        );
+        let toolbar = window.toolbar();
+        probe(&mut probes, "toolbar", toolbar.ns_toolbar());
+        probe(
+            &mut probes,
+            "toolbar delegate",
+            (&*toolbar.ns_toolbar().delegate().unwrap()).as_ref(),
+        );
+        let pages: Vec<Rc<dyn NativeView>> = (0..3)
+            .map(|id| {
+                let field = TextField::new(ui).on_change(|_| {});
+                probe(&mut probes, "text field", field.ns_view());
+                probe(
+                    &mut probes,
+                    "field delegate",
+                    (&*field.ns_text_field().delegate().unwrap()).as_ref(),
+                );
+                let switch = Switch::new(ui).on_change(|_| {});
+                probe(&mut probes, "switch", switch.ns_view());
+                probe(
+                    &mut probes,
+                    "action target",
+                    &*switch.ns_switch().target().unwrap(),
+                );
+                let popup = Popup::new(ui).items(["One", "Two"]).on_change(|_| {});
+                probe(&mut probes, "popup", popup.ns_view());
+                let list =
+                    SettingsList::new(ui, |v: &usize| format!("Item {v}"), |_| "Summary".into())
+                        .navigation()
+                        .fit_content(160.0)
+                        .on_open(|_| {});
+                list.set_rows((0..100).collect());
+                probe(&mut probes, "table", list.ns_table_view());
+                probe(
+                    &mut probes,
+                    "collection delegate",
+                    (&*unsafe { list.ns_table_view().delegate() }.unwrap()).as_ref(),
+                );
+                let info = InfoButton::new(ui, "Option", "Details");
+                probe(&mut probes, "info button", info.ns_view());
+                let glass = GlassEffectView::new(ui, Label::new(ui, "Glass"));
+                probe(&mut probes, "glass content", glass.ns_view());
+                let page = ViewController::new(
+                    ui,
+                    SettingsPage::new(ui, &format!("Page {id}"))
+                        .section(
+                            Section::new(ui, "Options")
+                                .row(SettingsRow::new(ui, "Name", field))
+                                .row(SwitchRow::new(ui, "Enabled", switch))
+                                .row(SettingsRow::new(ui, "Mode", popup))
+                                .row(SettingsRow::new(ui, "Help", info)),
+                        )
+                        .section(list)
+                        .section(glass),
+                );
+                probe(&mut probes, "page controller", page.ns_view_controller());
+                Rc::new(page) as Rc<dyn NativeView>
+            })
+            .collect();
+        window.show();
+        for page in &pages {
+            host.set_cached_page(page.clone());
+            let search = SearchField::new(ui).placeholder("Search").on_change(|_| {});
+            probe(&mut probes, "search field", search.ns_view());
+            let controls = HeaderControls::new(
+                ui,
+                "Filter",
+                "line.3.horizontal.decrease",
+                Menu::new(ui).item(MenuItem::new(ui, "All").on_click(|| {})),
+                search,
+            );
+            toolbar.set_page_controls(ui, Some(&controls));
+            window
+                .ns_window()
+                .contentView()
+                .unwrap()
+                .layoutSubtreeIfNeeded();
+            for item in toolbar.ns_toolbar().items() {
+                probe(&mut probes, "toolbar item", &item);
+            }
+            // Replace controls while the previous native items still have weak probes.
+            toolbar.set_page_controls(ui, None);
+        }
+        let sheet = Sheet::new(ui, "Editor", TextField::new(ui));
+        probe(&mut probes, "sheet", sheet.ns_window());
+        assert!(sheet.show(&window.handle()));
+        sheet.end();
+        let popover = Popover::new(ui, Label::new(ui, "Details"));
+        probe(&mut probes, "popover", popover.ns_popover());
+        probe(
+            &mut probes,
+            "popover controller",
+            popover.ns_view_controller(),
+        );
+        popover.show(&host);
+        popover.close();
+        popover.show(&host);
+        popover.close();
+        open();
+        if explicit_close {
+            window.close();
+        }
+        probes
+    })
+}
+
+fn active_presentations_teardown_with_their_owners(ui: &Ui) {
+    let (window_probe, sheet_probe, popover_probe, controller_probe) = autoreleasepool(|_| {
+        let anchor = Rc::new(Label::new(ui, "Anchor"));
+        let window = Window::new(ui).content(anchor.clone());
+        window.show();
+        let sheet = Sheet::new(ui, "Sheet", Label::new(ui, "Content"));
+        assert!(sheet.show(&WindowRef::new(window.ns_window())));
+        let sheet_probe = Weak::new(sheet.ns_window());
+        drop(sheet);
+        assert!(
+            window.ns_window().sheets().is_empty(),
+            "dropping a sheet must detach it"
+        );
+        let popover = Popover::new(ui, Label::new(ui, "Popover"));
+        let popover_probe = Weak::new(popover.ns_popover());
+        let controller_probe = Weak::new(popover.ns_view_controller());
+        popover.show(&anchor);
+        let native = popover.ns_popover().retain();
+        drop(popover);
+        assert!(!native.isShown());
+        assert!(
+            native.contentViewController().is_none(),
+            "popover drop must release its controller even with a native owner"
+        );
+        (
+            Weak::new(window.ns_window()),
+            sheet_probe,
+            popover_probe,
+            controller_probe,
+        )
+    });
+    settle();
+    assert!(window_probe.load().is_none());
+    assert!(sheet_probe.load().is_none());
+    assert!(popover_probe.load().is_none());
+    assert!(controller_probe.load().is_none());
+}
+
+fn graphics_resources_follow_their_native_views(ui: &Ui) {
+    let probes = autoreleasepool(|_| {
+        let mut probes = Vec::new();
+        let layer = objc2_quartz_core::CALayer::layer();
+        probe(&mut probes, "hosted layer", &layer);
+        let host = LayerHost::new(ui, &layer);
+        probe(&mut probes, "layer host", host.ns_view());
+        let canvas = Canvas::new(ui, |_, _| {});
+        probe(&mut probes, "canvas", canvas.ns_view());
+        let preview = LayoutPreview::new(ui, CGSize::new(240.0, 120.0));
+        preview.set_panes(&[CGRect::new(CGPoint::ZERO, CGSize::new(120.0, 120.0))]);
+        probe(&mut probes, "preview", preview.ns_view());
+        let effect = VisualEffect::sidebar(ui, Label::new(ui, "Sidebar"));
+        probe(&mut probes, "visual effect", effect.ns_view());
+        let window = Window::new(ui).content(
+            VStack::new(ui)
+                .push(host)
+                .push(canvas)
+                .push(preview)
+                .push(effect),
+        );
+        window.show();
+        window
+            .ns_window()
+            .contentView()
+            .unwrap()
+            .layoutSubtreeIfNeeded();
+        probes
+    });
+    settle();
+    for (name, weak) in probes {
+        assert!(weak.load().is_none(), "{name} survived destruction");
+    }
+}
+
+fn settings_windows_release_native_owners(ui: &Ui) {
+    for cycle in 0..20 {
+        let probes = settings_lifecycle(ui, cycle % 2 == 0, || {});
+        settle();
+        for (name, weak) in probes {
+            assert!(
+                weak.load().is_none(),
+                "cycle {cycle}: {name} survived destruction"
+            );
+        }
+    }
+}
+
+fn memory_profile(ui: &Ui) {
+    let directory = std::path::PathBuf::from(
+        std::env::var("CGS_MEMORY_REPORT").expect("set CGS_MEMORY_REPORT"),
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    let sample = |stage: &str| {
+        for (tool, args) in [
+            (
+                "footprint",
+                vec!["-p".to_string(), std::process::id().to_string()],
+            ),
+            (
+                "vmmap",
+                vec!["-summary".to_string(), std::process::id().to_string()],
+            ),
+        ] {
+            let output = std::process::Command::new(tool)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{tool} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut bytes = output.stdout;
+            bytes.extend(output.stderr);
+            std::fs::write(directory.join(format!("{stage}-{tool}.txt")), bytes).unwrap();
+        }
+    };
+    settle();
+    sample("cold");
+    for cycle in 0..20 {
+        let start = std::time::Instant::now();
+        let sampling = Cell::new(std::time::Duration::ZERO);
+        let probes = settings_lifecycle(ui, cycle % 2 == 0, || {
+            let start = std::time::Instant::now();
+            settle();
+            if cycle == 0 || cycle == 19 {
+                sample(&format!("open-{cycle}"));
+            }
+            sampling.set(start.elapsed());
+        });
+        let navigation = start.elapsed() - sampling.get();
+        settle();
+        let survivors = probes
+            .iter()
+            .filter(|(_, weak)| weak.load().is_some())
+            .count();
+        println!(
+            "cycle={cycle} lifecycle_ms={} survivors={survivors}",
+            navigation.as_millis()
+        );
+        if cycle == 0 || cycle == 19 {
+            sample(&format!("settled-{cycle}"));
+        }
+    }
+    for stage in ["idle-start", "idle-end"] {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &std::process::id().to_string(), "-o", "time=,%cpu="])
+            .output()
+            .unwrap();
+        std::fs::write(directory.join(format!("{stage}.txt")), output.stdout).unwrap();
+        if stage == "idle-start" {
+            autoreleasepool(|_| {
+                objc2_foundation::NSRunLoop::currentRunLoop()
+                    .runUntilDate(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(2.0))
+            });
+        }
+    }
+}
+
 fn main() {
     // A single libtest-compatible case lets nextest list this harness without running AppKit.
     if std::env::args().any(|arg| arg == "--list") {
@@ -677,6 +1168,46 @@ fn main() {
     let app = Application::shared(&ui);
     app.ns_application()
         .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+    if std::env::args().any(|arg| arg == "--memory-profile") {
+        memory_profile(&ui);
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--regressions") {
+        let mut failures = 0;
+        for (name, test) in [
+            (
+                "host",
+                released_components_detach_borrowed_native_content as fn(&Ui),
+            ),
+            ("footer", replaced_footer_releases_native_content),
+            ("status", replaced_status_releases_native_content),
+            (
+                "toolbar",
+                toolbar_releases_disabled_actions_and_preserves_unchanged_controls,
+            ),
+            (
+                "window",
+                window_close_is_idempotent_and_drop_does_not_dispatch,
+            ),
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&ui)));
+            println!(
+                "{name}: {}",
+                if result.is_ok() { "passed" } else { "failed" }
+            );
+            failures += usize::from(result.is_err());
+        }
+        assert_eq!(failures, 0);
+        return;
+    }
+    released_components_detach_borrowed_native_content(&ui);
+    replaced_footer_releases_native_content(&ui);
+    replaced_status_releases_native_content(&ui);
+    toolbar_releases_disabled_actions_and_preserves_unchanged_controls(&ui);
+    window_close_is_idempotent_and_drop_does_not_dispatch(&ui);
+    active_presentations_teardown_with_their_owners(&ui);
+    graphics_resources_follow_their_native_views(&ui);
+    settings_windows_release_native_owners(&ui);
     autoreleasepool(|_| {
         page_headings_preserve_window_identity(&ui);
         navigation_uses_native_toolbar_items_and_responder_chain(&ui);

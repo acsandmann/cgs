@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
@@ -19,31 +19,48 @@ pub(crate) fn callback(f: impl FnOnce()) {
     }
 }
 type Action = Box<dyn FnMut(&AnyObject)>;
+pub(crate) struct ActionState {
+    callback: RefCell<Option<Action>>,
+    clear_after_dispatch: Cell<bool>,
+}
 define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgUiActionTarget"]
-    #[ivars = RefCell<Option<Action>>]
+    #[ivars = ActionState]
     pub(crate) struct ActionTarget;
     unsafe impl NSObjectProtocol for ActionTarget {}
     impl ActionTarget {
         #[unsafe(method(invoke:))]
         fn invoke(&self, sender: &AnyObject) {
             let _keep_alive = self.retain();
-            if let Ok(mut cb) = self.ivars().try_borrow_mut() {
+            if let Ok(mut cb) = self.ivars().callback.try_borrow_mut() {
                 if let Some(cb) = cb.as_mut() { callback(|| cb(sender)); }
+                if self.ivars().clear_after_dispatch.replace(false) { cb.take(); }
             }
         }
     }
 );
 impl ActionTarget {
     pub(crate) fn new(ui: &Ui) -> Retained<Self> {
-        let this = Self::alloc(ui.mtm()).set_ivars(RefCell::new(None));
+        let this = Self::alloc(ui.mtm()).set_ivars(ActionState {
+            callback: RefCell::new(None),
+            clear_after_dispatch: Cell::new(false),
+        });
         unsafe { msg_send![super(this), init] }
     }
 
     pub(crate) fn set(&self, f: impl FnMut(&AnyObject) + 'static) {
-        *self.ivars().borrow_mut() = Some(Box::new(f));
+        *self.ivars().callback.borrow_mut() = Some(Box::new(f));
+    }
+
+    pub(crate) fn clear(&self) {
+        // A toolbar action may disable itself while its callback is borrowed.
+        if let Ok(mut cb) = self.ivars().callback.try_borrow_mut() {
+            cb.take();
+        } else {
+            self.ivars().clear_after_dispatch.set(true);
+        }
     }
 
     pub(crate) fn attach(&self, control: &NSControl) {

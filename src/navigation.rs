@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::ProtocolObject;
 use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
@@ -380,6 +380,7 @@ pub struct Toolbar {
     back_target: Retained<crate::bridge::ActionTarget>,
     forward_target: Retained<crate::bridge::ActionTarget>,
     menu: std::cell::RefCell<Option<(Rc<crate::Menu>, Retained<NSPopUpButton>)>>,
+    page_controls: std::cell::RefCell<[Option<Weak<NSView>>; 3]>,
 }
 impl Toolbar {
     pub fn new(ui: &Ui, id: &str) -> Self {
@@ -392,6 +393,7 @@ impl Toolbar {
             back_target: crate::bridge::ActionTarget::new(ui),
             forward_target: crate::bridge::ActionTarget::new(ui),
             menu: std::cell::RefCell::new(None),
+            page_controls: std::cell::RefCell::new([None, None, None]),
         }
     }
 
@@ -478,6 +480,7 @@ impl Toolbar {
                 );
             }
         } else {
+            self.back_target.clear();
             item.setEnabled(false);
             if let Some(index) = existing {
                 self.native.removeItemAtIndex(index as isize);
@@ -496,6 +499,23 @@ impl Toolbar {
         let Some(delegate) = &self.delegate else {
             return;
         };
+        // Reconfiguration replaces only history/menu items, preserving page controls.
+        for id in ["cgs.history", "cgs.page-menu", "cgs.forward"] {
+            let id = NSString::from_str(id);
+            if let Some(index) =
+                self.native.items().iter().position(|item| item.itemIdentifier() == id)
+            {
+                if id.to_string() == "cgs.page-menu" {
+                    self.native.items().objectAtIndex(index).setView(None);
+                }
+                self.native.removeItemAtIndex(index as isize);
+            }
+            delegate
+                .ivars()
+                .navigation
+                .borrow_mut()
+                .retain(|item| item.itemIdentifier() != id);
+        }
         self.back_target.set(move |_| back());
         self.forward_target.set(move |_| forward());
         let next = NSToolbarItem::initWithItemIdentifier(
@@ -553,7 +573,11 @@ impl Toolbar {
         title.setAutovalidates(false);
         delegate.ivars().back.setBordered(false);
         delegate.ivars().back.setToolTip(Some(&NSString::from_str("Back")));
-        *delegate.ivars().navigation.borrow_mut() = vec![next, title, arrows.into_super()];
+        delegate
+            .ivars()
+            .navigation
+            .borrow_mut()
+            .splice(0..0, [next, title, arrows.into_super()]);
         *self.menu.borrow_mut() = Some((menu, popup));
         let index = self
             .native
@@ -621,6 +645,29 @@ impl Toolbar {
         let Some(delegate) = &self.delegate else {
             return;
         };
+        let views = controls.map_or([None, None, None], |controls| {
+            [
+                Some(controls.menu.ns_view()),
+                Some(controls.search.ns_view()),
+                controls.actions.as_ref().map(|actions| actions.ns_view()),
+            ]
+        });
+        if self
+            .page_controls
+            .borrow()
+            .iter()
+            .zip(views)
+            .all(|(weak, view)| match (weak, view) {
+                (None, None) => true,
+                (Some(weak), Some(view)) => {
+                    weak.load().is_some_and(|old| std::ptr::eq(&*old, view))
+                }
+                _ => false,
+            })
+        {
+            return;
+        }
+        *self.page_controls.borrow_mut() = views.map(|view| view.map(Weak::new));
         for id in ["cgs.page-filter", "cgs.page-actions", "cgs.page-search"] {
             let id = NSString::from_str(id);
             if let Some(index) =
@@ -629,9 +676,14 @@ impl Toolbar {
                 if let Some(search) =
                     self.native.items().objectAtIndex(index).downcast_ref::<NSSearchToolbarItem>()
                 {
-                    search.setSearchField(&NSSearchField::new(ui.mtm()));
+                    // Removing the item releases its field; it needs no replacement field.
+                    search.searchField().removeFromSuperview();
                 }
-                crate::view::detach_glass_content(self.native.items().objectAtIndex(index).view());
+                let item = self.native.items().objectAtIndex(index);
+                if item.downcast_ref::<NSSearchToolbarItem>().is_none() {
+                    crate::view::detach_glass_content(item.view());
+                    item.setView(None);
+                }
                 self.native.removeItemAtIndex(index as isize);
             }
             delegate
@@ -714,12 +766,15 @@ impl Toolbar {
 
 impl Drop for Toolbar {
     fn drop(&mut self) {
+        self.native.setDelegate(None);
         if let Some(delegate) = &self.delegate {
             unsafe {
                 delegate.ivars().back.setTarget(None);
                 delegate.ivars().back.setAction(None);
                 for item in delegate.ivars().navigation.borrow().iter() {
-                    if item.itemIdentifier().to_string() == "cgs.page-filter" {
+                    if let Some(search) = item.downcast_ref::<NSSearchToolbarItem>() {
+                        search.searchField().removeFromSuperview();
+                    } else {
                         crate::view::detach_glass_content(item.view());
                         item.setView(None);
                     }
@@ -728,6 +783,5 @@ impl Drop for Toolbar {
                 }
             }
         }
-        self.native.setDelegate(None);
     }
 }

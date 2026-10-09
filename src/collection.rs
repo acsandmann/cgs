@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::{Retained, Weak};
@@ -376,12 +376,14 @@ impl CollectionBridge {
                 .is_some_and(|source| std::ptr::eq(&*source, table as &AnyObject))
     }
 
-    fn children(&self, item: Option<&AnyObject>) -> Vec<usize> {
+    fn children(&self, item: Option<&AnyObject>) -> Ref<'_, [usize]> {
         match item {
-            None => self.ivars().roots.borrow().clone(),
-            Some(item) => node_index(item)
-                .and_then(|i| self.ivars().nodes.borrow().get(i).map(|n| n.children.clone()))
-                .unwrap_or_default(),
+            None => Ref::map(self.ivars().roots.borrow(), |roots| roots.as_slice()),
+            Some(item) => Ref::map(self.ivars().nodes.borrow(), |nodes| {
+                node_index(item)
+                    .and_then(|i| nodes.get(i))
+                    .map_or(&[][..], |node| node.children.as_slice())
+            }),
         }
     }
 }

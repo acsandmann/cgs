@@ -497,6 +497,9 @@ impl SettingsPage {
 
     /// Keep collection actions reachable while the page content scrolls.
     pub fn bottom_bar(mut self, content: impl NativeView) -> Self {
+        if let Some(old) = self.footer.take() {
+            old.ns_view().removeFromSuperview();
+        }
         self.scroll_bottom.setActive(false);
         let row = VStack::new(&self.ui)
             .insets(Insets {

@@ -216,6 +216,9 @@ impl StatusItem {
     }
 
     pub fn content(self, view: impl NativeView) -> Self {
+        if let Some(old) = self.view.borrow_mut().take() {
+            old.ns_view().removeFromSuperview();
+        }
         if let Some(button) = self.native.button(self.ui.mtm()) {
             button.addSubview(view.ns_view());
         }

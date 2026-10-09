@@ -22,7 +22,8 @@ define_class!(
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking(&self) {
             unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
-            if let Some(old) = self.ivars().tracking.borrow_mut().take() { self.removeTrackingArea(&old); }
+            // InVisibleRect follows geometry without recreating the area.
+            if self.window().is_none() || self.ivars().tracking.borrow().is_some() { return; }
             let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(
                 NSTrackingArea::alloc(), crate::CGRect::ZERO,
                 NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveInKeyWindow | NSTrackingAreaOptions::InVisibleRect,
@@ -45,6 +46,9 @@ define_class!(
         fn move_to_window(&self, window: Option<&NSWindow>) {
             self.setContentTintColor(Some(&NSColor::tertiaryLabelColor()));
             self.close_help();
+            if window.is_none() {
+                if let Some(area) = self.ivars().tracking.borrow_mut().take() { self.removeTrackingArea(&area); }
+            }
             unsafe { let _: () = msg_send![super(self), viewWillMoveToWindow: window]; }
         }
     }
@@ -128,5 +132,14 @@ impl NativeView for InfoButton {
     fn ns_view(&self) -> &NSView { &self.native }
 }
 impl Drop for InfoButton {
-    fn drop(&mut self) { self.native.close_help(); }
+    fn drop(&mut self) {
+        self.native.close_help();
+        if let Some(area) = self.native.ivars().tracking.borrow_mut().take() {
+            self.native.removeTrackingArea(&area);
+        }
+        unsafe {
+            self.native.setTarget(None);
+            self.native.setAction(None);
+        }
+    }
 }
