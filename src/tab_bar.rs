@@ -51,7 +51,7 @@ struct Content {
     highlight: Retained<CALayer>,
     retiring: Retained<NSView>,
     fonts: [Retained<NSFont>; 2],
-    text_color: Retained<NSColor>,
+    text_colors: [Retained<NSColor>; 2],
     close_symbol: Option<Image>,
     placeholder: Image,
     close_colors: [Retained<NSColor>; 2],
@@ -96,12 +96,19 @@ define_class!(
             let workspace = NSWorkspace::sharedWorkspace();
             let opaque = workspace.accessibilityDisplayShouldReduceTransparency();
             NSGraphicsContext::saveGraphicsState_class();
-            // Leave the native material uncovered except when accessibility
-            // explicitly requests an opaque surface.
+            // Glass alone takes on the wallpaper behind it. A translucent window-colored
+            // wash keeps labels legible over busy imagery while preserving the material.
             if opaque {
                 NSColor::windowBackgroundColor().setFill();
-                NSBezierPath::fillRect(dirty);
+            } else {
+                if dark(self) {
+                    NSColor::windowBackgroundColor().colorWithAlphaComponent(0.72).setFill();
+                } else {
+                    // A gray track, as in a light segmented control, lets the white thumb read.
+                    NSColor::colorWithWhite_alpha(0.86, 0.8).setFill();
+                }
             }
+            NSBezierPath::fillRect(dirty);
             NSGraphicsContext::restoreGraphicsState_class();
         }
         #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
@@ -154,9 +161,14 @@ impl TabContent {
         let tabs = s.tabs.borrow();
         let close_fill = s.close_fill.borrow();
         for index in [previous, s.hovered.get()].into_iter().flatten() {
+            if let Some(next) = tabs.get(index + 1) {
+                next.visual.ivars().separator.set(self.separated(index + 1));
+                next.visual.setNeedsDisplay(true);
+            }
             let Some(tab) = tabs.get(index) else {
                 continue;
             };
+            tab.visual.ivars().separator.set(self.separated(index));
             let close_hover = s.close_hovered.get() == Some(index);
             tab.close
                 .ns_button()
@@ -183,20 +195,27 @@ impl TabContent {
         }
     }
 
+    /// Hairlines divide resting tabs only; a capsule already delimits its neighbours.
+    fn separated(&self, index: usize) -> bool {
+        let s = self.ivars();
+        let plain = |i: usize| s.selected.get() != i && s.hovered.get() != Some(i);
+        index > 0 && plain(index) && plain(index - 1)
+    }
+
     fn geometry(&self) -> (f64, f64) {
         let width = self.bounds().size.width.max(0.0);
         let n = self.ivars().tabs.try_borrow().map(|tabs| tabs.len().max(1)).unwrap_or(1) as f64;
-        (width, ((width - 4.0 - (n - 1.0) * 2.0) / n).max(120.0))
+        (width, ((width - 2.0 * INSET - (n - 1.0) * GAP) / n).max(120.0))
     }
 
     fn index_at(&self, p: CGPoint) -> Option<usize> {
         let (width, tab_width) = self.geometry();
-        if p.x < 2.0 || p.x >= width || p.y < 2.0 || p.y >= 26.0 {
+        if p.x < INSET || p.x >= width || p.y < INSET || p.y >= TabBar::HEIGHT - INSET {
             return None;
         }
-        let x = p.x - 2.0 + self.ivars().offset.get();
-        let i = (x / (tab_width + 2.0)) as usize;
-        (i < self.ivars().tabs.borrow().len() && x % (tab_width + 2.0) < tab_width).then_some(i)
+        let x = p.x - INSET + self.ivars().offset.get();
+        let i = (x / (tab_width + GAP)) as usize;
+        (i < self.ivars().tabs.borrow().len() && x % (tab_width + GAP) < tab_width).then_some(i)
     }
 
     fn arrange(&self, reveal: bool, mut redraw: bool, animate: bool) {
@@ -208,11 +227,11 @@ impl TabContent {
         // Commit model geometry and its explicit animations together.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let max = (tabs.len() as f64 * (tab_width + 2.0) + 2.0 - width).max(0.0);
+        let max = (tabs.len() as f64 * (tab_width + GAP) - GAP + 2.0 * INSET - width).max(0.0);
         let mut offset = s.offset.get().clamp(0.0, max);
         if reveal && s.selected.get() < tabs.len() {
-            let left = s.selected.get() as f64 * (tab_width + 2.0);
-            offset = offset.min(left).max(left + tab_width + 4.0 - width).clamp(0.0, max);
+            let left = s.selected.get() as f64 * (tab_width + GAP);
+            offset = offset.min(left).max(left + tab_width + 2.0 * INSET - width).clamp(0.0, max);
         }
         s.offset.set(offset);
         let viewport_frame = rect(0.0, 0.0, width, 28.0);
@@ -225,9 +244,9 @@ impl TabContent {
         for (i, tab) in tabs.iter_mut().enumerate() {
             let active = i == s.selected.get();
             let hover = s.hovered.get() == Some(i);
-            let x = 2.0 + i as f64 * (tab_width + 2.0) - offset;
+            let x = INSET + i as f64 * (tab_width + GAP) - offset;
             let button = tab.select.ns_button();
-            let frame = rect(x, 3.0, tab_width, 22.0);
+            let frame = rect(x, INSET, tab_width, TabBar::HEIGHT - 2.0 * INSET);
             button.setFrame(frame);
             let visual_frame = rect(x, 0.0, tab_width, 28.0);
             if tab.visual.frame() != visual_frame {
@@ -252,7 +271,10 @@ impl TabContent {
             } else {
                 0
             };
-            if tab.visual.ivars().style.replace(style) != style {
+            let separator = self.separated(i);
+            if tab.visual.ivars().style.replace(style) != style
+                || tab.visual.ivars().separator.replace(separator) != separator
+            {
                 tab.visual.setNeedsDisplay(true);
             }
             button.setAccessibilitySelected(active);
@@ -305,10 +327,14 @@ impl TabContent {
         CATransaction::commit();
     }
 }
+// Concentric with the capsule: the outer radius equals the tab radius plus this inset.
+const INSET: f64 = 3.0;
+const GAP: f64 = 2.0;
 struct Visual {
     labels: RefCell<Vec<(Retained<NSAttributedString>, CGSize)>>,
     icon: RefCell<Image>,
     style: Cell<usize>,
+    separator: Cell<bool>,
 }
 define_class!(
     #[unsafe(super(NSView))]
@@ -318,8 +344,8 @@ define_class!(
     struct TabVisual;
     impl TabVisual {
         #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
-        // Let AppKit composite semantic label colors against the native material.
-        #[unsafe(method(allowsVibrancy))] fn vibrant(&self) -> bool { true }
+        // Vibrant labels pick up the wallpaper's hue; plain semantic colors stay neutral.
+        #[unsafe(method(allowsVibrancy))] fn vibrant(&self) -> bool { false }
         #[unsafe(method(hitTest:))] fn hit(&self, _: CGPoint) -> Option<&NSView> { None }
         #[unsafe(method(viewDidChangeEffectiveAppearance))] fn appearance(&self) {
             unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
@@ -331,17 +357,25 @@ define_class!(
             let style = s.style.get();
             let Some((label, text_size)) = labels.get(style) else { return; };
             let width = self.bounds().size.width;
+            let radius = TabBar::HEIGHT / 2.0 - INSET;
             if style == 1 {
-                NSColor::labelColor().colorWithAlphaComponent(0.035).setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(0.0, 3.0, width, 22.0), 11.0, 11.0).fill();
+                NSColor::labelColor().colorWithAlphaComponent(0.07).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(0.0, INSET, width, TabBar::HEIGHT - 2.0 * INSET), radius, radius).fill();
+            }
+            if s.separator.get() {
+                NSColor::separatorColor().setFill();
+                let hairline = 1.0 / self.window().map_or(2.0, |window| window.backingScaleFactor()).max(1.0);
+                NSBezierPath::fillRect(rect(0.0, 8.0, hairline, TabBar::HEIGHT - 16.0));
             }
             let icon_width = 22.0;
             let text_width = labels[2].1.width.min((width - 44.0 - icon_width).max(0.0));
             let scale = self.window().map_or(1.0, |window| window.backingScaleFactor()).max(1.0);
             let x = (((width - text_width - icon_width) / 2.0) * scale).round() / scale;
             let text_y = (((28.0 - text_size.height) / 2.0) * scale).round() / scale;
+            // Resting tabs recede slightly so the selection reads at a glance.
+            let fraction = if style == 2 { 1.0 } else { 0.85 };
             unsafe { s.icon.borrow().drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                rect(x, 7.0, 14.0, 14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, 1.0, true, None); }
+                rect(x, 7.0, 14.0, 14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, fraction, true, None); }
             label.drawWithRect_options(rect(x + icon_width, text_y, text_width, text_size.height),
                 NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine);
         }
@@ -380,19 +414,32 @@ impl TabContent {
                 without_actions(|| {
                     *s.close_fill.borrow_mut() =
                         NSColor::labelColor().colorWithAlphaComponent(0.08);
+                    // The selection is a raised thumb, as in a native segmented control:
+                    // near-opaque in light, a lifted tone in dark, with a soft shadow.
+                    let dark = dark(self);
                     s.highlight.setBackgroundColor(Some(
-                        &if opaque || contrast {
-                            NSColor::labelColor().colorWithAlphaComponent(0.24)
+                        &if dark {
+                            NSColor::colorWithWhite_alpha(1.0, if contrast { 0.30 } else { 0.20 })
                         } else {
-                            // A selected segment needs a stronger tonal step than hover.
-                            NSColor::labelColor().colorWithAlphaComponent(0.18)
+                            NSColor::colorWithWhite_alpha(1.0, 0.92)
                         }
                         .CGColor(),
                     ));
-                    s.highlight.setBorderWidth(if contrast { 1.0 } else { 0.0 });
-                    s.highlight.setBorderColor(
-                        contrast.then(|| NSColor::labelColor().CGColor()).as_deref(),
-                    );
+                    s.highlight.setBorderWidth(if contrast { 1.0 } else { 0.5 });
+                    s.highlight.setBorderColor(Some(
+                        &if contrast {
+                            NSColor::labelColor()
+                        } else if dark {
+                            NSColor::colorWithWhite_alpha(1.0, 0.10)
+                        } else {
+                            NSColor::colorWithWhite_alpha(0.0, 0.06)
+                        }
+                        .CGColor(),
+                    ));
+                    s.highlight.setShadowColor(Some(&NSColor::blackColor().CGColor()));
+                    s.highlight.setShadowOpacity(if opaque { 0.0 } else if dark { 0.3 } else { 0.14 });
+                    s.highlight.setShadowRadius(2.0);
+                    s.highlight.setShadowOffset(CGSize::new(0.0, 1.0));
                 })
             }));
     }
@@ -406,6 +453,14 @@ impl TabContent {
             view.removeFromSuperview();
         }
     }
+}
+fn dark(view: &NSView) -> bool {
+    let names = objc2_foundation::NSArray::from_slice(&[unsafe { NSAppearanceNameAqua }, unsafe {
+        NSAppearanceNameDarkAqua
+    }]);
+    view.effectiveAppearance()
+        .bestMatchFromAppearancesWithNames(&names)
+        .is_some_and(|name| &*name == unsafe { NSAppearanceNameDarkAqua })
 }
 #[allow(deprecated)]
 fn placeholder() -> Image {
@@ -450,7 +505,7 @@ impl TabBar {
             layer.setMasksToBounds(true);
         }
         let highlight = CALayer::new();
-        highlight.setCornerRadius(11.0);
+        highlight.setCornerRadius(TabBar::HEIGHT / 2.0 - INSET);
         highlight.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
         highlight.setHidden(true);
         let retiring: Retained<TabVisual> = unsafe {
@@ -459,6 +514,7 @@ impl TabBar {
                     labels: RefCell::new(Vec::new()),
                     icon: RefCell::new(placeholder()),
                     style: Cell::new(0),
+                    separator: Cell::new(false),
                 })),
                 init
             ]
@@ -482,7 +538,7 @@ impl TabBar {
                             NSFont::systemFontOfSize_weight(12.0, NSFontWeightMedium),
                         ]
                     },
-                    text_color: NSColor::labelColor(),
+                    text_colors: [NSColor::secondaryLabelColor(), NSColor::labelColor()],
                     close_symbol: crate::Symbol::named("xmark").and_then(|image| {
                         image.imageWithSymbolConfiguration(
                             &NSImageSymbolConfiguration::configurationWithPointSize_weight(
@@ -658,6 +714,7 @@ impl TabBar {
                             labels: RefCell::new(Vec::new()),
                             icon: RefCell::new(s.placeholder.retain()),
                             style: Cell::new(0),
+                    separator: Cell::new(false),
                         })),
                         init
                     ]
@@ -703,7 +760,7 @@ impl TabBar {
                             ],
                             &[
                                 &*s.fonts[usize::from(style == 2)] as &AnyObject,
-                                &*s.text_color as &AnyObject,
+                                &*s.text_colors[usize::from(style != 0)] as &AnyObject,
                                 &*paragraph as &AnyObject,
                             ],
                         );

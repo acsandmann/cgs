@@ -1,5 +1,6 @@
 //! Native preview: `cargo run --example tab_bar -- --embedded --light`.
-//! Compare --dark, --many, --clear and --bright / --dim / --colorful backgrounds.
+//! Compare --dark, --many, --clear and --bright / --dim / --colorful backgrounds;
+//! --embedded --wallpaper=PATH previews the strip over busy imagery.
 //! --panel-only captures the actual non-key panel; --embedded is an ordinary-window
 //! reference (click its window to make the reference active).
 //! --anchor=WINDOW_NUMBER orders above another application's window without activating it.
@@ -11,7 +12,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cgs::*;
-use objc2::Message;
+use objc2::{AnyThread, Message};
 use objc2_app_kit::{NSAppearanceCustomization, NSApplicationActivationPolicy};
 fn main() {
     let ui = Ui::new(MainThreadMarker::new().unwrap());
@@ -196,6 +197,47 @@ fn main() {
                 ))
                 .push(controls),
         );
+        // Busy imagery is the realistic backdrop for an overlay strip.
+        if let Some(image) = std::env::args()
+            .find_map(|arg| arg.strip_prefix("--wallpaper=").map(str::to_owned))
+            .and_then(|path| {
+                objc2_app_kit::NSImage::initWithContentsOfFile(
+                    objc2_app_kit::NSImage::alloc(),
+                    &objc2_foundation::NSString::from_str(&path),
+                )
+            })
+        {
+            let root = window.ns_window().contentView().unwrap();
+            let container = objc2_app_kit::NSView::new(ui.mtm());
+            window.ns_window().setContentView(Some(&container));
+            let backdrop = objc2_app_kit::NSImageView::imageViewWithImage(&image, ui.mtm());
+            backdrop.setImageScaling(objc2_app_kit::NSImageScaling::ScaleAxesIndependently);
+            for view in [&*backdrop as &objc2_app_kit::NSView, &root] {
+                view.setTranslatesAutoresizingMaskIntoConstraints(false);
+                view.setContentCompressionResistancePriority_forOrientation(
+                    1.0,
+                    objc2_app_kit::NSLayoutConstraintOrientation::Horizontal,
+                );
+                view.setContentCompressionResistancePriority_forOrientation(
+                    1.0,
+                    objc2_app_kit::NSLayoutConstraintOrientation::Vertical,
+                );
+                container.addSubview(view);
+                for (a, b) in [
+                    (view.leadingAnchor(), container.leadingAnchor()),
+                    (view.trailingAnchor(), container.trailingAnchor()),
+                ] {
+                    a.constraintEqualToAnchor(&b).setActive(true);
+                }
+                for (a, b) in [
+                    (view.topAnchor(), container.topAnchor()),
+                    (view.bottomAnchor(), container.bottomAnchor()),
+                ] {
+                    a.constraintEqualToAnchor(&b).setActive(true);
+                }
+            }
+            window.ns_window().setContentSize(CGSize::new(680.0, 340.0));
+        }
     } else {
         window.set_content(
             VStack::new(&ui)
