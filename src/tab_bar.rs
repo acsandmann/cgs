@@ -205,6 +205,9 @@ impl TabContent {
         let Ok(mut tabs) = s.tabs.try_borrow_mut() else {
             return;
         };
+        // Commit model geometry and its explicit animations together.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
         let max = (tabs.len() as f64 * (tab_width + 2.0) + 2.0 - width).max(0.0);
         let mut offset = s.offset.get().clamp(0.0, max);
         if reveal && s.selected.get() < tabs.len() {
@@ -299,6 +302,7 @@ impl TabContent {
         if redraw {
             self.setNeedsDisplay(true);
         }
+        CATransaction::commit();
     }
 }
 struct Visual {
@@ -357,6 +361,7 @@ fn animate_value(layer: &CALayer, key: &str, from: Option<&AnyObject>, duration:
     let animation = CABasicAnimation::animationWithKeyPath(Some(&key));
     unsafe {
         animation.setFromValue(from);
+        animation.setToValue(layer_value(layer, &key.to_string()).as_deref());
     }
     animation.setDuration(duration);
     animation.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
@@ -767,10 +772,16 @@ impl TabBar {
     }
 
     pub fn set_frame(&self, frame: CGRect) {
-        if self.panel.frame() != frame {
-            self.content.stop_motion();
+        let previous = self.panel.frame();
+        if previous != frame {
+            let resized = previous.size != frame.size;
+            if resized {
+                self.content.stop_motion();
+            }
             self.panel.setFrame_display(frame, true);
-            self.content.arrange(true, true, false);
+            if resized {
+                self.content.arrange(true, true, false);
+            }
         }
     }
 
