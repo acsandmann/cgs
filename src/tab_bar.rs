@@ -1,15 +1,18 @@
 //! A nonactivating native glass strip. All objects are confined to the AppKit thread.
-//! Full-strip appearance follows ZimengXiong/tabbed's Theme, TabItemView and TabStripView
+//! Geometry was inspired by ZimengXiong/tabbed's Theme, TabItemView and TabStripView
 //! at https://github.com/ZimengXiong/tabbed/tree/9481b628767921bd1af1b90c4d7448282c9757b6/Sources/UI.
-//! The native AppKit material replaces its SwiftUI glassEffect; no SwiftUI is hosted.
+//! Adaptive native material and semantic colors follow the system appearance.
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
+use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{NSAttributedString, NSDictionary, NSString};
+use objc2_quartz_core::{
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CATransaction,
+};
 
 use crate::{
     Button, CGPoint, CGRect, CGSize, GlassEffectView, Image, NativeView, Ui, View, VisualEffect,
@@ -34,8 +37,8 @@ struct Tab {
     close: Button,
     title: String,
     icon: Option<Image>,
-    labels: Vec<(Retained<NSAttributedString>, CGSize)>,
-    path: Option<Retained<NSBezierPath>>,
+    visual: Retained<TabVisual>,
+    index: Rc<Cell<usize>>,
 }
 struct Content {
     tabs: RefCell<Vec<Tab>>,
@@ -45,16 +48,16 @@ struct Content {
     offset: Cell<f64>,
     action: Action,
     viewport: Retained<NSView>,
-    clip: RefCell<Option<Retained<NSBezierPath>>>,
+    highlight: Retained<CALayer>,
+    retiring: Retained<NSView>,
     fonts: [Retained<NSFont>; 2],
     text_colors: [Retained<NSColor>; 3],
-    paragraph: Retained<NSMutableParagraphStyle>,
     close_symbol: Option<Image>,
     placeholder: Image,
     close_colors: [Retained<NSColor>; 2],
     close_fill: Retained<NSColor>,
-    fills: [Retained<NSColor>; 3],
-    strokes: [Retained<NSColor>; 2],
+    clear: Retained<NSColor>,
+
     ui: Ui,
 }
 define_class!(
@@ -63,8 +66,12 @@ define_class!(
     #[name = "CgsTabPanel"]
     struct TabPanel;
     impl TabPanel {
-        #[unsafe(method(canBecomeKey))] fn key(&self) -> bool { false }
-        #[unsafe(method(canBecomeMain))] fn main(&self) -> bool { false }
+        #[unsafe(method(canBecomeKeyWindow))] fn key(&self) -> bool { false }
+        #[unsafe(method(canBecomeMainWindow))] fn main(&self) -> bool { false }
+        // Private AppKit appearance hook. This changes material rendering only;
+        // actual key/main eligibility and focus routing remain public AppKit state.
+        // Undocumented behavior may change in future macOS releases.
+        #[unsafe(method(_hasActiveAppearance))] fn active_appearance(&self) -> bool { true }
     }
 );
 define_class!(
@@ -76,38 +83,31 @@ define_class!(
     impl TabContent {
         #[unsafe(method(viewDidChangeEffectiveAppearance))] fn appearance_changed(&self) {
             unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
+            self.update_material();
+            for tab in self.ivars().tabs.borrow().iter() { tab.visual.setNeedsDisplay(true); }
             self.setNeedsDisplay(true);
         }
-        #[unsafe(method(drawRect:))] fn draw_tabs(&self, _: CGRect) {
-            let s = self.ivars();
+        #[unsafe(method(accessibilityChanged:))] fn accessibility_changed(&self, _: &objc2_foundation::NSNotification) {
+            if NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() { self.stop_motion(); }
+            self.update_material();
+            self.setNeedsDisplay(true);
+        }
+        #[unsafe(method(drawRect:))] fn draw_tabs(&self, dirty: CGRect) {
+            let workspace = NSWorkspace::sharedWorkspace();
+            let opaque = workspace.accessibilityDisplayShouldReduceTransparency();
             NSGraphicsContext::saveGraphicsState_class();
-            if let Some(clip) = s.clip.borrow().as_ref() { clip.addClip(); }
-            let Ok(tabs) = s.tabs.try_borrow() else { NSGraphicsContext::restoreGraphicsState_class(); return; };
-            for (i, tab) in tabs.iter().enumerate() {
-                if tab.select.ns_view().isHidden() { continue; }
-                let active = s.selected.get() == i;
-                let style = if active { 2 } else if s.hovered.get() == Some(i) { 1 } else { 0 };
-                if let Some(path) = &tab.path {
-                    s.fills[style].setFill(); path.fill();
-                    s.strokes[usize::from(active)].setStroke(); path.stroke();
-                }
-                let frame = tab.select.ns_view().frame();
-                let Some((label, text_size)) = tab.labels.get(style) else { continue; };
-                let icon_width = 20.0;
-                let text_width = text_size.width.min((frame.size.width - 44.0 - icon_width).max(0.0));
-                let x = frame.origin.x + (frame.size.width - text_width - icon_width) / 2.0;
-                let icon = tab.icon.as_ref().unwrap_or(&s.placeholder);
-                unsafe { icon.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                    rect(x,7.0,14.0,14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, 1.0, true, None); }
-                label.drawWithRect_options(rect(x + icon_width, (28.0 - text_size.height)/2.0, text_width, text_size.height),
-                    NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine);
+            // Leave the native material uncovered except when accessibility
+            // explicitly requests an opaque surface.
+            if opaque {
+                NSColor::windowBackgroundColor().setFill();
+                NSBezierPath::fillRect(dirty);
             }
             NSGraphicsContext::restoreGraphicsState_class();
         }
         #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
         #[unsafe(method(layout))] fn layout_tabs(&self) {
             unsafe { let _: () = msg_send![super(self), layout]; }
-            self.arrange(false);
+            self.arrange(false, true, false);
         }
         #[unsafe(method(updateTrackingAreas))] fn tracking(&self) {
             unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
@@ -128,24 +128,60 @@ define_class!(
                 let button = tabs[i].close.ns_view();
                 p.x >= button.frame().origin.x && p.x < button.frame().origin.x + 15.0 && p.y >= 6.5 && p.y < 21.5
             });
-            let changed = self.ivars().hovered.replace(hover) != hover;
+            let previous = self.ivars().hovered.replace(hover);
+            let changed = previous != hover;
             let close_changed = self.ivars().close_hovered.replace(close) != close;
-            if changed || close_changed { self.arrange(false); }
+            if changed || close_changed { self.refresh_hover(previous); }
         }
         #[unsafe(method(mouseExited:))] fn exited(&self, _: &NSEvent) {
             let hover = self.ivars().hovered.take();
             let close = self.ivars().close_hovered.take();
-            if hover.is_some() || close.is_some() { self.arrange(false); }
+            if hover.is_some() || close.is_some() { self.refresh_hover(hover); }
         }
         #[unsafe(method(scrollWheel:))] fn scroll(&self, event: &NSEvent) {
             let s = self.ivars();
             let delta = if event.scrollingDeltaX().abs() > event.scrollingDeltaY().abs() { event.scrollingDeltaX() } else { event.scrollingDeltaY() };
+            self.stop_motion();
             s.offset.set(s.offset.get() - delta);
-            self.arrange(false);
+            self.arrange(false, true, false);
         }
     }
 );
 impl TabContent {
+    // Hover changes neither geometry nor labels. Invalidate only the two affected capsules.
+    fn refresh_hover(&self, previous: Option<usize>) {
+        let s = self.ivars();
+        let tabs = s.tabs.borrow();
+        for index in [previous, s.hovered.get()].into_iter().flatten() {
+            let Some(tab) = tabs.get(index) else {
+                continue;
+            };
+            let close_hover = s.close_hovered.get() == Some(index);
+            tab.close
+                .ns_button()
+                .setContentTintColor(Some(&s.close_colors[usize::from(close_hover)]));
+            if let Some(layer) = tab.close.ns_view().layer() {
+                layer.setBackgroundColor(Some(
+                    &if close_hover { &s.close_fill } else { &s.clear }.CGColor(),
+                ));
+            }
+            let frame = tab.close.ns_view().frame();
+            tab.close.set_hidden(
+                s.hovered.get() != Some(index)
+                    || frame.origin.x < 0.0
+                    || frame.origin.x + frame.size.width > self.bounds().size.width,
+            );
+            tab.visual.ivars().style.set(if s.selected.get() == index {
+                2
+            } else if s.hovered.get() == Some(index) {
+                1
+            } else {
+                0
+            });
+            tab.visual.setNeedsDisplay(true);
+        }
+    }
+
     fn geometry(&self) -> (f64, f64) {
         let width = self.bounds().size.width.max(0.0);
         let n = self.ivars().tabs.try_borrow().map(|tabs| tabs.len().max(1)).unwrap_or(1) as f64;
@@ -162,7 +198,7 @@ impl TabContent {
         (i < self.ivars().tabs.borrow().len() && x % (tab_width + 3.0) < tab_width).then_some(i)
     }
 
-    fn arrange(&self, reveal: bool) {
+    fn arrange(&self, reveal: bool, mut redraw: bool, animate: bool) {
         let s = self.ivars();
         let (width, tab_width) = self.geometry();
         let Ok(mut tabs) = s.tabs.try_borrow_mut() else {
@@ -176,25 +212,43 @@ impl TabContent {
         }
         s.offset.set(offset);
         let viewport_frame = rect(0.0, 0.0, width, 28.0);
-        if s.viewport.frame() != viewport_frame || s.clip.borrow().is_none() {
+        if s.viewport.frame() != viewport_frame {
+            redraw = true;
             s.viewport.setFrame(viewport_frame);
-            *s.clip.borrow_mut() = Some(NSBezierPath::bezierPathWithRect(viewport_frame));
+            s.retiring.setFrame(viewport_frame);
         }
         for (i, tab) in tabs.iter_mut().enumerate() {
             let active = i == s.selected.get();
             let hover = s.hovered.get() == Some(i);
             let x = 2.0 + i as f64 * (tab_width + 3.0) - offset;
             let button = tab.select.ns_button();
-            let frame = rect(x, 2.0, tab_width, 24.0);
-            if button.frame() != frame || tab.path.is_none() {
-                button.setFrame(frame);
-                let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                    rect(x, 2.0, tab_width, 24.0),
-                    12.0,
-                    12.0,
-                );
-                path.setLineWidth(1.0);
-                tab.path = Some(path);
+            let frame = rect(x, 3.0, tab_width, 22.0);
+            button.setFrame(frame);
+            let visual_frame = rect(x, 0.0, tab_width, 28.0);
+            if tab.visual.frame() != visual_frame {
+                let layer = tab.visual.layer().unwrap();
+                let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
+                let had_size = from.bounds().size.width > 0.0;
+                let old_position = layer_value(&from, "position");
+                let old_bounds = layer_value(&from, "bounds");
+                without_actions(|| tab.visual.setFrame(visual_frame));
+                if animate && had_size {
+                    animate_value(&layer, "position", old_position.as_deref(), 0.20);
+                    animate_value(&layer, "bounds", old_bounds.as_deref(), 0.20);
+                } else if !animate {
+                    layer.removeAllAnimations();
+                }
+                tab.visual.setNeedsDisplay(true);
+            }
+            let style = if active {
+                2
+            } else if hover {
+                1
+            } else {
+                0
+            };
+            if tab.visual.ivars().style.replace(style) != style {
+                tab.visual.setNeedsDisplay(true);
             }
             button.setAccessibilitySelected(active);
             button.setState(if active {
@@ -207,7 +261,7 @@ impl TabContent {
                     &if s.close_hovered.get() == Some(i) {
                         &s.close_fill
                     } else {
-                        &s.fills[0]
+                        &s.clear
                     }
                     .CGColor(),
                 ));
@@ -216,18 +270,141 @@ impl TabContent {
                 &s.close_colors[usize::from(s.close_hovered.get() == Some(i))],
             ));
             tab.close.ns_button().setFrame(rect(x + 8.0, 6.5, 15.0, 15.0));
-            tab.close.set_hidden(!hover || x + 8.0 < 0.0 || x + 23.0 > width);
+            let close_x = tab.close.ns_view().frame().origin.x;
+            tab.close.set_hidden(!hover || close_x < 0.0 || close_x + 15.0 > width);
             // Only visible tabs participate in native hit testing.
             tab.select.set_hidden(x + tab_width <= 0.0 || x >= width);
         }
-        self.setNeedsDisplay(true);
+        let target = tabs.get(s.selected.get()).map(|tab| tab.select.ns_view().frame());
+        let layer = &s.highlight;
+        let was_hidden = layer.isHidden();
+        let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
+        let position = layer_value(&from, "position");
+        let bounds = layer_value(&from, "bounds");
+        let changed = target.is_some_and(|target| target != layer.frame());
+        without_actions(|| {
+            layer.setHidden(target.is_none());
+            if let Some(target) = target {
+                layer.setFrame(target);
+            }
+        });
+        if animate && !was_hidden && changed {
+            animate_value(layer, "position", position.as_deref(), 0.18);
+            animate_value(layer, "bounds", bounds.as_deref(), 0.18);
+        } else if !animate && changed {
+            layer.removeAllAnimations();
+        }
+        self.update_material();
+        if redraw {
+            self.setNeedsDisplay(true);
+        }
+    }
+}
+struct Visual {
+    labels: RefCell<Vec<(Retained<NSAttributedString>, CGSize)>>,
+    icon: RefCell<Image>,
+    style: Cell<usize>,
+}
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsTabVisual"]
+    #[ivars = Visual]
+    struct TabVisual;
+    impl TabVisual {
+        #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
+        #[unsafe(method(hitTest:))] fn hit(&self, _: CGPoint) -> Option<&NSView> { None }
+        #[unsafe(method(viewDidChangeEffectiveAppearance))] fn appearance(&self) {
+            unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
+            self.setNeedsDisplay(true);
+        }
+        #[unsafe(method(drawRect:))] fn draw(&self, _: CGRect) {
+            let s = self.ivars();
+            let labels = s.labels.borrow();
+            let style = s.style.get();
+            let Some((label, text_size)) = labels.get(style) else { return; };
+            let width = self.bounds().size.width;
+            if style == 1 {
+                NSColor::labelColor().colorWithAlphaComponent(0.035).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(0.0, 3.0, width, 22.0), 11.0, 11.0).fill();
+            }
+            let icon_width = 22.0;
+            let text_width = labels[2].1.width.min((width - 44.0 - icon_width).max(0.0));
+            let x = (width - text_width - icon_width) / 2.0;
+            unsafe { s.icon.borrow().drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                rect(x, 7.0, 14.0, 14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, 1.0, true, None); }
+            label.drawWithRect_options(rect(x + icon_width, (28.0 - text_size.height)/2.0, text_width, text_size.height),
+                NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine);
+        }
+    }
+);
+fn without_actions(f: impl FnOnce()) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    f();
+    CATransaction::commit();
+}
+fn layer_value(layer: &CALayer, key: &str) -> Option<Retained<AnyObject>> {
+    unsafe { msg_send![layer, valueForKey: &*NSString::from_str(key)] }
+}
+fn animate_value(layer: &CALayer, key: &str, from: Option<&AnyObject>, duration: f64) {
+    let key = NSString::from_str(key);
+    let animation = CABasicAnimation::animationWithKeyPath(Some(&key));
+    unsafe {
+        animation.setFromValue(from);
+    }
+    animation.setDuration(duration);
+    animation.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
+        0.42, 0.0, 0.58, 1.0,
+    )));
+    layer.addAnimation_forKey(&animation, Some(&key));
+}
+impl TabContent {
+    fn update_material(&self) {
+        let s = self.ivars();
+        let workspace = NSWorkspace::sharedWorkspace();
+        let contrast = workspace.accessibilityDisplayShouldIncreaseContrast();
+        let opaque = workspace.accessibilityDisplayShouldReduceTransparency();
+        self.effectiveAppearance()
+            .performAsCurrentDrawingAppearance(&block2::RcBlock::new(|| {
+                without_actions(|| {
+                    s.highlight.setBackgroundColor(Some(
+                        &if opaque || contrast {
+                            NSColor::controlBackgroundColor()
+                        } else {
+                            NSColor::unemphasizedSelectedContentBackgroundColor()
+                                .colorWithAlphaComponent(0.28)
+                        }
+                        .CGColor(),
+                    ));
+                    s.highlight.setBorderWidth(if contrast { 1.0 } else { 0.5 });
+                    s.highlight.setBorderColor(Some(
+                        &if contrast {
+                            NSColor::labelColor()
+                        } else {
+                            NSColor::highlightColor().colorWithAlphaComponent(0.16)
+                        }
+                        .CGColor(),
+                    ));
+                })
+            }));
+    }
+
+    fn stop_motion(&self) {
+        self.ivars().highlight.removeAllAnimations();
+        for tab in self.ivars().tabs.borrow().iter() {
+            tab.visual.layer().unwrap().removeAllAnimations();
+        }
+        for view in self.ivars().retiring.subviews() {
+            view.removeFromSuperview();
+        }
     }
 }
 #[allow(deprecated)]
 fn placeholder() -> Image {
     let image = NSImage::initWithSize(NSImage::alloc(), CGSize::new(14.0, 14.0));
     image.lockFocusFlipped(true);
-    NSColor::colorWithWhite_alpha(1.0, 0.20).setFill();
+    NSColor::secondaryLabelColor().setFill();
     NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(0.0, 0.0, 14.0, 14.0), 3.0, 3.0)
         .fill();
     image.unlockFocus();
@@ -265,8 +442,21 @@ impl TabBar {
         if let Some(layer) = viewport.layer() {
             layer.setMasksToBounds(true);
         }
-        let paragraph = NSMutableParagraphStyle::new();
-        paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        let highlight = CALayer::new();
+        highlight.setCornerRadius(11.0);
+        highlight.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
+        highlight.setHidden(true);
+        let retiring: Retained<TabVisual> = unsafe {
+            msg_send![
+                super(TabVisual::alloc(ui.mtm()).set_ivars(Visual {
+                    labels: RefCell::new(Vec::new()),
+                    icon: RefCell::new(placeholder()),
+                    style: Cell::new(0),
+                })),
+                init
+            ]
+        };
+        let retiring = retiring.into_super();
         let content: Retained<TabContent> = unsafe {
             msg_send![
                 super(TabContent::alloc(ui.mtm()).set_ivars(Content {
@@ -277,15 +467,19 @@ impl TabBar {
                     offset: Cell::new(0.0),
                     action,
                     viewport,
-                    clip: RefCell::new(None),
+                    highlight,
+                    retiring,
                     fonts: {
                         [
+                            NSFont::systemFontOfSize_weight(12.0, NSFontWeightRegular),
                             NSFont::systemFontOfSize_weight(12.0, NSFontWeightMedium),
-                            NSFont::systemFontOfSize_weight(12.0, NSFontWeightSemibold),
                         ]
                     },
-                    text_colors: [0.55, 0.80, 0.95].map(|a| NSColor::colorWithWhite_alpha(1.0, a)),
-                    paragraph,
+                    text_colors: [
+                        NSColor::secondaryLabelColor(),
+                        NSColor::labelColor(),
+                        NSColor::labelColor()
+                    ],
                     close_symbol: crate::Symbol::named("xmark").and_then(|image| {
                         image.imageWithSymbolConfiguration(
                             &NSImageSymbolConfiguration::configurationWithPointSize_weight(
@@ -295,43 +489,56 @@ impl TabBar {
                         )
                     }),
                     placeholder: placeholder(),
-                    close_colors: [0.60, 0.95].map(|a| NSColor::colorWithWhite_alpha(1.0, a)),
-                    close_fill: NSColor::colorWithWhite_alpha(1.0, 0.18),
-                    fills: [0.0, 0.10, 0.16].map(|a| NSColor::colorWithWhite_alpha(1.0, a)),
-                    strokes: [0.08, 0.22].map(|a| NSColor::colorWithWhite_alpha(1.0, a)),
+                    close_colors: [NSColor::secondaryLabelColor(), NSColor::labelColor()],
+                    close_fill: NSColor::labelColor().colorWithAlphaComponent(0.10),
+                    clear: NSColor::clearColor(),
                     ui: *ui,
                 })),
                 init
             ]
         };
+        unsafe {
+            NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .addObserver_selector_name_object(
+                    &content,
+                    objc2::sel!(accessibilityChanged:),
+                    Some(&NSString::from_str(
+                        "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification",
+                    )),
+                    None,
+                );
+        }
         content.setAccessibilityElement(true);
         content.setAccessibilityRole(Some(unsafe { NSAccessibilityTabGroupRole }));
         content.setAccessibilityLabel(Some(&NSString::from_str("Window tabs")));
         content.addSubview(&content.ivars().viewport);
+        content.addSubview(&content.ivars().retiring);
         content.setWantsLayer(true);
         if let Some(layer) = content.layer() {
-            layer.setMasksToBounds(true);
-        }
-        let host = View::new(ui).content(content.retain().into_super(), crate::uniform_insets(0.0));
-        // Tabbed puts black backing inside the regular glass, rather than tinting
-        // the material. Keep these separate: NSGlassEffectView renders live glass.
-        let backing = host.ns_view().retain();
-        backing.setWantsLayer(true);
-        let glass = GlassEffectView::new(ui, host)
-            .corner_radius(14.0)
-            .style(crate::GlassStyle::Regular);
-        let has_glass = glass.ns_glass_effect_view().is_some();
-        if let Some(layer) = backing.layer() {
             layer.setCornerRadius(14.0);
             layer.setMasksToBounds(true);
-            layer.setBackgroundColor(Some(
-                &NSColor::colorWithWhite_alpha(0.0, if has_glass { 0.45 } else { 0.18 }).CGColor(),
-            ));
+            layer.insertSublayer_atIndex(&content.ivars().highlight, 0);
         }
-        let surface: Box<dyn NativeView> = if has_glass {
+        let host = View::new(ui).content(content.retain().into_super(), crate::uniform_insets(0.0));
+        // The appearance hook must belong to AppKit itself, not just our subclass.
+        // If Apple removes it, use public active vibrancy rather than subdued glass.
+        let active_glass = objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
+            && NSPanel::class().instance_method(objc2::sel!(_hasActiveAppearance)).is_some();
+        let surface: Box<dyn NativeView> = if active_glass {
+            let glass = GlassEffectView::new(ui, host)
+                .corner_radius(14.0)
+                .style(crate::GlassStyle::Regular);
+            if let Some(native) = glass.ns_glass_effect_view() {
+                // Tint the material itself so its native optics remain visible.
+                native.setTintColor(Some(
+                    &NSColor::windowBackgroundColor().colorWithAlphaComponent(0.18),
+                ));
+            }
             Box::new(glass)
         } else {
-            let fallback = VisualEffect::new(ui, NSVisualEffectMaterial::HUDWindow, glass);
+            // Public-API fallback: active vibrancy, not Liquid Glass. Keep one material.
+            let fallback = VisualEffect::new(ui, NSVisualEffectMaterial::Popover, host);
             fallback.ns_visual_effect_view().setState(NSVisualEffectState::Active);
             fallback
                 .ns_visual_effect_view()
@@ -340,8 +547,6 @@ impl TabBar {
             if let Some(layer) = fallback.ns_view().layer() {
                 layer.setCornerRadius(14.0);
                 layer.setMasksToBounds(true);
-                layer.setBorderWidth(1.0);
-                layer.setBorderColor(Some(&NSColor::colorWithWhite_alpha(1.0, 0.10).CGColor()));
             }
             Box::new(fallback)
         };
@@ -353,7 +558,7 @@ impl TabBar {
         }
         panel.setAcceptsMouseMovedEvents(true);
         panel.setFloatingPanel(false);
-        panel.setHasShadow(true);
+        panel.setHasShadow(false);
         panel.setOpaque(false);
         panel.setBackgroundColor(Some(&NSColor::clearColor()));
         panel.setLevel(NSNormalWindowLevel);
@@ -362,9 +567,6 @@ impl TabBar {
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::FullScreenAuxiliary
                 | NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        panel.setAppearance(
-            NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }).as_deref(),
         );
         panel.setContentView(Some(surface.ns_view()));
         Self {
@@ -381,7 +583,7 @@ impl TabBar {
 
     pub fn set_tabs(&self, items: Vec<TabBarItem>, selected: usize) {
         let s = self.content.ivars();
-        if s.selected.get() == selected {
+        {
             let tabs = s.tabs.borrow();
             if tabs.len() == items.len()
                 && tabs
@@ -389,21 +591,51 @@ impl TabBar {
                     .zip(&items)
                     .all(|(tab, item)| tab.title == item.title && tab.icon == item.icon)
             {
+                let previous = s.selected.replace(selected);
+                if previous == selected {
+                    return;
+                }
+                drop(tabs);
+                // Reveal may change every frame during overflow. Otherwise only two
+                // cached labels and capsules need redrawing; controls remain unchanged.
+                self.content.arrange(true, false, self.motion_enabled());
+                let tabs = s.tabs.borrow();
+                for index in [previous, selected] {
+                    if let Some(tab) = tabs.get(index) {
+                        tab.visual.setNeedsDisplay(true);
+                    }
+                }
                 return;
             }
         }
-        let mut tabs = s.tabs.borrow_mut();
-        while tabs.len() > items.len() {
-            let tab = tabs.pop().unwrap();
-            tab.select.ns_view().removeFromSuperview();
-            tab.close.ns_view().removeFromSuperview();
+        let animate = self.motion_enabled();
+        let count_changed = s.tabs.borrow().len() != items.len();
+        for view in s.retiring.subviews() {
+            view.removeFromSuperview();
         }
+        let mut tabs = s.tabs.borrow_mut();
+        let mut old: Vec<_> = tabs.drain(..).map(Some).collect();
         for (i, item) in items.into_iter().enumerate() {
+            let existing = old.iter().position(|tab| {
+                tab.as_ref().is_some_and(|tab| tab.title == item.title && tab.icon == item.icon)
+            });
+            if let Some(tab) = existing.and_then(|index| old[index].take()).or_else(|| {
+                if !count_changed {
+                    old.get_mut(i).and_then(Option::take)
+                } else {
+                    None
+                }
+            }) {
+                tabs.push(tab);
+            }
             if i == tabs.len() {
+                let index = Rc::new(Cell::new(i));
+                let select_index = index.clone();
+                let close_index = index.clone();
                 let action = s.action.clone();
                 let select = Button::new(&s.ui, "")
                     .borderless()
-                    .on_click(move || emit(&action, TabBarAction::Select(i)));
+                    .on_click(move || emit(&action, TabBarAction::Select(select_index.get())));
                 select.ns_button().setTransparent(true);
                 select
                     .ns_button()
@@ -412,7 +644,7 @@ impl TabBar {
                 let close = Button::new(&s.ui, "")
                     .borderless()
                     .symbol("xmark")
-                    .on_click(move || emit(&action, TabBarAction::Close(i)));
+                    .on_click(move || emit(&action, TabBarAction::Close(close_index.get())));
                 close.accessibility_label("Close window");
                 close.ns_button().setBezelStyle(NSBezelStyle::FlexiblePush);
                 close.ns_button().setImage(s.close_symbol.as_deref());
@@ -421,6 +653,27 @@ impl TabBar {
                 if let Some(layer) = close.ns_view().layer() {
                     layer.setCornerRadius(7.5);
                 }
+                let visual: Retained<TabVisual> = unsafe {
+                    msg_send![
+                        super(TabVisual::alloc(s.ui.mtm()).set_ivars(Visual {
+                            labels: RefCell::new(Vec::new()),
+                            icon: RefCell::new(s.placeholder.retain()),
+                            style: Cell::new(0),
+                        })),
+                        init
+                    ]
+                };
+                visual.setWantsLayer(true);
+                // Preserve glyph/icon scale while the compositor resizes the tab.
+                visual.setLayerContentsPlacement(NSViewLayerContentsPlacement::Center);
+                visual.setAccessibilityElement(false);
+                s.viewport.addSubview(&visual);
+                if animate {
+                    let layer = visual.layer().unwrap();
+                    without_actions(|| layer.setOpacity(1.0));
+                    let zero = objc2_foundation::NSNumber::new_f32(0.0);
+                    animate_value(&layer, "opacity", Some(&zero), 0.14);
+                }
                 s.viewport.addSubview(select.ns_view());
                 s.viewport.addSubview(close.ns_view());
                 tabs.push(Tab {
@@ -428,14 +681,20 @@ impl TabBar {
                     close,
                     title: String::new(),
                     icon: None,
-                    labels: Vec::new(),
-                    path: None,
+                    visual,
+                    index,
                 });
             }
             let tab = &mut tabs[i];
-            if tab.title != item.title || tab.labels.is_empty() {
+            tab.index.set(i);
+            if tab.title != item.title || tab.visual.ivars().labels.borrow().is_empty() {
                 tab.select.set_title(&item.title);
-                tab.labels = (0..3)
+                let paragraph = NSMutableParagraphStyle::new();
+                paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                if item.title.contains('/') || item.title.contains('\\') {
+                    paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+                }
+                let labels = (0..3)
                     .map(|style| {
                         let attrs = NSDictionary::from_slices(
                             &[
@@ -446,7 +705,7 @@ impl TabBar {
                             &[
                                 &*s.fonts[usize::from(style == 2)] as &AnyObject,
                                 &*s.text_colors[style] as &AnyObject,
-                                &*s.paragraph as &AnyObject,
+                                &*paragraph as &AnyObject,
                             ],
                         );
                         let label = unsafe {
@@ -463,26 +722,61 @@ impl TabBar {
                 tab.select.accessibility_label(&item.title);
                 tab.select.tooltip(&item.title);
                 tab.close.accessibility_label(&format!("Close {}", item.title));
+                *tab.visual.ivars().labels.borrow_mut() = labels;
+                tab.visual.setNeedsDisplay(true);
                 tab.title = item.title;
             }
             if tab.icon != item.icon {
+                *tab.visual.ivars().icon.borrow_mut() =
+                    item.icon.as_ref().unwrap_or(&s.placeholder).retain();
+                tab.visual.setNeedsDisplay(true);
                 tab.icon = item.icon;
+            }
+        }
+        for tab in old.into_iter().flatten() {
+            tab.select.ns_view().removeFromSuperview();
+            tab.close.ns_view().removeFromSuperview();
+            if animate {
+                s.retiring.addSubview(&tab.visual);
+                let layer = tab.visual.layer().unwrap();
+                let from = layer_value(
+                    &unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain()),
+                    "opacity",
+                );
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                layer.setOpacity(0.0);
+                let visual = tab.visual.retain();
+                let done = block2::RcBlock::new(move || visual.removeFromSuperview());
+                unsafe {
+                    CATransaction::setCompletionBlock(Some(&done));
+                }
+                animate_value(&layer, "opacity", from.as_deref(), 0.14);
+                CATransaction::commit();
+            } else {
+                tab.visual.removeFromSuperview();
             }
         }
         let count = tabs.len();
         drop(tabs);
         s.selected.set(selected);
-        if s.hovered.get().is_some_and(|index| index >= count) {
+        if count_changed || s.hovered.get().is_some_and(|index| index >= count) {
             s.hovered.set(None);
             s.close_hovered.set(None);
         }
-        self.content.arrange(true);
+        self.content.arrange(true, true, animate);
+    }
+
+    fn motion_enabled(&self) -> bool {
+        self.content.window().is_some_and(|window| window.isVisible())
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
     }
 
     pub fn set_frame(&self, frame: CGRect) {
         if self.panel.frame() != frame {
+            self.content.stop_motion();
             self.panel.setFrame_display(frame, true);
-            self.content.arrange(true);
+            self.content.arrange(true, true, false);
         }
     }
 
@@ -494,6 +788,7 @@ impl TabBar {
     }
 
     pub fn hide(&self) {
+        self.content.stop_motion();
         if self.is_visible() {
             self.panel.orderOut(None);
         }
@@ -506,6 +801,11 @@ impl TabBar {
 impl Drop for TabBar {
     fn drop(&mut self) {
         self.hide();
+        unsafe {
+            NSWorkspace::sharedWorkspace()
+                .notificationCenter()
+                .removeObserver(&self.content);
+        }
         let action = &self.content.ivars().action;
         action.alive.set(false);
         if let Ok(mut callback) = action.callback.try_borrow_mut() {

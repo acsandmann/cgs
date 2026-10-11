@@ -1199,6 +1199,20 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         let anchor = Window::new(ui).size(CGSize::new(250.0, 100.0));
         anchor.show();
         bar.show_above(anchor.ns_window().windowNumber());
+        let app = objc2_app_kit::NSApplication::sharedApplication(ui.mtm());
+        let key_before = app.keyWindow();
+        let frontmost_before = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication();
+        bar.ns_panel().makeKeyWindow();
+        assert!(
+            !bar.ns_panel().isKeyWindow(),
+            "appearance must never fake key status"
+        );
+        assert!(!bar.ns_panel().isMainWindow());
+        assert_eq!(
+            app.keyWindow(),
+            key_before,
+            "a nonactivating bar cannot take keyboard focus"
+        );
         bar.ns_panel()
             .contentView()
             .unwrap()
@@ -1258,6 +1272,13 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         action(close);
         assert!(matches!(actions.borrow()[0], TabBarAction::Select(0)));
         assert!(matches!(actions.borrow()[1], TabBarAction::Close(0)));
+        assert!(!bar.ns_panel().isKeyWindow());
+        assert_eq!(app.keyWindow(), key_before);
+        assert_eq!(
+            objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication(),
+            frontmost_before,
+            "native tab actions must not activate the overlay application"
+        );
         content.mouseExited(&movement);
         assert!(close.isHidden(), "leaving the strip hides close controls");
         bar.set_frame(CGRect::new(
@@ -1290,6 +1311,45 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
             .frame();
         assert!(second.size.width >= 120.0);
         assert!(second.origin.x >= 0.0 && second.origin.x + second.size.width <= 218.0);
+        // Native controls must follow their window when count changes/reordering
+        // retarget the visuals. Hit testing uses the new logical frames immediately.
+        let second_control = overflow
+            .iter()
+            .find(|control| {
+                control
+                    .accessibilityLabel()
+                    .is_some_and(|label| label.to_string() == "Second")
+            })
+            .unwrap()
+            .retain();
+        let items = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| TabBarItem {
+                    title: (*name).into(),
+                    icon: None,
+                })
+                .collect()
+        };
+        bar.set_tabs(items(&["First", "Second", "Third"]), 2);
+        bar.set_tabs(items(&["Second", "Third"]), 0);
+        assert!(unsafe { second_control.superview() }.is_some());
+        let frame = second_control.frame();
+        let point = content.convertPoint_toView(
+            CGPoint::new(frame.origin.x + frame.size.width / 2.0, 14.0),
+            unsafe { content.superview() }.as_deref(),
+        );
+        assert_eq!(
+            content.hitTest(point).as_deref(),
+            Some(second_control.as_super()),
+            "transitioning visuals must not intercept the new logical tab region"
+        );
+        actions.borrow_mut().clear();
+        action(&second_control);
+        assert!(
+            matches!(actions.borrow().as_slice(), [TabBarAction::Select(0)]),
+            "reused controls must dispatch the current index after removal"
+        );
         anchor.ns_window().orderWindow_relativeTo(
             objc2_app_kit::NSWindowOrderingMode::Above,
             bar.ns_panel().windowNumber(),
