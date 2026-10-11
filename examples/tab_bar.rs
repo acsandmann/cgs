@@ -1,8 +1,8 @@
 //! Native preview: `cargo run --example tab_bar -- --embedded --light`.
 //! Compare --dark, --many, --clear and --bright / --dim / --colorful backgrounds;
 //! --embedded --wallpaper=PATH previews the strip over busy imagery.
-//! --vertical lays tabs top to bottom (--length=N sets its height); --thickness=N changes
-//! the strip's thickness.
+//! --vertical lays tabs top to bottom (--length=N sets its height, --right reads downward); --thickness=N changes
+//! the strip's thickness. --hover selects tabs when the pointer enters them.
 //! --panel-only captures the actual non-key panel; --embedded is an ordinary-window
 //! reference (click its window to make the reference active).
 //! --anchor=WINDOW_NUMBER orders above another application's window without activating it.
@@ -140,7 +140,14 @@ fn main() {
     let length = std::env::args()
         .find_map(|arg| arg.strip_prefix("--length=").and_then(|v| v.parse::<f64>().ok()))
         .unwrap_or(300.0);
-    bar.set_vertical(vertical);
+    bar.set_edge(if !vertical {
+        TabBarEdge::Top
+    } else if std::env::args().any(|arg| arg == "--right") {
+        TabBarEdge::Right
+    } else {
+        TabBarEdge::Left
+    });
+    bar.set_select_on_hover(std::env::args().any(|arg| arg == "--hover"));
     let frame = window.ns_window().frame();
     bar.set_frame(CGRect::new(
         CGPoint::new(frame.origin.x + 10.0, frame.origin.y + 285.0),
@@ -209,8 +216,7 @@ fn main() {
         );
         if vertical {
             strip.width(thickness);
-            // A vertical bar fits its tabs; mirror the panel's fitted height.
-            strip.height(bar.ns_panel().frame().size.height);
+            strip.height(length);
             window.set_content(
                 HStack::new(&ui).push(strip).push(VStack::new(&ui).push(label).push(controls)),
             );
