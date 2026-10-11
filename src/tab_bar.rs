@@ -46,6 +46,7 @@ struct Content {
     hovered: Cell<Option<usize>>,
     close_hovered: Cell<Option<usize>>,
     offset: Cell<f64>,
+    vertical: Cell<bool>,
     action: Action,
     viewport: Retained<NSView>,
     highlight: Retained<CALayer>,
@@ -72,6 +73,16 @@ define_class!(
         // actual key/main eligibility and focus routing remain public AppKit state.
         // Undocumented behavior may change in future macOS releases.
         #[unsafe(method(_hasActiveAppearance))] fn active_appearance(&self) -> bool { true }
+    }
+);
+define_class!(
+    // Tabs are positioned top-down, matching the content view and its highlight layer.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsTabViewport"]
+    struct TabViewport;
+    impl TabViewport {
+        #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
     }
 );
 define_class!(
@@ -132,8 +143,8 @@ define_class!(
             let hover = self.index_at(p);
             let close = hover.filter(|&i| {
                 let tabs = self.ivars().tabs.borrow();
-                let button = tabs[i].close.ns_view();
-                p.x >= button.frame().origin.x && p.x < button.frame().origin.x + 15.0 && p.y >= 6.5 && p.y < 21.5
+                let f = tabs[i].close.ns_view().frame();
+                p.x >= f.origin.x && p.x < f.origin.x + f.size.width && p.y >= f.origin.y && p.y < f.origin.y + f.size.height
             });
             let previous = self.ivars().hovered.replace(hover);
             let changed = previous != hover;
@@ -178,12 +189,9 @@ impl TabContent {
                     &if close_hover { &*close_fill } else { &s.clear }.CGColor(),
                 ));
             }
-            let frame = tab.close.ns_view().frame();
-            tab.close.set_hidden(
-                s.hovered.get() != Some(index)
-                    || frame.origin.x < 0.0
-                    || frame.origin.x + frame.size.width > self.bounds().size.width,
-            );
+            tab.close
+                .set_hidden(s.hovered.get() != Some(index) || self.clipped(tab.close.ns_view()));
+            self.cover_icon(tab);
             tab.visual.ivars().style.set(if s.selected.get() == index {
                 2
             } else if s.hovered.get() == Some(index) {
@@ -195,22 +203,70 @@ impl TabContent {
         }
     }
 
+    /// Like Safari's favicons, an icon-only tab shows its close button in the icon's place.
+    fn cover_icon(&self, tab: &Tab) {
+        let covered = self.ivars().vertical.get() && !tab.close.ns_view().isHidden();
+        if tab.visual.ivars().covered.replace(covered) != covered {
+            tab.visual.setNeedsDisplay(true);
+        }
+    }
+
     /// Hairlines divide resting tabs only; a capsule already delimits its neighbours.
     fn separated(&self, index: usize) -> bool {
         let s = self.ivars();
         let plain = |i: usize| s.selected.get() != i && s.hovered.get() != Some(i);
-        index > 0 && plain(index) && plain(index - 1)
+        !s.vertical.get() && index > 0 && plain(index) && plain(index - 1)
     }
 
-    fn geometry(&self) -> (f64, f64) {
-        let width = self.bounds().size.width.max(0.0);
+    /// Bar length along the tab axis, bar thickness across it, and the length of one tab.
+    /// Tabs run left to right in a horizontal bar and top to bottom in a vertical one.
+    fn geometry(&self) -> (f64, f64, f64) {
+        let size = self.bounds().size;
+        let (length, thickness) = if self.ivars().vertical.get() {
+            (size.height, size.width)
+        } else {
+            (size.width, size.height)
+        };
+        let length = length.max(0.0);
+        if self.ivars().vertical.get() {
+            return (length, thickness.max(0.0), cell_length(thickness));
+        }
         let n = self.ivars().tabs.try_borrow().map(|tabs| tabs.len().max(1)).unwrap_or(1) as f64;
-        (width, ((width - 2.0 * INSET - (n - 1.0) * GAP) / n).max(120.0))
+        (
+            length,
+            thickness.max(0.0),
+            ((length - 2.0 * INSET - (n - 1.0) * GAP) / n).max(120.0),
+        )
+    }
+
+    /// A rectangle given along (`main`) and across (`cross`) the tab axis.
+    fn place(&self, main: f64, cross: f64, main_len: f64, cross_len: f64) -> CGRect {
+        if self.ivars().vertical.get() {
+            rect(cross, main, cross_len, main_len)
+        } else {
+            rect(main, cross, main_len, cross_len)
+        }
+    }
+
+    fn clipped(&self, view: &NSView) -> bool {
+        let f = view.frame();
+        let (length, ..) = self.geometry();
+        let (start, len) = if self.ivars().vertical.get() {
+            (f.origin.y, f.size.height)
+        } else {
+            (f.origin.x, f.size.width)
+        };
+        start < 0.0 || start + len > length
     }
 
     fn index_at(&self, p: CGPoint) -> Option<usize> {
-        let (width, tab_width) = self.geometry();
-        if p.x < INSET || p.x >= width || p.y < INSET || p.y >= TabBar::HEIGHT - INSET {
+        let (width, thickness, tab_width) = self.geometry();
+        let p = if self.ivars().vertical.get() {
+            CGPoint::new(p.y, p.x)
+        } else {
+            p
+        };
+        if p.x < INSET || p.x >= width || p.y < INSET || p.y >= thickness - INSET {
             return None;
         }
         let x = p.x - INSET + self.ivars().offset.get();
@@ -220,7 +276,8 @@ impl TabContent {
 
     fn arrange(&self, reveal: bool, mut redraw: bool, animate: bool) {
         let s = self.ivars();
-        let (width, tab_width) = self.geometry();
+        let (width, thickness, tab_width) = self.geometry();
+        let vertical = s.vertical.get();
         let Ok(mut tabs) = s.tabs.try_borrow_mut() else {
             return;
         };
@@ -234,7 +291,7 @@ impl TabContent {
             offset = offset.min(left).max(left + tab_width + 2.0 * INSET - width).clamp(0.0, max);
         }
         s.offset.set(offset);
-        let viewport_frame = rect(0.0, 0.0, width, 28.0);
+        let viewport_frame = self.bounds();
         if s.viewport.frame() != viewport_frame {
             redraw = true;
             s.viewport.setFrame(viewport_frame);
@@ -246,13 +303,16 @@ impl TabContent {
             let hover = s.hovered.get() == Some(i);
             let x = INSET + i as f64 * (tab_width + GAP) - offset;
             let button = tab.select.ns_button();
-            let frame = rect(x, INSET, tab_width, TabBar::HEIGHT - 2.0 * INSET);
+            let frame = self.place(x, INSET, tab_width, thickness - 2.0 * INSET);
             button.setFrame(frame);
-            let visual_frame = rect(x, 0.0, tab_width, 28.0);
+            let visual_frame = self.place(x, 0.0, tab_width, thickness);
+            if tab.visual.ivars().vertical.replace(vertical) != vertical {
+                tab.visual.setNeedsDisplay(true);
+            }
             if tab.visual.frame() != visual_frame {
                 let layer = tab.visual.layer().unwrap();
                 let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
-                let had_size = from.bounds().size.width > 0.0;
+                let had_size = from.bounds().size.width > 0.0 && from.bounds().size.height > 0.0;
                 let old_position = layer_value(&from, "position");
                 let old_bounds = layer_value(&from, "bounds");
                 without_actions(|| tab.visual.setFrame(visual_frame));
@@ -296,14 +356,36 @@ impl TabContent {
             tab.close.ns_button().setContentTintColor(Some(
                 &s.close_colors[usize::from(s.close_hovered.get() == Some(i))],
             ));
-            tab.close.ns_button().setFrame(rect(x + 8.0, 6.5, 15.0, 15.0));
-            let close_x = tab.close.ns_view().frame().origin.x;
-            tab.close.set_hidden(!hover || close_x < 0.0 || close_x + 15.0 > width);
+            let close = CLOSE.min(thickness - 2.0 * INSET);
+            let close_main = if vertical {
+                x + (tab_width - close) / 2.0
+            } else {
+                x + (thickness - close) / 2.0 - INSET + 2.0
+            };
+            tab.close.ns_button().setFrame(self.place(
+                close_main,
+                (thickness - close) / 2.0,
+                close,
+                close,
+            ));
+            if let Some(layer) = tab.close.ns_view().layer() {
+                layer.setCornerRadius(close / 2.0);
+            }
+            tab.close.set_hidden(!hover || self.clipped(tab.close.ns_view()));
+            self.cover_icon(tab);
             // Only visible tabs participate in native hit testing.
             tab.select.set_hidden(x + tab_width <= 0.0 || x >= width);
         }
         let target = tabs.get(s.selected.get()).map(|tab| tab.select.ns_view().frame());
         let layer = &s.highlight;
+        let radius = (thickness / 2.0 - INSET).max(0.0);
+        if layer.cornerRadius() != radius {
+            without_actions(|| layer.setCornerRadius(radius));
+        }
+        // Concentric with the outer capsule, whose radius follows the bar's thickness.
+        if let Some(outer) = self.layer() {
+            outer.setCornerRadius(thickness / 2.0);
+        }
         let was_hidden = layer.isHidden();
         let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
         let position = layer_value(&from, "position");
@@ -330,11 +412,16 @@ impl TabContent {
 // Concentric with the capsule: the outer radius equals the tab radius plus this inset.
 const INSET: f64 = 3.0;
 const GAP: f64 = 2.0;
+const CLOSE: f64 = 15.0;
+/// A vertical bar holds icon-only capsules, slightly taller than they are wide.
+fn cell_length(thickness: f64) -> f64 { (thickness - 2.0 * INSET).max(0.0) + 8.0 }
 struct Visual {
     labels: RefCell<Vec<(Retained<NSAttributedString>, CGSize)>>,
     icon: RefCell<Image>,
     style: Cell<usize>,
     separator: Cell<bool>,
+    vertical: Cell<bool>,
+    covered: Cell<bool>,
 }
 define_class!(
     #[unsafe(super(NSView))]
@@ -356,27 +443,51 @@ define_class!(
             let labels = s.labels.borrow();
             let style = s.style.get();
             let Some((label, text_size)) = labels.get(style) else { return; };
-            let width = self.bounds().size.width;
-            let radius = TabBar::HEIGHT / 2.0 - INSET;
+            let vertical = s.vertical.get();
+            let size = self.bounds().size;
+            // Work along the tab axis; a vertical bar swaps the two dimensions.
+            let (length, thickness) = if vertical { (size.height, size.width) } else { (size.width, size.height) };
+            let place = |main: f64, cross: f64, main_len: f64, cross_len: f64| {
+                if vertical { rect(cross, main, cross_len, main_len) } else { rect(main, cross, main_len, cross_len) }
+            };
+            let radius = (thickness / 2.0 - INSET).max(0.0);
             if style == 1 {
                 NSColor::labelColor().colorWithAlphaComponent(0.07).setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect(0.0, INSET, width, TabBar::HEIGHT - 2.0 * INSET), radius, radius).fill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(place(0.0, INSET, length, thickness - 2.0 * INSET), radius, radius).fill();
             }
+            let scale = self.window().map_or(2.0, |window| window.backingScaleFactor()).max(1.0);
+            let snap = |value: f64| (value * scale).round() / scale;
             if s.separator.get() {
                 NSColor::separatorColor().setFill();
-                let hairline = 1.0 / self.window().map_or(2.0, |window| window.backingScaleFactor()).max(1.0);
-                NSBezierPath::fillRect(rect(0.0, 8.0, hairline, TabBar::HEIGHT - 16.0));
+                let inset = (thickness / 2.0 - 6.0).max(INSET);
+                NSBezierPath::fillRect(place(0.0, inset, 1.0 / scale, thickness - 2.0 * inset));
             }
-            let icon_width = 22.0;
-            let text_width = labels[2].1.width.min((width - 44.0 - icon_width).max(0.0));
-            let scale = self.window().map_or(1.0, |window| window.backingScaleFactor()).max(1.0);
-            let x = (((width - text_width - icon_width) / 2.0) * scale).round() / scale;
-            let text_y = (((28.0 - text_size.height) / 2.0) * scale).round() / scale;
+            // Icons alone carry a vertical tab, so they get a little more room.
+            let icon = if vertical {
+                (thickness - 2.0 * INSET - 6.0).clamp(10.0, 16.0)
+            } else {
+                (thickness - 2.0 * INSET - 8.0).clamp(10.0, 14.0)
+            };
             // Resting tabs recede slightly so the selection reads at a glance.
             let fraction = if style == 2 { 1.0 } else { 0.85 };
-            unsafe { s.icon.borrow().drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                rect(x, 7.0, 14.0, 14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, fraction, true, None); }
-            label.drawWithRect_options(rect(x + icon_width, text_y, text_width, text_size.height),
+            let draw_icon = |main: f64| unsafe {
+                s.icon.borrow().drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+                    place(main, snap((thickness - icon) / 2.0), icon, icon), CGRect::ZERO,
+                    NSCompositingOperation::SourceOver, fraction, true, None);
+            };
+            if vertical {
+                // Too narrow for a legible title; the button's tooltip and label carry it.
+                if !s.covered.get() {
+                    draw_icon(snap((length - icon) / 2.0));
+                }
+                return;
+            }
+            let icon_width = icon + 8.0;
+            let text_width = labels[2].1.width.min((length - 44.0 - icon_width).max(0.0));
+            let start = snap((length - text_width - icon_width) / 2.0);
+            draw_icon(start);
+            let text_y = snap((thickness - text_size.height) / 2.0);
+            label.drawWithRect_options(rect(start + icon_width, text_y, text_width, text_size.height),
                 NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine);
         }
     }
@@ -437,7 +548,13 @@ impl TabContent {
                         .CGColor(),
                     ));
                     s.highlight.setShadowColor(Some(&NSColor::blackColor().CGColor()));
-                    s.highlight.setShadowOpacity(if opaque { 0.0 } else if dark { 0.3 } else { 0.14 });
+                    s.highlight.setShadowOpacity(if opaque {
+                        0.0
+                    } else if dark {
+                        0.3
+                    } else {
+                        0.14
+                    });
                     s.highlight.setShadowRadius(2.0);
                     s.highlight.setShadowOffset(CGSize::new(0.0, 1.0));
                 })
@@ -490,8 +607,11 @@ pub struct TabBar {
     panel: Retained<TabPanel>,
     content: Retained<TabContent>,
     _surface: Box<dyn NativeView>,
+    /// The full edge offered by the caller; a vertical bar occupies only its top.
+    edge: Cell<CGRect>,
 }
 impl TabBar {
+    /// Default thickness; any thickness from about 20 points works.
     pub const HEIGHT: f64 = 28.0;
 
     pub fn new(ui: &Ui) -> Self {
@@ -499,7 +619,9 @@ impl TabBar {
             callback: RefCell::new(None),
             alive: Cell::new(true),
         });
-        let viewport = NSView::new(ui.mtm());
+        let viewport: Retained<TabViewport> =
+            unsafe { msg_send![super(TabViewport::alloc(ui.mtm()).set_ivars(())), init] };
+        let viewport = viewport.into_super();
         viewport.setWantsLayer(true);
         if let Some(layer) = viewport.layer() {
             layer.setMasksToBounds(true);
@@ -515,6 +637,8 @@ impl TabBar {
                     icon: RefCell::new(placeholder()),
                     style: Cell::new(0),
                     separator: Cell::new(false),
+                    vertical: Cell::new(false),
+                    covered: Cell::new(false),
                 })),
                 init
             ]
@@ -528,6 +652,7 @@ impl TabBar {
                     hovered: Cell::new(None),
                     close_hovered: Cell::new(None),
                     offset: Cell::new(0.0),
+                    vertical: Cell::new(false),
                     action,
                     viewport,
                     highlight,
@@ -628,6 +753,7 @@ impl TabBar {
             panel,
             content,
             _surface: surface,
+            edge: Cell::new(CGRect::ZERO),
         }
     }
 
@@ -714,7 +840,9 @@ impl TabBar {
                             labels: RefCell::new(Vec::new()),
                             icon: RefCell::new(s.placeholder.retain()),
                             style: Cell::new(0),
-                    separator: Cell::new(false),
+                            separator: Cell::new(false),
+                            vertical: Cell::new(false),
+                    covered: Cell::new(false),
                         })),
                         init
                     ]
@@ -821,6 +949,9 @@ impl TabBar {
             s.close_hovered.set(None);
         }
         self.content.arrange(true, true, animate);
+        if count_changed {
+            self.fit();
+        }
     }
 
     fn motion_enabled(&self) -> bool {
@@ -828,16 +959,62 @@ impl TabBar {
             && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
     }
 
+    /// Lay tabs out as a compact column of icons, for a strip beside a vertical stack.
+    pub fn set_vertical(&self, vertical: bool) {
+        let s = self.content.ivars();
+        if s.vertical.replace(vertical) != vertical {
+            self.content.stop_motion();
+            s.offset.set(0.0);
+            self.content.arrange(true, true, false);
+            self.fit();
+        }
+    }
+
+    /// The edge the bar may occupy, in AppKit screen coordinates. A horizontal bar fills
+    /// it; a vertical bar shrinks to its tabs and hangs from the top.
     pub fn set_frame(&self, frame: CGRect) {
+        self.edge.set(frame);
+        self.fit();
+    }
+
+    fn fit(&self) {
+        let mut frame = self.edge.get();
+        if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+            return;
+        }
+        if self.content.ivars().vertical.get() {
+            let n = self.content.ivars().tabs.borrow().len().max(1) as f64;
+            let length = 2.0 * INSET + n * cell_length(frame.size.width) + (n - 1.0) * GAP;
+            let length = length.min(frame.size.height);
+            frame.origin.y += frame.size.height - length;
+            frame.size.height = length;
+        }
+        self.apply_frame(frame);
+    }
+
+    fn apply_frame(&self, frame: CGRect) {
         let previous = self.panel.frame();
         if previous != frame {
             let resized = previous.size != frame.size;
             if resized {
                 self.content.stop_motion();
+                self.set_corner_radius(frame.size.width.min(frame.size.height) / 2.0);
             }
             self.panel.setFrame_display(frame, true);
             if resized {
                 self.content.arrange(true, true, false);
+            }
+        }
+    }
+
+    fn set_corner_radius(&self, radius: f64) {
+        if let Some(view) = self.panel.contentView() {
+            if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
+                && let Ok(glass) = view.clone().downcast::<NSGlassEffectView>()
+            {
+                glass.setCornerRadius(radius);
+            } else if let Some(layer) = view.layer() {
+                layer.setCornerRadius(radius);
             }
         }
     }

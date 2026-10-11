@@ -1,6 +1,8 @@
 //! Native preview: `cargo run --example tab_bar -- --embedded --light`.
 //! Compare --dark, --many, --clear and --bright / --dim / --colorful backgrounds;
 //! --embedded --wallpaper=PATH previews the strip over busy imagery.
+//! --vertical lays tabs top to bottom (--length=N sets its height); --thickness=N changes
+//! the strip's thickness.
 //! --panel-only captures the actual non-key panel; --embedded is an ordinary-window
 //! reference (click its window to make the reference active).
 //! --anchor=WINDOW_NUMBER orders above another application's window without activating it.
@@ -57,7 +59,9 @@ fn main() {
             .setAppearance(objc2_app_kit::NSAppearance::appearanceNamed(name).as_deref());
     }
     let reference = std::env::args().any(|arg| arg == "--reference");
-    let titles = Rc::new(RefCell::new(if reference {
+    let titles = Rc::new(RefCell::new(if std::env::args().any(|arg| arg == "--same") {
+        vec![".../Documents/schoolgithub/rift", ".../Documents/schoolgithub/rift"]
+    } else if reference {
         vec!["Downloads", "Start Page"]
     } else if std::env::args().any(|arg| arg == "--many") {
         vec![
@@ -129,10 +133,22 @@ fn main() {
             }
         }
     }
+    let thickness = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--thickness=").and_then(|v| v.parse::<f64>().ok()))
+        .unwrap_or(TabBar::HEIGHT);
+    let vertical = std::env::args().any(|arg| arg == "--vertical");
+    let length = std::env::args()
+        .find_map(|arg| arg.strip_prefix("--length=").and_then(|v| v.parse::<f64>().ok()))
+        .unwrap_or(300.0);
+    bar.set_vertical(vertical);
     let frame = window.ns_window().frame();
     bar.set_frame(CGRect::new(
         CGPoint::new(frame.origin.x + 10.0, frame.origin.y + 285.0),
-        CGSize::new(660.0, 28.0),
+        if vertical {
+            CGSize::new(thickness, length)
+        } else {
+            CGSize::new(660.0, thickness)
+        },
     ));
     if let Some(values) =
         std::env::args().find_map(|arg| arg.strip_prefix("--frame=").map(str::to_owned))
@@ -187,16 +203,21 @@ fn main() {
         // Useful for window-only screenshot tools: retain exactly the same glass content.
         let strip = bar.ns_panel().contentView().unwrap();
         bar.ns_panel().setContentView(None);
-        strip.height(28.0);
-        window.set_content(
-            VStack::new(&ui)
-                .push(strip)
-                .push(Label::new(
-                    &ui,
-                    "Native glass, Unicode truncation, hover, close and overflow preview",
-                ))
-                .push(controls),
+        let label = Label::new(
+            &ui,
+            "Native glass, Unicode truncation, hover, close and overflow preview",
         );
+        if vertical {
+            strip.width(thickness);
+            // A vertical bar fits its tabs; mirror the panel's fitted height.
+            strip.height(bar.ns_panel().frame().size.height);
+            window.set_content(
+                HStack::new(&ui).push(strip).push(VStack::new(&ui).push(label).push(controls)),
+            );
+        } else {
+            strip.height(thickness);
+            window.set_content(VStack::new(&ui).push(strip).push(label).push(controls));
+        }
         // Busy imagery is the realistic backdrop for an overlay strip.
         if let Some(image) = std::env::args()
             .find_map(|arg| arg.strip_prefix("--wallpaper=").map(str::to_owned))
