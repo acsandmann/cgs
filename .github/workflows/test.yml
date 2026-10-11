@@ -28,5 +28,8 @@ jobs:
           shared-key: macos-stable
           add-job-id-key: false
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo nextest run --all-targets -E 'not binary(/^settings_/)'

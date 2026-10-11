@@ -4,10 +4,11 @@ use std::rc::Rc;
 use cgs::*;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
-    NSApplicationActivationPolicy, NSControl, NSControlStateValueOn, NSControlTextEditingDelegate,
-    NSDragOperation, NSDraggingInfo, NSEvent, NSEventType, NSPasteboard, NSPasteboardWriting,
+    NSAccessibility, NSApplicationActivationPolicy, NSControl, NSControlStateValueOn,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventType, NSPasteboard,
+    NSPasteboardWriting,
     NSTableViewDataSource, NSTableViewDropOperation, NSTextField,
 };
 use objc2_foundation::{NSArray, NSNotification, NSObject, NSObjectProtocol, NSString};
@@ -1155,6 +1156,227 @@ fn memory_profile(ui: &Ui) {
     }
 }
 
+fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
+    use objc2::ClassType;
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let received = actions.clone();
+    let weak = autoreleasepool(|_| {
+        let bar = TabBar::new(ui).on_action(move |a| received.borrow_mut().push(a));
+        let panel = Weak::new(bar.ns_panel());
+        let number = bar.ns_panel().windowNumber();
+        assert!(!bar.ns_panel().canBecomeKeyWindow());
+        assert!(!bar.ns_panel().canBecomeMainWindow());
+        let icon = objc2_app_kit::NSImage::initWithSize(
+            objc2_app_kit::NSImage::alloc(),
+            CGSize::new(14.0, 14.0),
+        );
+        let icon_owner = Weak::new(&*icon);
+        bar.set_tabs(
+            vec![TabBarItem {
+                title: "Icon".into(),
+                icon: Some(icon),
+            }],
+            usize::MAX,
+        );
+        for title in ["First", "Updated 窗口 title"] {
+            bar.set_tabs(
+                vec![TabBarItem {
+                    title: title.into(),
+                    icon: None,
+                }],
+                0,
+            );
+            assert_eq!(bar.ns_panel().windowNumber(), number);
+        }
+        fn controls(view: &objc2_app_kit::NSView, out: &mut Vec<Retained<NSControl>>) {
+            if let Some(control) = view.downcast_ref::<NSControl>() {
+                out.push(control.retain());
+            }
+            for child in view.subviews() {
+                controls(&child, out);
+            }
+        }
+        let anchor = Window::new(ui).size(CGSize::new(250.0, 100.0));
+        anchor.show();
+        bar.show_above(anchor.ns_window().windowNumber());
+        bar.ns_panel()
+            .contentView()
+            .unwrap()
+            .layoutSubtreeIfNeeded();
+        let mut buttons = Vec::new();
+        controls(&bar.ns_panel().contentView().unwrap(), &mut buttons);
+        let select = buttons
+            .iter()
+            .find(|button| {
+                button
+                    .accessibilityLabel()
+                    .is_some_and(|label| label.to_string() == "Updated 窗口 title")
+            })
+            .unwrap();
+        let close = buttons
+            .iter()
+            .find(|button| {
+                button
+                    .accessibilityLabel()
+                    .is_some_and(|label| label.to_string() == "Close Updated 窗口 title")
+            })
+            .unwrap();
+        assert!(
+            close.isHidden(),
+            "selected tabs show their close control only on hover"
+        );
+        fn tab_group(view: &objc2_app_kit::NSView) -> Option<Retained<objc2_app_kit::NSView>> {
+            if view
+                .accessibilityLabel()
+                .is_some_and(|label| label.to_string() == "Window tabs")
+            {
+                return Some(view.retain());
+            }
+            view.subviews().iter().find_map(|child| tab_group(&child))
+        }
+        let content = tab_group(&bar.ns_panel().contentView().unwrap()).unwrap();
+        let location = content.convertPoint_toView(CGPoint::new(17.0, 14.0), None);
+        let movement = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            NSEventType::MouseMoved, location, objc2_app_kit::NSEventModifierFlags::empty(), 0.0, number, None, 0, 0, 0.0,
+        ).unwrap();
+        content.mouseMoved(&movement);
+        assert!(!close.isHidden(), "hover reveals the native close control");
+        assert!(
+            actions.borrow().is_empty(),
+            "hover never selects or closes a tab"
+        );
+        let hit_point = content.convertPoint_toView(
+            CGPoint::new(17.0, 14.0),
+            unsafe { content.superview() }.as_deref(),
+        );
+        assert_eq!(
+            content.hitTest(hit_point).as_deref(),
+            Some(close.as_super()),
+            "close gets its own hit target"
+        );
+        action(select);
+        action(close);
+        assert!(matches!(actions.borrow()[0], TabBarAction::Select(0)));
+        assert!(matches!(actions.borrow()[1], TabBarAction::Close(0)));
+        content.mouseExited(&movement);
+        assert!(close.isHidden(), "leaving the strip hides close controls");
+        bar.set_frame(CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(218.0, 28.0),
+        ));
+        bar.set_tabs(
+            vec![
+                TabBarItem {
+                    title: "First".into(),
+                    icon: None,
+                },
+                TabBarItem {
+                    title: "Second".into(),
+                    icon: None,
+                },
+            ],
+            1,
+        );
+        let mut overflow = Vec::new();
+        controls(&bar.ns_panel().contentView().unwrap(), &mut overflow);
+        let second = overflow
+            .iter()
+            .find(|control| {
+                control
+                    .accessibilityLabel()
+                    .is_some_and(|label| label.to_string() == "Second")
+            })
+            .unwrap()
+            .frame();
+        assert!(second.size.width >= 120.0);
+        assert!(second.origin.x >= 0.0 && second.origin.x + second.size.width <= 218.0);
+        anchor.ns_window().orderWindow_relativeTo(
+            objc2_app_kit::NSWindowOrderingMode::Above,
+            bar.ns_panel().windowNumber(),
+        );
+        let order = || {
+            objc2_app_kit::NSWindow::windowNumbersWithOptions(
+                objc2_app_kit::NSWindowNumberListOptions::empty(),
+                ui.mtm(),
+            )
+            .unwrap()
+            .iter()
+            .map(|number| number.integerValue())
+            .collect::<Vec<_>>()
+        };
+        let windows = order();
+        let anchor_number = anchor.ns_window().windowNumber();
+        let panel_number = bar.ns_panel().windowNumber();
+        assert!(
+            windows.iter().position(|n| *n == anchor_number).unwrap()
+                < windows.iter().position(|n| *n == panel_number).unwrap()
+        );
+        bar.show_above(anchor_number);
+        let windows = order();
+        assert!(
+            windows.iter().position(|n| *n == panel_number).unwrap()
+                < windows.iter().position(|n| *n == anchor_number).unwrap(),
+            "reasserting the same anchor must repair native stacking after focus raises it"
+        );
+        bar.set_tabs(Vec::new(), usize::MAX);
+        assert!(
+            icon_owner.load().is_none(),
+            "replacing tabs must release icons"
+        );
+        for _ in 0..3 {
+            bar.show_above(anchor.ns_window().windowNumber());
+            assert!(bar.is_visible());
+            bar.hide();
+            bar.hide();
+            assert!(!bar.is_visible());
+        }
+        anchor.close();
+        panel
+    });
+    assert!(weak.load().is_none(), "tab panel must release on teardown");
+    assert_eq!(Rc::strong_count(&actions), 1, "callback must release");
+}
+
+fn tab_bar_callback_can_destroy_its_owner(ui: &Ui) {
+    let slot = Rc::new(RefCell::new(None::<TabBar>));
+    let owner = Rc::downgrade(&slot);
+    let calls = Rc::new(Cell::new(0));
+    let received = calls.clone();
+    let bar = TabBar::new(ui).on_action(move |_| {
+        received.set(received.get() + 1);
+        owner.upgrade().unwrap().borrow_mut().take();
+    });
+    bar.set_tabs(
+        vec![TabBarItem {
+            title: "Remove owner".into(),
+            icon: None,
+        }],
+        0,
+    );
+    fn select_control(view: &objc2_app_kit::NSView) -> Option<Retained<NSControl>> {
+        if let Some(control) = view.downcast_ref::<NSControl>() {
+            if control
+                .accessibilityLabel()
+                .is_some_and(|label| label.to_string() == "Remove owner")
+            {
+                return Some(control.retain());
+            }
+        }
+        view.subviews().iter().find_map(|v| select_control(&v))
+    }
+    let button = select_control(&bar.ns_panel().contentView().unwrap()).unwrap();
+    *slot.borrow_mut() = Some(bar);
+    action(&button);
+    assert!(slot.borrow().is_none());
+    assert_eq!(calls.get(), 1);
+    action(&button);
+    assert_eq!(
+        calls.get(),
+        1,
+        "borrowed controls cannot dispatch after owner teardown"
+    );
+}
+
 fn main() {
     // A single libtest-compatible case lets nextest list this harness without running AppKit.
     if std::env::args().any(|arg| arg == "--list") {
@@ -1165,6 +1387,8 @@ fn main() {
     }
     let ui =
         Ui::new(MainThreadMarker::new().expect("native tests must run on the macOS main thread"));
+    tab_bar_updates_and_releases_native_owners(&ui);
+    tab_bar_callback_can_destroy_its_owner(&ui);
     let app = Application::shared(&ui);
     app.ns_application()
         .setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
