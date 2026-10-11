@@ -100,7 +100,7 @@ fn main() {
         }
         if let Some(slot) = weak.upgrade() {
             if let Some(bar) = slot.borrow().as_ref() {
-                bar.set_tabs(preview_items(&titles.borrow()), 0);
+                bar.set_tabs(preview_items(&names.borrow()), selection.get());
                 if diagnostics {
                     report_focus(bar, &ui);
                 }
@@ -109,23 +109,7 @@ fn main() {
     });
     bar.ns_panel()
         .setTitle(&objc2_foundation::NSString::from_str("cgs floating glass"));
-    bar.set_tabs(
-        titles
-            .borrow()
-            .iter()
-            .map(|s| TabBarItem {
-                title: (*s).into(),
-                icon: Application::icon_for_bundle(if *s == "Start Page" {
-                    "com.apple.Safari"
-                } else if s.starts_with("Long") {
-                    "com.apple.TextEdit"
-                } else {
-                    "com.apple.finder"
-                }),
-            })
-            .collect(),
-        0,
-    );
+    bar.set_tabs(preview_items(&titles.borrow()), 0);
     if diagnostics {
         println!("Material: {:?}", bar.ns_panel().contentView());
     }

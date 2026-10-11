@@ -51,11 +51,11 @@ struct Content {
     highlight: Retained<CALayer>,
     retiring: Retained<NSView>,
     fonts: [Retained<NSFont>; 2],
-    text_colors: [Retained<NSColor>; 3],
+    text_color: Retained<NSColor>,
     close_symbol: Option<Image>,
     placeholder: Image,
     close_colors: [Retained<NSColor>; 2],
-    close_fill: Retained<NSColor>,
+    close_fill: RefCell<Retained<NSColor>>,
     clear: Retained<NSColor>,
 
     ui: Ui,
@@ -152,6 +152,7 @@ impl TabContent {
     fn refresh_hover(&self, previous: Option<usize>) {
         let s = self.ivars();
         let tabs = s.tabs.borrow();
+        let close_fill = s.close_fill.borrow();
         for index in [previous, s.hovered.get()].into_iter().flatten() {
             let Some(tab) = tabs.get(index) else {
                 continue;
@@ -162,7 +163,7 @@ impl TabContent {
                 .setContentTintColor(Some(&s.close_colors[usize::from(close_hover)]));
             if let Some(layer) = tab.close.ns_view().layer() {
                 layer.setBackgroundColor(Some(
-                    &if close_hover { &s.close_fill } else { &s.clear }.CGColor(),
+                    &if close_hover { &*close_fill } else { &s.clear }.CGColor(),
                 ));
             }
             let frame = tab.close.ns_view().frame();
@@ -185,7 +186,7 @@ impl TabContent {
     fn geometry(&self) -> (f64, f64) {
         let width = self.bounds().size.width.max(0.0);
         let n = self.ivars().tabs.try_borrow().map(|tabs| tabs.len().max(1)).unwrap_or(1) as f64;
-        (width, ((width - 4.0 - (n - 1.0) * 3.0) / n).max(120.0))
+        (width, ((width - 4.0 - (n - 1.0) * 2.0) / n).max(120.0))
     }
 
     fn index_at(&self, p: CGPoint) -> Option<usize> {
@@ -194,8 +195,8 @@ impl TabContent {
             return None;
         }
         let x = p.x - 2.0 + self.ivars().offset.get();
-        let i = (x / (tab_width + 3.0)) as usize;
-        (i < self.ivars().tabs.borrow().len() && x % (tab_width + 3.0) < tab_width).then_some(i)
+        let i = (x / (tab_width + 2.0)) as usize;
+        (i < self.ivars().tabs.borrow().len() && x % (tab_width + 2.0) < tab_width).then_some(i)
     }
 
     fn arrange(&self, reveal: bool, mut redraw: bool, animate: bool) {
@@ -204,10 +205,10 @@ impl TabContent {
         let Ok(mut tabs) = s.tabs.try_borrow_mut() else {
             return;
         };
-        let max = (tabs.len() as f64 * (tab_width + 3.0) + 1.0 - width).max(0.0);
+        let max = (tabs.len() as f64 * (tab_width + 2.0) + 2.0 - width).max(0.0);
         let mut offset = s.offset.get().clamp(0.0, max);
         if reveal && s.selected.get() < tabs.len() {
-            let left = s.selected.get() as f64 * (tab_width + 3.0);
+            let left = s.selected.get() as f64 * (tab_width + 2.0);
             offset = offset.min(left).max(left + tab_width + 4.0 - width).clamp(0.0, max);
         }
         s.offset.set(offset);
@@ -217,10 +218,11 @@ impl TabContent {
             s.viewport.setFrame(viewport_frame);
             s.retiring.setFrame(viewport_frame);
         }
+        let close_fill = s.close_fill.borrow();
         for (i, tab) in tabs.iter_mut().enumerate() {
             let active = i == s.selected.get();
             let hover = s.hovered.get() == Some(i);
-            let x = 2.0 + i as f64 * (tab_width + 3.0) - offset;
+            let x = 2.0 + i as f64 * (tab_width + 2.0) - offset;
             let button = tab.select.ns_button();
             let frame = rect(x, 3.0, tab_width, 22.0);
             button.setFrame(frame);
@@ -259,7 +261,7 @@ impl TabContent {
             if let Some(layer) = tab.close.ns_view().layer() {
                 layer.setBackgroundColor(Some(
                     &if s.close_hovered.get() == Some(i) {
-                        &s.close_fill
+                        &*close_fill
                     } else {
                         &s.clear
                     }
@@ -294,7 +296,6 @@ impl TabContent {
         } else if !animate && changed {
             layer.removeAllAnimations();
         }
-        self.update_material();
         if redraw {
             self.setNeedsDisplay(true);
         }
@@ -313,6 +314,8 @@ define_class!(
     struct TabVisual;
     impl TabVisual {
         #[unsafe(method(isFlipped))] fn flipped(&self) -> bool { true }
+        // Let AppKit composite semantic label colors against the native material.
+        #[unsafe(method(allowsVibrancy))] fn vibrant(&self) -> bool { true }
         #[unsafe(method(hitTest:))] fn hit(&self, _: CGPoint) -> Option<&NSView> { None }
         #[unsafe(method(viewDidChangeEffectiveAppearance))] fn appearance(&self) {
             unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
@@ -330,10 +333,12 @@ define_class!(
             }
             let icon_width = 22.0;
             let text_width = labels[2].1.width.min((width - 44.0 - icon_width).max(0.0));
-            let x = (width - text_width - icon_width) / 2.0;
+            let scale = self.window().map_or(1.0, |window| window.backingScaleFactor()).max(1.0);
+            let x = (((width - text_width - icon_width) / 2.0) * scale).round() / scale;
+            let text_y = (((28.0 - text_size.height) / 2.0) * scale).round() / scale;
             unsafe { s.icon.borrow().drawInRect_fromRect_operation_fraction_respectFlipped_hints(
                 rect(x, 7.0, 14.0, 14.0), CGRect::ZERO, NSCompositingOperation::SourceOver, 1.0, true, None); }
-            label.drawWithRect_options(rect(x + icon_width, (28.0 - text_size.height)/2.0, text_width, text_size.height),
+            label.drawWithRect_options(rect(x + icon_width, text_y, text_width, text_size.height),
                 NSStringDrawingOptions::UsesLineFragmentOrigin | NSStringDrawingOptions::TruncatesLastVisibleLine);
         }
     }
@@ -368,24 +373,21 @@ impl TabContent {
         self.effectiveAppearance()
             .performAsCurrentDrawingAppearance(&block2::RcBlock::new(|| {
                 without_actions(|| {
+                    *s.close_fill.borrow_mut() =
+                        NSColor::labelColor().colorWithAlphaComponent(0.08);
                     s.highlight.setBackgroundColor(Some(
                         &if opaque || contrast {
-                            NSColor::controlBackgroundColor()
+                            NSColor::labelColor().colorWithAlphaComponent(0.24)
                         } else {
-                            NSColor::unemphasizedSelectedContentBackgroundColor()
-                                .colorWithAlphaComponent(0.28)
+                            // A selected segment needs a stronger tonal step than hover.
+                            NSColor::labelColor().colorWithAlphaComponent(0.18)
                         }
                         .CGColor(),
                     ));
-                    s.highlight.setBorderWidth(if contrast { 1.0 } else { 0.5 });
-                    s.highlight.setBorderColor(Some(
-                        &if contrast {
-                            NSColor::labelColor()
-                        } else {
-                            NSColor::highlightColor().colorWithAlphaComponent(0.16)
-                        }
-                        .CGColor(),
-                    ));
+                    s.highlight.setBorderWidth(if contrast { 1.0 } else { 0.0 });
+                    s.highlight.setBorderColor(
+                        contrast.then(|| NSColor::labelColor().CGColor()).as_deref(),
+                    );
                 })
             }));
     }
@@ -475,11 +477,7 @@ impl TabBar {
                             NSFont::systemFontOfSize_weight(12.0, NSFontWeightMedium),
                         ]
                     },
-                    text_colors: [
-                        NSColor::secondaryLabelColor(),
-                        NSColor::labelColor(),
-                        NSColor::labelColor()
-                    ],
+                    text_color: NSColor::labelColor(),
                     close_symbol: crate::Symbol::named("xmark").and_then(|image| {
                         image.imageWithSymbolConfiguration(
                             &NSImageSymbolConfiguration::configurationWithPointSize_weight(
@@ -490,7 +488,7 @@ impl TabBar {
                     }),
                     placeholder: placeholder(),
                     close_colors: [NSColor::secondaryLabelColor(), NSColor::labelColor()],
-                    close_fill: NSColor::labelColor().colorWithAlphaComponent(0.10),
+                    close_fill: RefCell::new(NSColor::labelColor().colorWithAlphaComponent(0.08)),
                     clear: NSColor::clearColor(),
                     ui: *ui,
                 })),
@@ -517,6 +515,7 @@ impl TabBar {
         content.setWantsLayer(true);
         if let Some(layer) = content.layer() {
             layer.setCornerRadius(14.0);
+            layer.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
             layer.setMasksToBounds(true);
             layer.insertSublayer_atIndex(&content.ivars().highlight, 0);
         }
@@ -529,12 +528,6 @@ impl TabBar {
             let glass = GlassEffectView::new(ui, host)
                 .corner_radius(14.0)
                 .style(crate::GlassStyle::Regular);
-            if let Some(native) = glass.ns_glass_effect_view() {
-                // Tint the material itself so its native optics remain visible.
-                native.setTintColor(Some(
-                    &NSColor::windowBackgroundColor().colorWithAlphaComponent(0.18),
-                ));
-            }
             Box::new(glass)
         } else {
             // Public-API fallback: active vibrancy, not Liquid Glass. Keep one material.
@@ -569,6 +562,7 @@ impl TabBar {
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
         panel.setContentView(Some(surface.ns_view()));
+        content.update_material();
         Self {
             panel,
             content,
@@ -646,7 +640,7 @@ impl TabBar {
                     .symbol("xmark")
                     .on_click(move || emit(&action, TabBarAction::Close(close_index.get())));
                 close.accessibility_label("Close window");
-                close.ns_button().setBezelStyle(NSBezelStyle::FlexiblePush);
+
                 close.ns_button().setImage(s.close_symbol.as_deref());
                 close.ns_button().setContentTintColor(Some(&s.close_colors[0]));
                 close.ns_view().setWantsLayer(true);
@@ -704,7 +698,7 @@ impl TabBar {
                             ],
                             &[
                                 &*s.fonts[usize::from(style == 2)] as &AnyObject,
-                                &*s.text_colors[style] as &AnyObject,
+                                &*s.text_color as &AnyObject,
                                 &*paragraph as &AnyObject,
                             ],
                         );
