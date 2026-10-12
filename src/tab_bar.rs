@@ -125,8 +125,9 @@ define_class!(
                 if dark(self) {
                     NSColor::windowBackgroundColor().colorWithAlphaComponent(0.72).setFill();
                 } else {
-                    // A gray track, as in a light segmented control, lets the white thumb read.
-                    NSColor::colorWithWhite_alpha(0.86, 0.8).setFill();
+                    // A neutral gray track, as in a light segmented control, lets the white
+                    // thumb read. Kept near-opaque so the wallpaper's hue doesn't muddy it.
+                    NSColor::colorWithWhite_alpha(0.89, 0.94).setFill();
                 }
             }
             NSBezierPath::fillRect(dirty);
@@ -545,7 +546,7 @@ impl TabContent {
                         &if dark {
                             NSColor::colorWithWhite_alpha(1.0, if contrast { 0.30 } else { 0.20 })
                         } else {
-                            NSColor::colorWithWhite_alpha(1.0, 0.92)
+                            NSColor::whiteColor()
                         }
                         .CGColor(),
                     ));
@@ -556,7 +557,7 @@ impl TabContent {
                         } else if dark {
                             NSColor::colorWithWhite_alpha(1.0, 0.10)
                         } else {
-                            NSColor::colorWithWhite_alpha(0.0, 0.06)
+                            NSColor::colorWithWhite_alpha(0.0, 0.10)
                         }
                         .CGColor(),
                     ));
@@ -566,9 +567,9 @@ impl TabContent {
                     } else if dark {
                         0.3
                     } else {
-                        0.14
+                        0.2
                     });
-                    s.highlight.setShadowRadius(2.0);
+                    s.highlight.setShadowRadius(if dark { 2.0 } else { 1.5 });
                     s.highlight.setShadowOffset(CGSize::new(0.0, 1.0));
                 })
             }));
