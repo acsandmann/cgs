@@ -854,7 +854,7 @@ impl TabBar {
                             style: Cell::new(0),
                             separator: Cell::new(false),
                             vertical: Cell::new(false),
-                    upward: Cell::new(false),
+                            upward: Cell::new(false),
                         })),
                         init
                     ]

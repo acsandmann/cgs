@@ -66,11 +66,22 @@ pub struct Window {
     toolbar: OnceCell<Rc<crate::Toolbar>>,
 }
 impl Window {
-    pub fn new(ui: &Ui) -> Self {
+    pub fn new(ui: &Ui) -> Self { Self::with_size(ui, CGSize::new(800.0, 600.0), false) }
+
+    fn with_size(ui: &Ui, size: CGSize, full_size: bool) -> Self {
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+            | if full_size {
+                NSWindowStyleMask::FullSizeContentView
+            } else {
+                NSWindowStyleMask::empty()
+            };
         let native: Retained<NativeWindow> = unsafe {
             msg_send![super(NativeWindow::alloc(ui.mtm()).set_ivars(Cell::new(false))),
-                initWithContentRect: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(800.0, 600.0)),
-                styleMask: NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable | NSWindowStyleMask::Resizable,
+                initWithContentRect: CGRect::new(CGPoint::new(0.0, 0.0), size),
+                styleMask: style,
                 backing: NSBackingStoreType::Buffered,
                 defer: false
             ]
@@ -200,19 +211,36 @@ pub enum Appearance {
 pub struct SettingsWindow(Window);
 impl SettingsWindow {
     pub fn new(ui: &Ui, title: &str) -> Self {
-        let window = Window::new(ui)
-            .title(title)
-            .min_size(CGSize::new(
-                crate::Metrics::SIDEBAR_MIN_WIDTH + crate::Metrics::DETAIL_MIN_WIDTH,
-                420.0,
-            ))
-            .autosave_frame(title);
+        Self::from_window(
+            Window::with_size(ui, CGSize::new(800.0, 600.0), true),
+            title,
+            true,
+        )
+    }
+
+    /// Use explicit initial geometry without restoring and then resizing an autosaved frame.
+    pub fn with_size(ui: &Ui, title: &str, size: CGSize) -> Self {
+        Self::from_window(Window::with_size(ui, size, true), title, false)
+    }
+
+    fn from_window(window: Window, title: &str, autosave: bool) -> Self {
+        let window = window.title(title).min_size(CGSize::new(
+            crate::Metrics::SIDEBAR_MIN_WIDTH + crate::Metrics::DETAIL_MIN_WIDTH,
+            420.0,
+        ));
+        let window = if autosave {
+            window.autosave_frame(title)
+        } else {
+            window
+        };
         window.native.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::Automatic);
         window.native.setToolbarStyle(NSWindowToolbarStyle::Automatic);
         window.native.setTitleVisibility(NSWindowTitleVisibility::Visible);
-        window
-            .native
-            .setStyleMask(window.native.styleMask() | NSWindowStyleMask::FullSizeContentView);
+        if !window.native.styleMask().contains(NSWindowStyleMask::FullSizeContentView) {
+            window
+                .native
+                .setStyleMask(window.native.styleMask() | NSWindowStyleMask::FullSizeContentView);
+        }
         Self(window)
     }
 
@@ -243,7 +271,15 @@ impl SettingsWindow {
         })
     }
 
-    pub fn content(self, content: impl NativeView) -> Self { Self(self.0.content(content)) }
+    pub fn content(self, content: impl NativeView) -> Self {
+        // NSWindow adopts a controller view's frame on attachment. Keep the requested
+        // size rather than laying out at the controller's default size first.
+        if let Some(controller) = content.view_controller() {
+            let size = self.0.native.contentRectForFrameRect(self.0.native.frame()).size;
+            controller.view().setFrame(CGRect::new(CGPoint::new(0.0, 0.0), size));
+        }
+        Self(self.0.content(content))
+    }
 
     pub fn show(&self) {
         self.toolbar();

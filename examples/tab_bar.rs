@@ -60,7 +60,10 @@ fn main() {
     }
     let reference = std::env::args().any(|arg| arg == "--reference");
     let titles = Rc::new(RefCell::new(if std::env::args().any(|arg| arg == "--same") {
-        vec![".../Documents/schoolgithub/rift", ".../Documents/schoolgithub/rift"]
+        vec![
+            ".../Documents/schoolgithub/rift",
+            ".../Documents/schoolgithub/rift",
+        ]
     } else if reference {
         vec!["Downloads", "Start Page"]
     } else if std::env::args().any(|arg| arg == "--many") {

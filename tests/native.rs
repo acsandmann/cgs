@@ -7,9 +7,9 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSAccessibility, NSApplicationActivationPolicy, NSControl, NSControlStateValueOn,
-    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventType, NSPasteboard,
-    NSPasteboardWriting,
-    NSTableViewDataSource, NSTableViewDropOperation, NSTextField,
+    NSControlTextEditingDelegate, NSDragOperation, NSDraggingInfo, NSEvent, NSEventType,
+    NSPasteboard, NSPasteboardWriting, NSTableViewDataSource, NSTableViewDropOperation,
+    NSTextField,
 };
 use objc2_foundation::{NSArray, NSNotification, NSObject, NSObjectProtocol, NSString};
 
@@ -676,16 +676,9 @@ fn released_components_detach_borrowed_native_content(ui: &Ui) {
         host.set_cached_page(first);
         host.set_page(Label::new(ui, "Current"));
         drop(host);
-        assert!(
-            native.subviews().is_empty(),
-            "host drop must unmount all pages"
-        );
+        assert!(native.subviews().is_empty(), "host drop must unmount all pages");
         assert!(controller.childViewControllers().is_empty());
-        assert!(
-            child
-                .load()
-                .is_none_or(|child| child.parentViewController().is_none())
-        );
+        assert!(child.load().is_none_or(|child| child.parentViewController().is_none()));
     });
 }
 
@@ -715,9 +708,7 @@ fn replaced_status_releases_native_content(ui: &Ui) {
             let old = Label::new(ui, "Old status");
             let weak = Weak::new(old.ns_view());
             (
-                StatusItem::new(ui)
-                    .content(old)
-                    .content(Label::new(ui, "New status")),
+                StatusItem::new(ui).content(old).content(Label::new(ui, "New status")),
                 weak,
             )
         });
@@ -856,9 +847,8 @@ fn probe(
 
 fn settle() {
     autoreleasepool(|_| {
-        objc2_foundation::NSRunLoop::currentRunLoop().runUntilDate(
-            &objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.15),
-        );
+        objc2_foundation::NSRunLoop::currentRunLoop()
+            .runUntilDate(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.15));
     });
 }
 
@@ -964,11 +954,7 @@ fn settings_lifecycle(
                 search,
             );
             toolbar.set_page_controls(ui, Some(&controls));
-            window
-                .ns_window()
-                .contentView()
-                .unwrap()
-                .layoutSubtreeIfNeeded();
+            window.ns_window().contentView().unwrap().layoutSubtreeIfNeeded();
             for item in toolbar.ns_toolbar().items() {
                 probe(&mut probes, "toolbar item", &item);
             }
@@ -981,11 +967,7 @@ fn settings_lifecycle(
         sheet.end();
         let popover = Popover::new(ui, Label::new(ui, "Details"));
         probe(&mut probes, "popover", popover.ns_popover());
-        probe(
-            &mut probes,
-            "popover controller",
-            popover.ns_view_controller(),
-        );
+        probe(&mut probes, "popover controller", popover.ns_view_controller());
         popover.show(&host);
         popover.close();
         popover.show(&host);
@@ -1050,19 +1032,10 @@ fn graphics_resources_follow_their_native_views(ui: &Ui) {
         probe(&mut probes, "preview", preview.ns_view());
         let effect = VisualEffect::sidebar(ui, Label::new(ui, "Sidebar"));
         probe(&mut probes, "visual effect", effect.ns_view());
-        let window = Window::new(ui).content(
-            VStack::new(ui)
-                .push(host)
-                .push(canvas)
-                .push(preview)
-                .push(effect),
-        );
+        let window = Window::new(ui)
+            .content(VStack::new(ui).push(host).push(canvas).push(preview).push(effect));
         window.show();
-        window
-            .ns_window()
-            .contentView()
-            .unwrap()
-            .layoutSubtreeIfNeeded();
+        window.ns_window().contentView().unwrap().layoutSubtreeIfNeeded();
         probes
     });
     settle();
@@ -1091,19 +1064,16 @@ fn memory_profile(ui: &Ui) {
     std::fs::create_dir_all(&directory).unwrap();
     let sample = |stage: &str| {
         for (tool, args) in [
-            (
-                "footprint",
-                vec!["-p".to_string(), std::process::id().to_string()],
-            ),
-            (
-                "vmmap",
-                vec!["-summary".to_string(), std::process::id().to_string()],
-            ),
+            ("footprint", vec![
+                "-p".to_string(),
+                std::process::id().to_string(),
+            ]),
+            ("vmmap", vec![
+                "-summary".to_string(),
+                std::process::id().to_string(),
+            ]),
         ] {
-            let output = std::process::Command::new(tool)
-                .args(args)
-                .output()
-                .unwrap();
+            let output = std::process::Command::new(tool).args(args).output().unwrap();
             assert!(
                 output.status.success(),
                 "{tool} failed: {}",
@@ -1129,10 +1099,7 @@ fn memory_profile(ui: &Ui) {
         });
         let navigation = start.elapsed() - sampling.get();
         settle();
-        let survivors = probes
-            .iter()
-            .filter(|(_, weak)| weak.load().is_some())
-            .count();
+        let survivors = probes.iter().filter(|(_, weak)| weak.load().is_some()).count();
         println!(
             "cycle={cycle} lifecycle_ms={} survivors={survivors}",
             navigation.as_millis()
@@ -1213,10 +1180,7 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
             key_before,
             "a nonactivating bar cannot take keyboard focus"
         );
-        bar.ns_panel()
-            .contentView()
-            .unwrap()
-            .layoutSubtreeIfNeeded();
+        bar.ns_panel().contentView().unwrap().layoutSubtreeIfNeeded();
         let mut buttons = Vec::new();
         controls(&bar.ns_panel().contentView().unwrap(), &mut buttons);
         let select = buttons
@@ -1281,10 +1245,7 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         );
         content.mouseExited(&movement);
         assert!(close.isHidden(), "leaving the strip hides close controls");
-        bar.set_frame(CGRect::new(
-            CGPoint::new(0.0, 0.0),
-            CGSize::new(218.0, 28.0),
-        ));
+        bar.set_frame(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(218.0, 28.0)));
         bar.set_tabs(
             vec![
                 TabBarItem {
@@ -1303,9 +1264,7 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         let second = overflow
             .iter()
             .find(|control| {
-                control
-                    .accessibilityLabel()
-                    .is_some_and(|label| label.to_string() == "Second")
+                control.accessibilityLabel().is_some_and(|label| label.to_string() == "Second")
             })
             .unwrap()
             .frame();
@@ -1316,9 +1275,7 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         let second_control = overflow
             .iter()
             .find(|control| {
-                control
-                    .accessibilityLabel()
-                    .is_some_and(|label| label.to_string() == "Second")
+                control.accessibilityLabel().is_some_and(|label| label.to_string() == "Second")
             })
             .unwrap()
             .retain();
@@ -1379,10 +1336,7 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
             "reasserting the same anchor must repair native stacking after focus raises it"
         );
         bar.set_tabs(Vec::new(), usize::MAX);
-        assert!(
-            icon_owner.load().is_none(),
-            "replacing tabs must release icons"
-        );
+        assert!(icon_owner.load().is_none(), "replacing tabs must release icons");
         for _ in 0..3 {
             bar.show_above(anchor.ns_window().windowNumber());
             assert!(bar.is_visible());
@@ -1469,16 +1423,10 @@ fn main() {
                 "toolbar",
                 toolbar_releases_disabled_actions_and_preserves_unchanged_controls,
             ),
-            (
-                "window",
-                window_close_is_idempotent_and_drop_does_not_dispatch,
-            ),
+            ("window", window_close_is_idempotent_and_drop_does_not_dispatch),
         ] {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&ui)));
-            println!(
-                "{name}: {}",
-                if result.is_ok() { "passed" } else { "failed" }
-            );
+            println!("{name}: {}", if result.is_ok() { "passed" } else { "failed" });
             failures += usize::from(result.is_err());
         }
         assert_eq!(failures, 0);

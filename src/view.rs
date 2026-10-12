@@ -443,9 +443,7 @@ impl PageHost {
     }
 }
 impl Drop for PageHost {
-    fn drop(&mut self) {
-        self.clear();
-    }
+    fn drop(&mut self) { self.clear(); }
 }
 impl NativeView for PageHost {
     fn view_controller(&self) -> Option<&NSViewController> { Some(&self.controller) }

@@ -55,7 +55,6 @@ pub struct SidebarItem<T> {
 }
 struct SidebarCell {
     native: Retained<NSTableCellView>,
-    _content: HStack,
 }
 impl NativeView for SidebarCell {
     fn ns_view(&self) -> &NSView { &self.native }
@@ -75,11 +74,12 @@ impl<T: Clone + 'static> Sidebar<T> {
         children: impl Fn(&T) -> Vec<SidebarItem<T>>,
     ) -> Self {
         let ui_copy = *ui;
+        let measure = Label::new(ui, "");
         let content_width = items
             .iter()
             .map(|item| {
-                Label::new(ui, &item.title).ns_view().fittingSize().width
-                    + Metrics::CONTROL_SPACING * 6.0
+                measure.set_text(&item.title);
+                measure.ns_view().fittingSize().width + Metrics::CONTROL_SPACING * 6.0
             })
             .fold(0.0, f64::max);
         let items = items
@@ -103,36 +103,42 @@ impl<T: Clone + 'static> Sidebar<T> {
             unsafe {
                 native.setTextField(Some(label.ns_text_field()));
             }
-            let row = HStack::new(&ui_copy).spacing(8.0);
-            let row = if let Some(image) = ImageView::symbol(&ui_copy, &item.symbol) {
+            native.addSubview(label.ns_view());
+            crate::view::prepare(label.ns_view());
+            let leading = if let Some(image) = ImageView::symbol(&ui_copy, &item.symbol) {
                 image.width(16.0);
                 image.height(16.0);
                 unsafe {
                     native.setImageView(Some(image.ns_image_view()));
                 }
-                row.push(image)
+                native.addSubview(image.ns_view());
+                crate::view::prepare(image.ns_view());
+                image
+                    .ns_view()
+                    .leadingAnchor()
+                    .constraintEqualToAnchor(&native.leadingAnchor())
+                    .setActive(true);
+                image
+                    .ns_view()
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&native.centerYAnchor())
+                    .setActive(true);
+                label
+                    .ns_view()
+                    .leadingAnchor()
+                    .constraintEqualToAnchor_constant(&image.ns_view().trailingAnchor(), 8.0)
             } else {
-                row
+                label.ns_view().leadingAnchor().constraintEqualToAnchor(&native.leadingAnchor())
             };
-            let content = row.push(label);
-            native.addSubview(content.ns_view());
-            crate::view::prepare(content.ns_view());
-            content
-                .ns_view()
-                .leadingAnchor()
-                .constraintEqualToAnchor(&native.leadingAnchor())
-                .setActive(true);
-            content
-                .ns_view()
-                .trailingAnchor()
-                .constraintEqualToAnchor(&native.trailingAnchor())
-                .setActive(true);
-            content
-                .ns_view()
-                .centerYAnchor()
-                .constraintEqualToAnchor(&native.centerYAnchor())
-                .setActive(true);
-            Box::new(SidebarCell { native, _content: content })
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                leading,
+                label
+                    .ns_view()
+                    .trailingAnchor()
+                    .constraintEqualToAnchor(&native.trailingAnchor()),
+                label.ns_view().centerYAnchor().constraintEqualToAnchor(&native.centerYAnchor()),
+            ]));
+            Box::new(SidebarCell { native })
         });
         let native = outline.ns_outline_view();
         native.setUsesAutomaticRowHeights(false);
@@ -387,7 +393,8 @@ pub struct Toolbar {
     delegate: Option<Retained<NavigationToolbarDelegate>>,
     back_target: Retained<crate::bridge::ActionTarget>,
     forward_target: Retained<crate::bridge::ActionTarget>,
-    menu: std::cell::RefCell<Option<(Rc<crate::Menu>, Retained<NSPopUpButton>)>>,
+    menu:
+        std::cell::RefCell<Option<(Rc<crate::Menu>, std::cell::OnceCell<Retained<NSPopUpButton>>)>>,
     page_controls: std::cell::RefCell<[Option<Weak<NSView>>; 3]>,
 }
 impl Toolbar {
@@ -557,26 +564,6 @@ impl Toolbar {
             NSToolbarItem::alloc(ui.mtm()),
             &NSString::from_str("cgs.page-menu"),
         );
-        let popup = NSPopUpButton::initWithFrame_pullsDown(
-            NSPopUpButton::alloc(ui.mtm()),
-            CGRect::ZERO,
-            false,
-        );
-        crate::control::header_menu_style(&popup);
-        popup.setImagePosition(NSCellImagePosition::ImageLeading);
-        popup.setImageHugsTitle(false);
-        popup.setMenu(Some(menu.ns_menu()));
-        let display = MenuItem::new(ui, "All");
-        display
-            .ns_menu_item()
-            .setImage(Symbol::header("line.3.horizontal.decrease").as_deref());
-        if let Some(cell) = popup.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok())
-        {
-            cell.setUsesItemFromMenu(false);
-            cell.setMenuItem(Some(display.ns_menu_item()));
-            cell.setAltersStateOfSelectedItem(false);
-        }
-        title.setView(Some(&popup));
         title.setBordered(false);
         title.setAutovalidates(false);
         delegate.ivars().back.setBordered(false);
@@ -586,7 +573,7 @@ impl Toolbar {
             .navigation
             .borrow_mut()
             .splice(0..0, [next, title, arrows.into_super()]);
-        *self.menu.borrow_mut() = Some((menu, popup));
+        *self.menu.borrow_mut() = Some((menu, std::cell::OnceCell::new()));
         let index = self
             .native
             .items()
@@ -608,7 +595,35 @@ impl Toolbar {
         if let Some(item) = items.first() {
             item.setEnabled(forward);
         }
-        if let (Some(item), Some((menu, popup))) = (items.get(1), self.menu.borrow().as_ref()) {
+        if let (Some(item), Some((menu, popup))) = (items.get(1), self.menu.borrow().as_ref())
+            && has_menu
+        {
+            let popup = popup.get_or_init(|| {
+                let ui = Ui::new(self.native.mtm());
+                let popup = NSPopUpButton::initWithFrame_pullsDown(
+                    NSPopUpButton::alloc(ui.mtm()),
+                    CGRect::ZERO,
+                    false,
+                );
+                crate::control::header_menu_style(&popup);
+                popup.setImagePosition(NSCellImagePosition::ImageLeading);
+                popup.setImageHugsTitle(false);
+                popup.setMenu(Some(menu.ns_menu()));
+                let display = MenuItem::new(&ui, "All");
+                display
+                    .ns_menu_item()
+                    .setImage(Symbol::header("line.3.horizontal.decrease").as_deref());
+                if let Some(cell) =
+                    popup.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok())
+                {
+                    cell.setUsesItemFromMenu(false);
+                    cell.setMenuItem(Some(display.ns_menu_item()));
+                    cell.setAltersStateOfSelectedItem(false);
+                }
+
+                item.setView(Some(&popup));
+                popup
+            });
             item.setLabel(&NSString::from_str(title));
             for entry in menu.ns_menu().itemArray() {
                 if entry.tag() == 1 || entry.tag() >= 9 {

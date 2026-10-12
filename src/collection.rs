@@ -1016,7 +1016,9 @@ impl<T: 'static> SettingsList<T> {
                         inline.get(),
                         row_symbol.borrow().is_some() || row_image.borrow().is_some(),
                         row_navigation.get(),
-                        opens.borrow().is_some(),
+                        // Opening a sheet can synchronously ask AppKit to rebuild this cell
+                        // while the open callback holds its mutable borrow.
+                        opens.try_borrow().map_or(true, |open| open.is_some()),
                     );
                     cell.setIdentifier(Some(&identifier));
                     cell
@@ -1170,7 +1172,8 @@ impl<T: 'static> SettingsList<T> {
     pub fn on_select_item(self, mut f: impl FnMut(Option<T>) + 'static) -> Self
     where T: Clone {
         let rows = self.table.rows.clone();
-        self.table.set_on_select(move |index| f(index.and_then(|i| rows.borrow().get(i).cloned())));
+        self.table
+            .set_on_select(move |index| f(index.and_then(|i| rows.borrow().get(i).cloned())));
         self
     }
 
