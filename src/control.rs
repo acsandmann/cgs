@@ -547,7 +547,123 @@ macro_rules! numeric_control {
         native_control!($name, $native, $accessor);
     };
 }
-numeric_control!(Slider, NSSlider, ns_slider);
+/// An accent-colored native slider, with optional snapping and tactile detents.
+/// Native tracking preserves keyboard, accessibility, and appearance support.
+pub struct Slider {
+    native: Retained<NSSlider>,
+    target: Retained<ActionTarget>,
+    last_value: std::rc::Rc<std::cell::Cell<f64>>,
+}
+impl Slider {
+    pub fn new(ui: &Ui) -> Self {
+        let native = NSSlider::new(ui.mtm());
+        native.setTrackFillColor(Some(&NSColor::controlAccentColor()));
+        let target = ActionTarget::new(ui);
+        target.attach(&native);
+        Self {
+            native,
+            target,
+            last_value: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+        }
+    }
+
+    pub fn range(self, min: f64, max: f64) -> Self {
+        self.set_range(min, max);
+        self
+    }
+
+    pub fn set_range(&self, min: f64, max: f64) {
+        assert!(min.is_finite() && max.is_finite() && min <= max);
+        self.native.setMinValue(min);
+        self.native.setMaxValue(max);
+        self.last_value.set(self.native.doubleValue());
+    }
+
+    /// Equally spaced notches, including both endpoints. Each changed detent
+    /// produces a subtle alignment haptic on supported hardware during tracking.
+    /// Programmatic updates never produce feedback.
+    pub fn notches(self, count: usize) -> Self {
+        assert!(count >= 2 && count <= isize::MAX as usize);
+        self.native.setNumberOfTickMarks(count as isize);
+        self.native.setAllowsTickMarkValuesOnly(true);
+        self.native.setTickMarkPosition(NSTickMarkPosition::Below);
+        self.native.setContinuous(true);
+        self
+    }
+
+    pub fn continuous(self, value: bool) -> Self {
+        self.native.setContinuous(value);
+        self
+    }
+
+    pub fn value(self, value: f64) -> Self {
+        self.set_value(value);
+        self
+    }
+
+    pub fn set_value(&self, value: f64) {
+        if self.native.doubleValue() != value {
+            self.native.setDoubleValue(value);
+        }
+        self.last_value.set(self.native.doubleValue());
+    }
+
+    pub fn get_value(&self) -> f64 { self.native.doubleValue() }
+
+    pub fn on_change(self, mut f: impl FnMut(f64) + 'static) -> Self {
+        let last = self.last_value.clone();
+        self.target.set(move |sender| {
+            let Some(control) = sender.downcast_ref::<NSSlider>() else {
+                return;
+            };
+            let mut value = control.doubleValue();
+            if control.allowsTickMarkValuesOnly() {
+                value = control.closestTickMarkValueToValue(value);
+                control.setDoubleValue(value);
+                let changed = last.replace(value) != value;
+                let tracking = NSApplication::sharedApplication(control.mtm())
+                    .currentEvent()
+                    .is_some_and(|event| {
+                        matches!(
+                            event.r#type(),
+                            NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged
+                        )
+                    });
+                if changed && tracking {
+                    NSHapticFeedbackManager::defaultPerformer()
+                        .performFeedbackPattern_performanceTime(
+                            NSHapticFeedbackPattern::Alignment,
+                            NSHapticFeedbackPerformanceTime::Now,
+                        );
+                }
+            } else {
+                last.set(value);
+            }
+            f(value);
+        });
+        self
+    }
+}
+native_control!(Slider, NSSlider, ns_slider);
+
+/// A spacious native slider paired with a compact field for exact values.
+/// The caller binds both controls to its model; the field can accept values
+/// outside the slider's convenient range without losing precision.
+pub struct NumberSlider {
+    stack: HStack,
+}
+impl NumberSlider {
+    pub fn new(ui: &Ui, slider: std::rc::Rc<Slider>, field: std::rc::Rc<NumberField>) -> Self {
+        slider.width(160.0);
+        field.width(68.0);
+        Self {
+            stack: HStack::new(ui).spacing(12.0).push(slider).push(field),
+        }
+    }
+}
+impl NativeView for NumberSlider {
+    fn ns_view(&self) -> &NSView { self.stack.ns_view() }
+}
 numeric_control!(Stepper, NSStepper, ns_stepper);
 impl Stepper {
     pub fn increment(self, value: f64) -> Self {
