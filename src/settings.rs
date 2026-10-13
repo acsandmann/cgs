@@ -288,7 +288,7 @@ impl SettingsGroup {
         if row.control_view().downcast_ref::<objc2_app_kit::NSPopUpButton>().is_some() {
             row.control_view()
                 .widthAnchor()
-                .constraintEqualToConstant(220.0)
+                .constraintEqualToConstant(if self.surface.is_none() { 200.0 } else { 220.0 })
                 .setActive(true);
         }
         grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
@@ -299,7 +299,7 @@ impl SettingsGroup {
             objc2_app_kit::NSGridCellPlacement::Trailing
         });
         if self.surface.is_none() {
-            grid.columnAtIndex(1).setWidth(240.0);
+            grid.columnAtIndex(1).setWidth(220.0);
         }
         self.rows.push(row);
         self

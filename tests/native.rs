@@ -1391,6 +1391,30 @@ fn tab_bar_callback_can_destroy_its_owner(ui: &Ui) {
     );
 }
 
+fn inline_hosts_size_only_the_visible_inspector(ui: &Ui) {
+    let host = Rc::new(PageHost::content_sized(ui));
+    let short = Rc::new(VStack::new(ui).push(Label::new(ui, "Short")));
+    short.height(48.0);
+    let long = Rc::new(VStack::new(ui).push(Label::new(ui, "Long")));
+    long.height(140.0);
+    let window = Window::new(ui).content(SettingsPage::new(ui, "").section(host.clone()));
+    for (page, height) in [
+        (short.clone(), 48.0),
+        (long.clone(), 140.0),
+        (short.clone(), 48.0),
+    ] {
+        host.set_cached_page(page);
+        window.ns_window().contentView().unwrap().layoutSubtreeIfNeeded();
+        assert_eq!(
+            host.ns_view().frame().size.height,
+            height,
+            "parked inspectors do not constrain the inline host"
+        );
+    }
+    host.clear();
+    assert!(host.ns_view().subviews().is_empty());
+}
+
 fn main() {
     // A single libtest-compatible case lets nextest list this harness without running AppKit.
     if std::env::args().any(|arg| arg == "--list") {
@@ -1401,6 +1425,14 @@ fn main() {
     }
     let ui =
         Ui::new(MainThreadMarker::new().expect("native tests must run on the macOS main thread"));
+    if std::env::args().any(|arg| arg == "--layouts") {
+        autoreleasepool(|_| {
+            inline_hosts_size_only_the_visible_inspector(&ui);
+            cached_pages_keep_their_mount_and_release_on_clear(&ui);
+        });
+        println!("native inline host, search focus and teardown checks passed");
+        return;
+    }
     tab_bar_updates_and_releases_native_owners(&ui);
     tab_bar_callback_can_destroy_its_owner(&ui);
     let app = Application::shared(&ui);

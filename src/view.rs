@@ -274,6 +274,7 @@ pub struct PageHost {
     /// Owner of the current page when it was shown with `set_cached_page`.
     cached: RefCell<Option<std::rc::Weak<dyn NativeView>>>,
     parked: RefCell<Vec<Parked>>,
+    content_constraints: Option<RefCell<Vec<Retained<NSLayoutConstraint>>>>,
 }
 /// A caller-cached page left mounted but hidden. Detaching a page from its window discards
 /// its solved constraints, so revisiting it would cost a full layout pass; parked pages also
@@ -294,7 +295,16 @@ impl PageHost {
             page: RefCell::new(None),
             cached: RefCell::new(None),
             parked: RefCell::new(Vec::new()),
+            content_constraints: None,
         }
+    }
+
+    /// An inline host whose current content determines its Auto Layout height.
+    /// Cached content is retained, but only the visible content constrains the host.
+    pub fn content_sized(ui: &Ui) -> Self {
+        let mut host = Self::new(ui);
+        host.content_constraints = Some(RefCell::new(Vec::new()));
+        host
     }
 
     pub fn ns_view_controller(&self) -> &NSViewController { &self.controller }
@@ -339,6 +349,21 @@ impl PageHost {
     }
 
     fn fill(&self, view: &NSView) {
+        if let Some(constraints) = &self.content_constraints {
+            prepare(view);
+            let parent = self.view.ns_view();
+            let edges = vec![
+                view.topAnchor().constraintEqualToAnchor(&parent.topAnchor()),
+                view.bottomAnchor().constraintEqualToAnchor(&parent.bottomAnchor()),
+                view.leadingAnchor().constraintEqualToAnchor(&parent.leadingAnchor()),
+                view.trailingAnchor().constraintEqualToAnchor(&parent.trailingAnchor()),
+            ];
+            for edge in &edges {
+                edge.setActive(true);
+            }
+            *constraints.borrow_mut() = edges;
+            return;
+        }
         view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -351,8 +376,8 @@ impl PageHost {
             self.controller.addChildViewController(controller);
         }
         view.setTranslatesAutoresizingMaskIntoConstraints(true);
-        self.fill(view);
         self.view.ns_view().addSubview(view);
+        self.fill(view);
     }
 
     fn unmount(view: &NSView, controller: Option<&NSViewController>) {
@@ -363,6 +388,7 @@ impl PageHost {
     }
 
     fn leave(&self) {
+        self.release_content_constraints();
         let Some(page) = self.page.borrow_mut().take() else {
             return;
         };
@@ -431,8 +457,17 @@ impl PageHost {
         }
     }
 
+    fn release_content_constraints(&self) {
+        if let Some(constraints) = &self.content_constraints {
+            for constraint in constraints.borrow_mut().drain(..) {
+                constraint.setActive(false);
+            }
+        }
+    }
+
     /// Unmount the current and all parked pages.
     pub fn clear(&self) {
+        self.release_content_constraints();
         if let Some(page) = self.page.borrow_mut().take() {
             Self::unmount(page.ns_view(), page.view_controller());
         }

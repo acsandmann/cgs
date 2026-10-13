@@ -1,13 +1,12 @@
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::{MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSAnimationContext, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSColor, NSView, NSWorkspace,
+    NSAccessibility, NSAnimationContext, NSAppearanceCustomization, NSColor, NSView, NSWorkspace,
 };
-use objc2_foundation::NSArray;
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::{CGPoint, CGRect, CGSize, LayerHost, NativeView, Ui};
@@ -16,8 +15,12 @@ define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsLayoutPreview"]
+    #[ivars = Cell<bool>]
     struct PreviewView;
     impl PreviewView {
+        // Illustrations never intercept their enclosing native control’s clicks.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: CGPoint) -> *mut NSView { std::ptr::null_mut() }
         #[unsafe(method(viewDidChangeEffectiveAppearance))]
         fn appearance_changed(&self) {
             unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
@@ -33,32 +36,27 @@ impl NativeView for PreviewView {
 impl PreviewView {
     fn update_palette(&self) {
         let Some(layer) = self.layer() else { return };
-        let names = NSArray::from_slice(&[unsafe { NSAppearanceNameAqua }, unsafe {
-            NSAppearanceNameDarkAqua
-        }]);
-        let dark = self
-            .effectiveAppearance()
-            .bestMatchFromAppearancesWithNames(&names)
-            .is_some_and(|name| &*name == unsafe { NSAppearanceNameDarkAqua });
-        let background = NSColor::colorWithWhite_alpha(if dark { 0.13 } else { 0.96 }, 1.0);
-        let border = NSColor::colorWithWhite_alpha(if dark { 0.65 } else { 0.40 }, 1.0);
-        let tile = if dark {
-            NSColor::colorWithSRGBRed_green_blue_alpha(0.57, 0.72, 0.88, 1.0)
-        } else {
-            NSColor::colorWithSRGBRed_green_blue_alpha(0.29, 0.53, 0.78, 1.0)
-        };
-        // CGColors don't follow appearance changes; refresh the native layers
-        // explicitly without introducing color animations during a theme switch.
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        layer.setBackgroundColor(Some(&background.CGColor()));
-        layer.setBorderColor(Some(&border.CGColor()));
-        for view in self.subviews() {
-            if let Some(layer) = view.layer() {
-                layer.setBackgroundColor(Some(&tile.CGColor()));
+        // Resolve semantic colors using this view’s appearance before assigning CGColors.
+        self.effectiveAppearance().performAsCurrentDrawingAppearance(&RcBlock::new(|| {
+            let background = NSColor::controlBackgroundColor();
+            let border = if self.ivars().get() {
+                NSColor::controlAccentColor()
+            } else {
+                NSColor::separatorColor()
+            };
+            let tile = NSColor::tertiaryLabelColor();
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            layer.setBackgroundColor(Some(&background.CGColor()));
+            layer.setBorderColor(Some(&border.CGColor()));
+            for view in self.subviews() {
+                if let Some(layer) = view.layer() {
+                    layer.setBackgroundColor(Some(&tile.CGColor()));
+                    layer.setBorderColor(Some(&background.CGColor()));
+                }
             }
-        }
-        CATransaction::commit();
+            CATransaction::commit();
+        }));
     }
 }
 
@@ -90,7 +88,7 @@ struct WindowView {
     frame: CGRect,
 }
 
-/// An appearance-aware layout canvas with blue tiles and a rounded screen outline.
+/// An appearance-aware layout canvas with neutral windows and a restrained screen outline.
 /// Window geometry animates natively.
 /// No capture, timers, shadows, or background rendering run while it is idle.
 /// Callers supply layout geometry; this component owns all rendering and motion.
@@ -102,6 +100,13 @@ pub struct LayoutPreview {
     initialized: Cell<bool>,
 }
 impl LayoutPreview {
+    /// Mark the inspected choice using the system accent without changing its geometry.
+    pub fn set_selected(&self, selected: bool) {
+        if self.host.ivars().replace(selected) != selected {
+            self.host.update_palette();
+        }
+    }
+
     pub fn new(ui: &Ui, size: CGSize) -> Self {
         assert!(
             size.width.is_finite()
@@ -110,10 +115,17 @@ impl LayoutPreview {
                 && size.height > 0.0
         );
         let root = CALayer::layer();
-        root.setCornerRadius(9.0);
-        root.setBorderWidth(2.0);
+        root.setCornerRadius((size.height * 0.1).min(9.0));
+        root.setBorderWidth(1.0);
         root.setMasksToBounds(true);
-        let host: Retained<PreviewView> = unsafe { msg_send![PreviewView::alloc(ui.mtm()), init] };
+        let host: Retained<PreviewView> = unsafe {
+            msg_send![
+                super(PreviewView::alloc(ui.mtm()).set_ivars(Cell::new(false))),
+                init
+            ]
+        };
+        host.setAccessibilityElement(true);
+        host.setAccessibilityRole(Some(unsafe { objc2_app_kit::NSAccessibilityImageRole }));
         host.setWantsLayer(true);
         host.setLayer(Some(&root));
         host.update_palette();
@@ -175,6 +187,7 @@ impl LayoutPreview {
             let index = index.unwrap_or_else(|| {
                 let layer = CALayer::layer();
                 layer.setCornerRadius(3.0);
+                layer.setBorderWidth(0.5);
                 layer.setMasksToBounds(true);
                 let view = LayerHost::new(&self.ui, &layer);
                 view.ns_view().setTranslatesAutoresizingMaskIntoConstraints(true);
@@ -187,6 +200,9 @@ impl LayoutPreview {
                 windows.len() - 1
             });
             let pane = &mut windows[index];
+            pane.view
+                .ns_view()
+                .setHidden(frame.size.width <= 0.0 || frame.size.height <= 0.0);
             if existing && duration > 0.0 && pane.frame != window.frame {
                 unsafe {
                     let animator: objc2::rc::Retained<objc2::runtime::AnyObject> =

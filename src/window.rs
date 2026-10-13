@@ -172,6 +172,11 @@ impl Window {
 }
 impl Drop for Window {
     fn drop(&mut self) {
+        // End editing while native content and its Rust delegates are still alive.
+        // Otherwise the cached field editor can retain its former client after teardown.
+        unsafe {
+            self.native.endEditingFor(None);
+        }
         self.native.setDelegate(None);
         // End presentation before releasing Rust content; delegates cannot call back into it.
         if let Some(parent) = self.native.sheetParent() {

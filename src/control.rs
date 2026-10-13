@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{MainThreadOnly, Message};
+use objc2::{AllocAnyThread, MainThreadOnly, Message};
 use objc2_app_kit::*;
 use objc2_foundation::{
     NSArray, NSNumber, NSNumberFormatter, NSNumberFormatterStyle, NSObjectProtocol, NSString,
@@ -37,6 +37,7 @@ pub(crate) fn action_button_bezel() -> NSBezelStyle {
 pub struct Button {
     native: Retained<NSButton>,
     target: Retained<ActionTarget>,
+    illustration: Option<crate::LayoutPreview>,
 }
 impl Button {
     pub fn new(ui: &Ui, title: &str) -> Self {
@@ -45,8 +46,43 @@ impl Button {
         native.setBezelStyle(action_button_bezel());
         let target = ActionTarget::new(ui);
         target.attach(&native);
-        Self { native, target }
+        Self {
+            native,
+            target,
+            illustration: None,
+        }
     }
+
+    /// A compact native toggle with a live, noninteractive layout illustration.
+    pub fn layout_illustration(mut self, preview: crate::LayoutPreview) -> Self {
+        self.native.setButtonType(NSButtonType::PushOnPushOff);
+        #[allow(deprecated)] // AppKit’s flexible native image-and-title button bezel.
+        self.native.setBezelStyle(NSBezelStyle::RegularSquare);
+        self.native.setBordered(false);
+        self.native.setContentTintColor(Some(&NSColor::labelColor()));
+        let size = preview.canvas_size();
+        let image = NSImage::initWithSize(NSImage::alloc(), size);
+        self.native.setImage(Some(&image));
+        self.native.setImagePosition(NSCellImagePosition::ImageAbove);
+        self.native.addSubview(preview.ns_view());
+        preview.ns_view().setAccessibilityElement(false);
+        preview
+            .ns_view()
+            .centerXAnchor()
+            .constraintEqualToAnchor(&self.native.centerXAnchor())
+            .setActive(true);
+        preview
+            .ns_view()
+            .topAnchor()
+            .constraintEqualToAnchor_constant(&self.native.topAnchor(), 5.0)
+            .setActive(true);
+        self.width(140.0);
+        self.height(size.height + 30.0);
+        self.illustration = Some(preview);
+        self
+    }
+
+    pub fn layout_preview(&self) -> Option<&crate::LayoutPreview> { self.illustration.as_ref() }
 
     pub fn on_click(self, mut f: impl FnMut() + 'static) -> Self {
         self.target.set(move |_| f());
