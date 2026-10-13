@@ -1432,14 +1432,18 @@ fn main() {
         assert_eq!(failures, 0);
         return;
     }
+    if std::env::args().any(|arg| arg == "--lifecycle") {
+        window_close_is_idempotent_and_drop_does_not_dispatch(&ui);
+        active_presentations_teardown_with_their_owners(&ui);
+        graphics_resources_follow_their_native_views(&ui);
+        settings_windows_release_native_owners(&ui);
+        println!("native window lifecycle checks passed");
+        return;
+    }
     released_components_detach_borrowed_native_content(&ui);
     replaced_footer_releases_native_content(&ui);
     replaced_status_releases_native_content(&ui);
     toolbar_releases_disabled_actions_and_preserves_unchanged_controls(&ui);
-    window_close_is_idempotent_and_drop_does_not_dispatch(&ui);
-    active_presentations_teardown_with_their_owners(&ui);
-    graphics_resources_follow_their_native_views(&ui);
-    settings_windows_release_native_owners(&ui);
     autoreleasepool(|_| {
         page_headings_preserve_window_identity(&ui);
         navigation_uses_native_toolbar_items_and_responder_chain(&ui);
