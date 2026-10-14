@@ -81,6 +81,7 @@ pub struct SettingsRow {
     unit: Option<crate::UnitField>,
     control: Box<dyn NativeView>,
     validation: Rc<ValidationMessage>,
+    wide: bool,
 }
 impl SettingsRow {
     pub fn new(ui: &Ui, title: &str, control: impl NativeView) -> Self {
@@ -109,7 +110,16 @@ impl SettingsRow {
             unit: None,
             control: Box::new(control),
             validation,
+            wide: false,
         }
+    }
+
+    /// Let the control extend into the label column, past the group's shared
+    /// column widths, so long values such as paths show whole. The label keeps
+    /// only the width its text needs.
+    pub fn wide(mut self) -> Self {
+        self.wide = true;
+        self
     }
 
     /// Add a discoverable description beside the label, without expanding the row.
@@ -276,6 +286,7 @@ pub struct SettingsGroup {
     grid: Rc<Grid>,
     rows: Vec<SettingsRow>,
     dividers: Vec<Divider>,
+    lines: Vec<HStack>,
 }
 impl SettingsGroup {
     pub fn new(ui: &Ui) -> Self {
@@ -286,6 +297,7 @@ impl SettingsGroup {
             grid,
             rows: Vec::new(),
             dividers: Vec::new(),
+            lines: Vec::new(),
         }
     }
 
@@ -295,6 +307,7 @@ impl SettingsGroup {
             grid: Rc::new(Grid::new(ui).spacing(8.0, 20.0)),
             rows: Vec::new(),
             dividers: Vec::new(),
+            lines: Vec::new(),
         }
     }
 
@@ -312,16 +325,34 @@ impl SettingsGroup {
                 .setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
             self.dividers.push(divider);
         }
-        grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
-        if self.surface.is_some() {
+        if row.wide {
+            // One merged cell, so other rows' labels don't set this row's column split.
+            let [label, value] = row.take_form_cells();
+            let line = HStack::new(&row.ui)
+                .spacing(grid.columnSpacing())
+                .push(label.retain())
+                .push(Spacer::new(&row.ui))
+                .push(value.retain());
+            let cells = grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&[
+                line.ns_view(),
+                &objc2_app_kit::NSGridCell::emptyContentView(row.ui.mtm()),
+            ]));
+            cells.mergeCellsInRange(objc2_foundation::NSRange::new(0, 2));
+            grid.cellAtColumnIndex_rowIndex(0, grid.numberOfRows() - 1)
+                .setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
+            self.lines.push(line);
+        } else {
+            grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
+        }
+        if self.surface.is_some() && !row.wide {
             // Prefer enough room for explanations before compressing them to a
-            // narrow strip. Yield to wide native controls at compact window sizes.
+            // narrow strip. Yield to wide native controls and text field content.
             let label_width = row
                 .label
                 .ns_view()
                 .widthAnchor()
                 .constraintGreaterThanOrEqualToAnchor_multiplier(&grid.widthAnchor(), 0.5);
-            label_width.setPriority(749.0);
+            label_width.setPriority(crate::text::LABEL_PREFERRED_WIDTH);
             label_width.setActive(true);
         }
         grid.columnAtIndex(0).setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);

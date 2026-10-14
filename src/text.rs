@@ -57,6 +57,17 @@ impl Color {
     }
 }
 
+/// Above stack (250) and label (251) hugging, so a stack that pins its children to
+/// one width sizes to its longest text rather than squeezing it to the shortest
+/// sibling; above text fields, so a long value never wraps the label beside it;
+/// below window-size constraints (500), so text yields in narrow windows.
+pub(crate) const TEXT_COMPRESSION_RESISTANCE: f32 = 260.0;
+/// Text fields grow to fit their value, taking room a settings label would
+/// prefer (`LABEL_PREFERRED_WIDTH`) but not room its text needs.
+pub(crate) const FIELD_COMPRESSION_RESISTANCE: f32 = 255.0;
+/// Settings labels prefer half the row, but yield it to text field content.
+pub(crate) const LABEL_PREFERRED_WIDTH: f32 = 253.0;
+
 pub struct Label(Retained<NSTextField>);
 impl Label {
     pub fn new(ui: &Ui, text: &str) -> Self {
@@ -91,7 +102,18 @@ impl Label {
         self.0.setUsesSingleLineMode(false);
         self.0.setMaximumNumberOfLines(0);
         self.0.setContentCompressionResistancePriority_forOrientation(
-            250.0,
+            TEXT_COMPRESSION_RESISTANCE,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+        self
+    }
+
+    /// Truncate the tail when space runs out. Keeps the single line of `new`;
+    /// unlike `wrapping`, the natural width is the full line, so stacks show it whole.
+    pub fn truncating(self) -> Self {
+        self.0.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        self.0.setContentCompressionResistancePriority_forOrientation(
+            TEXT_COMPRESSION_RESISTANCE,
             NSLayoutConstraintOrientation::Horizontal,
         );
         self
@@ -131,6 +153,16 @@ macro_rules! text_style {
             pub fn set_text(&self, text: &str) { self.0.set_text(text); }
 
             pub fn max_lines(self, lines: isize) -> Self { Self(self.0.max_lines(lines)) }
+
+            /// One line that truncates its tail instead of wrapping.
+            pub fn single_line(ui: &Ui, text: &str) -> Self {
+                Self(
+                    Label::new(ui, text)
+                        .font(&Font::$font())
+                        .color(&Color::$color())
+                        .truncating(),
+                )
+            }
 
             pub fn ns_text_field(&self) -> &NSTextField { self.0.ns_text_field() }
         }

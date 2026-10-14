@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::*;
 use objc2_foundation::NSString;
 
@@ -22,17 +22,71 @@ define_class!(
         #[unsafe(method(intrinsicContentSize))]
         fn intrinsic_size(&self) -> crate::CGSize {
             let mut size: crate::CGSize = unsafe { msg_send![super(self), intrinsicContentSize] };
-            let font_size = self.font().map_or(NSFont::systemFontSize(), |font| font.pointSize());
-            // Leave room to edit empty fields and numbers without imposing a
-            // fixed width. A unit bezel supplies its own surrounding padding.
-            size.width = size.width.max(font_size * if self.isBezeled() { 6.0 } else { 3.0 });
+            let font = self.font().unwrap_or_else(crate::Font::body);
+            // Fit the value (live while editing) or the placeholder, whichever is wider.
+            // Leave room to edit empty fields and numbers without imposing a fixed
+            // width. A unit bezel supplies its own surrounding padding.
+            let value = self
+                .currentEditor()
+                .map(|editor| editor.string())
+                .unwrap_or_else(|| self.stringValue());
+            let text = text_width(&value, &font).max(
+                self.placeholderString().map_or(0.0, |placeholder| text_width(&placeholder, &font)),
+            );
+            let padding = if self.isBezeled() { 12.0 } else { 4.0 };
+            let minimum = font.pointSize() * if self.isBezeled() { 6.0 } else { 3.0 };
+            size.width = (text + padding).ceil().max(minimum);
             size
+        }
+
+        #[unsafe(method(setStringValue:))]
+        fn set_string_value(&self, value: &NSString) {
+            let _: () = unsafe { msg_send![super(self), setStringValue: value] };
+            self.invalidateIntrinsicContentSize();
+        }
+
+        #[unsafe(method(setPlaceholderString:))]
+        fn set_placeholder_string(&self, value: Option<&NSString>) {
+            let _: () = unsafe { msg_send![super(self), setPlaceholderString: value] };
+            self.invalidateIntrinsicContentSize();
+        }
+
+        #[unsafe(method(textDidChange:))]
+        fn text_did_change(&self, notification: &objc2_foundation::NSNotification) {
+            let _: () = unsafe { msg_send![super(self), textDidChange: notification] };
+            self.invalidateIntrinsicContentSize();
         }
     }
 );
+fn text_width(text: &NSString, font: &NSFont) -> f64 {
+    let attributes =
+        objc2_foundation::NSDictionary::from_slices(&[unsafe { NSFontAttributeName }], &[
+            font as &AnyObject
+        ]);
+    unsafe {
+        objc2_foundation::NSAttributedString::initWithString_attributes(
+            objc2_foundation::NSAttributedString::alloc(),
+            text,
+            Some(&attributes),
+        )
+    }
+    .size()
+    .width
+}
 fn natural_text_field(ui: &Ui) -> Retained<NSTextField> {
     let field: Retained<NaturalTextField> =
         unsafe { msg_send![NaturalTextField::alloc(ui.mtm()), init] };
+    // A bare `init` cell wraps; keep long values such as paths on one scrolling line.
+    if let Some(cell) = field.cell() {
+        cell.setWraps(false);
+        cell.setScrollable(true);
+    }
+    field.setUsesSingleLineMode(true);
+    // Grow with the content, but scroll it rather than widen the window or wrap labels.
+    field.setContentCompressionResistancePriority_forOrientation(
+        crate::text::FIELD_COMPRESSION_RESISTANCE,
+        NSLayoutConstraintOrientation::Horizontal,
+    );
     field.into_super()
 }
 

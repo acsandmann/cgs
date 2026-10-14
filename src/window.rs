@@ -676,8 +676,6 @@ impl PathField {
     pub fn new(ui: &Ui) -> Self {
         let field = crate::TextField::new(ui);
         field.min_width(112.0);
-        field.max_width(220.0);
-        field.compression_resistance(249.0, NSLayoutConstraintOrientation::Horizontal);
         let weak = Weak::new(field.ns_text_field());
         let ui_copy = *ui;
         let directories = Rc::new(Cell::new(false));

@@ -820,11 +820,7 @@ impl SettingsListCell {
         opens: bool,
     ) -> Retained<Self> {
         let title = Rc::new(Label::new(ui, ""));
-        let summary = (!inline).then(|| {
-            let label = Rc::new(crate::Caption::new(ui, ""));
-            label.ns_text_field().setMaximumNumberOfLines(1);
-            label
-        });
+        let summary = (!inline).then(|| Rc::new(crate::Caption::single_line(ui, "")));
         let trailing = inline.then(|| Rc::new(Label::new(ui, "")));
         let icon = has_icon.then(|| {
             let image = NSImageView::new(ui.mtm());
