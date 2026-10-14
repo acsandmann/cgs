@@ -40,7 +40,7 @@ impl PreviewView {
         self.effectiveAppearance().performAsCurrentDrawingAppearance(&RcBlock::new(|| {
             // Wireframe windows: a light fill with a defined stroke, so overlapping
             // windows layer cleanly. An unselected screen is a faint, borderless well on
-            // its grouped surface; selection tints it and outlines it in the accent color.
+            // its grouped surface; selection adds a quiet accent tint without an outline.
             let selected = self.ivars().get();
             let surface = grouped_surface();
             let accent = NSColor::controlAccentColor();
@@ -54,14 +54,14 @@ impl PreviewView {
             } else {
                 NSColor::labelColor()
             };
-            let background = mix(&surface, if selected { 0.12 } else { 0.04 }, &ink);
-            let tile = mix(&background, if selected { 0.16 } else { 0.08 }, &ink);
-            let stroke = mix(&background, if selected { 0.6 } else { 0.28 }, &ink);
+            let background = mix(&surface, if selected { 0.10 } else { 0.02 }, &ink);
+            let tile = mix(&background, if selected { 0.10 } else { 0.06 }, &ink);
+            let stroke = mix(&background, if selected { 0.32 } else { 0.24 }, &ink);
             CATransaction::begin();
             CATransaction::setDisableActions(true);
             layer.setBackgroundColor(Some(&background.CGColor()));
             layer.setBorderColor(Some(&accent.CGColor()));
-            layer.setBorderWidth(if selected { 1.5 } else { 0.0 });
+            layer.setBorderWidth(0.0);
             for view in self.subviews() {
                 if let Some(layer) = view.layer() {
                     layer.setBackgroundColor(Some(&tile.CGColor()));
