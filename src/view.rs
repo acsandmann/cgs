@@ -449,12 +449,17 @@ impl PageHost {
             find(root, section, true).and_then(|heading| unsafe { heading.superview() });
         let mut target = None;
         while let Some(parent) = scope {
+            crate::layout::reveal_disclosures(&parent, title);
             target = find(&parent, title, false).or_else(|| find(&parent, title, true));
             if target.is_some() || std::ptr::eq(&*parent, root) {
                 break;
             }
             scope = unsafe { parent.superview() };
         }
+        if target.is_none() {
+            crate::layout::reveal_disclosures(root, title);
+        }
+        root.layoutSubtreeIfNeeded();
         let Some(view) =
             target.or_else(|| find(root, title, false)).or_else(|| find(root, title, true))
         else {

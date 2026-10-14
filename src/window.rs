@@ -675,7 +675,9 @@ pub struct PathField {
 impl PathField {
     pub fn new(ui: &Ui) -> Self {
         let field = crate::TextField::new(ui);
-        field.min_width(160.0);
+        field.min_width(112.0);
+        field.max_width(220.0);
+        field.compression_resistance(249.0, NSLayoutConstraintOrientation::Horizontal);
         let weak = Weak::new(field.ns_text_field());
         let ui_copy = *ui;
         let directories = Rc::new(Cell::new(false));
@@ -709,7 +711,11 @@ impl PathField {
         self
     }
 
-    pub fn set_value(&self, path: &Path) { self.field.set_value(&path.to_string_lossy()); }
+    pub fn set_value(&self, path: &Path) {
+        let path = path.to_string_lossy();
+        self.field.set_value(&path);
+        self.field.tooltip(&path);
+    }
 
     pub fn on_change(mut self, mut f: impl FnMut(PathBuf) + 'static) -> Self {
         use std::rc::Rc;

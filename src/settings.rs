@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 
 use objc2::Message;
@@ -25,17 +25,31 @@ impl Validation {
 }
 pub struct ValidationMessage {
     label: SecondaryLabel,
+    value: RefCell<Validation>,
 }
 impl ValidationMessage {
     pub fn new(ui: &Ui) -> Self {
         let label = SecondaryLabel::new(ui, "");
-        let this = Self { label };
+        let this = Self {
+            label,
+            value: RefCell::new(Validation::None),
+        };
         this.set_hidden(true);
         this
     }
 
     pub fn set_validation(&self, value: &Validation) {
+        if *self.value.borrow() == *value {
+            return;
+        }
+        *self.value.borrow_mut() = value.clone();
         self.label.set_text(value.message().unwrap_or(""));
+        let color = match value {
+            Validation::Error(_) => objc2_app_kit::NSColor::systemRedColor(),
+            Validation::Warning(_) => objc2_app_kit::NSColor::systemOrangeColor(),
+            _ => Color::secondary_label(),
+        };
+        self.label.ns_text_field().setTextColor(Some(&color));
         self.set_hidden(matches!(value, Validation::None));
         self.accessibility_label(value.message().unwrap_or(""));
     }
@@ -123,6 +137,9 @@ impl SettingsRow {
     }
 
     pub fn description(mut self, text: &str) -> Self {
+        if text.trim().is_empty() {
+            return self;
+        }
         self.label = Rc::new(
             VStack::new(&self.ui)
                 .spacing(4.0)
@@ -262,7 +279,7 @@ pub struct SettingsGroup {
 }
 impl SettingsGroup {
     pub fn new(ui: &Ui) -> Self {
-        let grid = Rc::new(Grid::new(ui).spacing(8.0, 20.0));
+        let grid = Rc::new(Grid::new(ui).spacing(10.0, 24.0));
         let surface = GroupBox::new(ui, grid.clone());
         Self {
             surface: Some(surface),
@@ -296,6 +313,17 @@ impl SettingsGroup {
             self.dividers.push(divider);
         }
         grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
+        if self.surface.is_some() {
+            // Prefer enough room for explanations before compressing them to a
+            // narrow strip. Yield to wide native controls at compact window sizes.
+            let label_width = row
+                .label
+                .ns_view()
+                .widthAnchor()
+                .constraintGreaterThanOrEqualToAnchor_multiplier(&grid.widthAnchor(), 0.5);
+            label_width.setPriority(749.0);
+            label_width.setActive(true);
+        }
         grid.columnAtIndex(0).setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
         grid.columnAtIndex(1).setXPlacement(if self.surface.is_none() {
             objc2_app_kit::NSGridCellPlacement::Leading
@@ -321,7 +349,7 @@ pub struct Section {
 }
 impl Section {
     pub fn new(ui: &Ui, title: &str) -> Self {
-        let mut stack = VStack::new(ui).spacing(6.0);
+        let mut stack = VStack::new(ui).spacing(8.0);
         if !title.is_empty() {
             stack = stack.push(SectionTitle::new(ui, title));
         }
@@ -514,6 +542,17 @@ impl SettingsPage {
 
     pub fn subtitle(self, text: &str) -> Self {
         self.content.add(SecondaryLabel::new(&self.ui, text));
+        self
+    }
+
+    /// Keep a page's title and explanation together, with the same rhythm in every pane.
+    pub fn introduction(self, title: &str, description: &str) -> Self {
+        self.content.add(
+            VStack::new(&self.ui)
+                .spacing(5.0)
+                .push(Title::new(&self.ui, title))
+                .push(SecondaryLabel::new(&self.ui, description)),
+        );
         self
     }
 

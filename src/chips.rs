@@ -7,13 +7,14 @@ use objc2::runtime::AnyObject;
 use objc2::{AllocAnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSBezelStyle, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventMask, NSEventType,
-    NSImageSymbolConfiguration, NSTrackingArea, NSTrackingAreaOptions, NSView, NSWorkspace,
+    NSImageSymbolConfiguration, NSLayoutConstraintOrientation, NSTrackingArea,
+    NSTrackingAreaOptions, NSView, NSWorkspace,
 };
 use objc2_foundation::NSString;
 
 use crate::{
-    Application, Button, CGRect, HStack, NativeView, NumberField, Popover, Slider, Spacer, Symbol,
-    Ui, VStack, View,
+    Application, Button, CGPoint, CGRect, CGSize, HStack, NativeView, NumberField, Popover, Slider,
+    Spacer, Symbol, Ui, VStack, View,
 };
 
 /// A change the user made to a [`ValueChips`] list, in display units.
@@ -24,6 +25,86 @@ pub enum ChipEdit {
     Remove(usize),
     /// Move a value to its final index in the list.
     Move(usize, usize),
+}
+
+// Chip positions are independent of Auto Layout, so their fixed widths cannot
+// force the preferences window wider. The row contributes only its flowing height.
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsChipFlow"]
+    #[ivars = Cell<f64>]
+    struct ChipFlow;
+    impl ChipFlow {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool { true }
+
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_size(&self) -> CGSize {
+            let children = self.subviews();
+            let width = children.iter().map(|view| view.fittingSize().width).sum::<f64>()
+                + 6.0 * children.len().saturating_sub(1) as f64;
+            let widest = children.iter().map(|view| view.fittingSize().width).fold(0.0, f64::max);
+            // A long list grows downward instead of inflating NSGridView's
+            // minimum fitting width. Keep a single chip fully readable.
+            CGSize::new(width.min(220.0).max(widest), self.ivars().get())
+        }
+
+        #[unsafe(method(layout))]
+        fn layout_chips(&self) {
+            unsafe { let _: () = msg_send![super(self), layout]; }
+            let available = self.bounds().size.width.max(1.0);
+            let (mut x, mut y, mut row_height) = (0.0, 0.0, 0.0_f64);
+            for child in self.subviews() {
+                let size = child.fittingSize();
+                if x > 0.0 && x + size.width > available + 0.5 {
+                    x = 0.0;
+                    y += row_height + 6.0;
+                    row_height = 0.0;
+                }
+                child.setFrame(CGRect::new(CGPoint::new(x, y), size));
+                x += size.width + 6.0;
+                row_height = row_height.max(size.height);
+            }
+            let height = y + row_height;
+            if self.ivars().replace(height) != height {
+                self.invalidateIntrinsicContentSize();
+            }
+        }
+    }
+);
+
+impl ChipFlow {
+    fn new(ui: &Ui) -> Retained<Self> {
+        let row: Retained<Self> = unsafe {
+            msg_send![
+                super(Self::alloc(ui.mtm()).set_ivars(Cell::new(24.0))),
+                init
+            ]
+        };
+        crate::view::prepare(&row);
+        row.setContentCompressionResistancePriority_forOrientation(
+            250.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+        // A compact two-column flow remains readable even when the form would
+        // otherwise shrink this control to the width of its largest chip.
+        row.widthAnchor().constraintGreaterThanOrEqualToConstant(180.0).setActive(true);
+        row
+    }
+
+    fn clear(&self) {
+        for view in self.subviews() {
+            view.removeFromSuperview();
+        }
+    }
+
+    fn add(&self, view: &NSView) {
+        view.setTranslatesAutoresizingMaskIntoConstraints(true);
+        self.addSubview(view);
+        self.setNeedsLayout(true);
+        self.invalidateIntrinsicContentSize();
+    }
 }
 
 pub struct ChipIvars {
@@ -49,9 +130,8 @@ define_class!(
         }
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking_areas(&self) {
-            if let Some(area) = self.ivars().area.borrow_mut().take() {
-                self.removeTrackingArea(&area);
-            }
+            unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
+            if self.ivars().area.borrow().is_some() { return; }
             let area = unsafe {
                 NSTrackingArea::initWithRect_options_owner_userInfo(
                     NSTrackingArea::alloc(),
@@ -65,7 +145,6 @@ define_class!(
             };
             self.addTrackingArea(&area);
             *self.ivars().area.borrow_mut() = Some(area);
-            unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
         }
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, _event: &NSEvent) { self.reveal(true); }
@@ -114,10 +193,11 @@ struct Inner {
     unit: String,
     range: (f64, f64),
     min_count: Cell<usize>,
-    row: HStack,
+    row: Retained<ChipFlow>,
     add: Rc<Button>,
     chips: RefCell<Vec<Rc<Chip>>>,
     values: RefCell<Vec<f64>>,
+    rendered: Cell<bool>,
     format: Format,
     on_edit: OnEdit,
     popover: RefCell<Option<Popover>>,
@@ -152,10 +232,11 @@ impl ValueChips {
                 unit: unit.into(),
                 range: (min, max),
                 min_count: Cell::new(1),
-                row: HStack::new(ui).spacing(6.0),
+                row: ChipFlow::new(ui),
                 add: Rc::new(add),
                 chips: RefCell::new(Vec::new()),
                 values: RefCell::new(Vec::new()),
+                rendered: Cell::new(false),
                 format: RefCell::new(Box::new(|value| format!("{value}"))),
                 on_edit: RefCell::new(None),
                 popover: RefCell::new(None),
@@ -166,12 +247,14 @@ impl ValueChips {
     /// How a value appears on its chip, without the unit.
     pub fn format(self, format: impl Fn(f64) -> String + 'static) -> Self {
         *self.0.format.borrow_mut() = Box::new(format);
+        self.0.rendered.set(false);
         self
     }
 
     /// The fewest values allowed; their remove controls stay hidden at this count.
     pub fn min_count(self, count: usize) -> Self {
         self.0.min_count.set(count);
+        self.0.rendered.set(false);
         self
     }
 
@@ -183,7 +266,10 @@ impl ValueChips {
     /// Show `values`, keeping existing chips (and any open editor) when the count is unchanged.
     pub fn set_values(&self, values: &[f64]) {
         let inner = &self.0;
-        if inner.chips.borrow().len() != values.len() {
+        if inner.rendered.get() && inner.values.borrow().as_slice() == values {
+            return;
+        }
+        if inner.chips.borrow().len() != values.len() || inner.row.subviews().is_empty() {
             inner.rebuild(values.len());
         }
         let removable = values.len() > inner.min_count.get();
@@ -202,10 +288,13 @@ impl ValueChips {
                 .setConstant(chip.button.ns_view().intrinsicContentSize().width + 18.0);
         }
         *inner.values.borrow_mut() = values.to_vec();
+        inner.rendered.set(true);
+        inner.row.setNeedsLayout(true);
+        inner.row.invalidateIntrinsicContentSize();
     }
 }
 impl NativeView for ValueChips {
-    fn ns_view(&self) -> &NSView { self.0.row.ns_view() }
+    fn ns_view(&self) -> &NSView { &self.0.row }
 }
 
 impl Inner {
@@ -273,10 +362,10 @@ impl Inner {
             let width = native.widthAnchor().constraintEqualToConstant(0.0);
             width.setActive(true);
             let chip = Rc::new(Chip { button, remove, width });
-            self.row.add(chip.clone());
+            self.row.add(chip.ns_view());
             chips.push(chip);
         }
-        self.row.add(self.add.clone());
+        self.row.add(self.add.ns_view());
     }
 
     /// Track the gesture before activating the button so dragging never opens the editor.
@@ -285,18 +374,21 @@ impl Inner {
             return;
         }
         let Some(window) = button.window() else { return };
-        let row = self.row.ns_view();
+        let row: &NSView = &self.row;
         row.layoutSubtreeIfNeeded();
         // Keep the original slots stable while the chips preview their new order.
         let chips = self.chips.borrow().clone();
         if from >= chips.len() {
             return;
         }
-        let centers: Vec<f64> = chips
+        let centers: Vec<CGPoint> = chips
             .iter()
             .map(|chip| {
                 let frame = chip.ns_view().frame();
-                frame.origin.x + frame.size.width / 2.0
+                CGPoint::new(
+                    frame.origin.x + frame.size.width / 2.0,
+                    frame.origin.y + frame.size.height / 2.0,
+                )
             })
             .collect();
         let start = down.locationInWindow();
@@ -328,7 +420,11 @@ impl Inner {
                 let destination = centers
                     .iter()
                     .enumerate()
-                    .min_by(|(_, a), (_, b)| (*a - point.x).abs().total_cmp(&(*b - point.x).abs()))
+                    .min_by(|(_, a), (_, b)| {
+                        (a.x - point.x)
+                            .hypot(a.y - point.y)
+                            .total_cmp(&(b.x - point.x).hypot(b.y - point.y))
+                    })
                     .map_or(from, |(index, _)| index);
                 if destination != to {
                     to = destination;
@@ -371,10 +467,10 @@ impl Inner {
     fn arrange(&self, chips: &[Rc<Chip>], order: &[usize]) {
         self.row.clear();
         for &index in order {
-            self.row.add(chips[index].clone());
+            self.row.add(chips[index].ns_view());
         }
-        self.row.add(self.add.clone());
-        self.row.ns_view().layoutSubtreeIfNeeded();
+        self.row.add(self.add.ns_view());
+        self.row.layoutSubtreeIfNeeded();
     }
 
     /// The middle of the widest gap between existing values and the range ends.

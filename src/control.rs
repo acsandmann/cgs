@@ -551,8 +551,12 @@ macro_rules! numeric_control {
             }
 
             pub fn set_range(&self, min: f64, max: f64) {
-                self.native.setMinValue(min);
-                self.native.setMaxValue(max);
+                if self.native.minValue() != min {
+                    self.native.setMinValue(min);
+                }
+                if self.native.maxValue() != max {
+                    self.native.setMaxValue(max);
+                }
             }
 
             /// Report every change while tracking, rather than only on release.
@@ -632,8 +636,12 @@ impl Slider {
 
     pub fn set_range(&self, min: f64, max: f64) {
         assert!(min.is_finite() && max.is_finite() && min <= max);
-        self.native.setMinValue(min);
-        self.native.setMaxValue(max);
+        if self.native.minValue() != min {
+            self.native.setMinValue(min);
+        }
+        if self.native.maxValue() != max {
+            self.native.setMaxValue(max);
+        }
         self.last_value.set(self.native.doubleValue());
     }
 

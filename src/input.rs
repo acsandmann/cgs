@@ -521,7 +521,10 @@ impl UnitField {
         bezel.setAccessibilityRole(Some(unsafe { NSAccessibilityGroupRole }));
         field.setBezeled(false);
         field.setDrawsBackground(false);
-        let label = crate::SecondaryLabel::new(ui, unit);
+        // Units must retain their natural width while the editable value yields.
+        let label = crate::Label::new(ui, unit).color(&crate::Color::secondary_label());
+        label.compression_resistance(1000.0, NSLayoutConstraintOrientation::Horizontal);
+        label.hugging_priority(1000.0, NSLayoutConstraintOrientation::Horizontal);
         label.ns_text_field().setSelectable(false);
         let value_object: &AnyObject = field;
         let unit_object: &AnyObject = label.ns_text_field();

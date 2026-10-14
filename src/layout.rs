@@ -271,10 +271,10 @@ pub struct GroupBox {
 impl GroupBox {
     pub fn new(ui: &Ui, content: impl NativeView) -> Self {
         Self::with_insets(ui, content, Insets {
-            top: 10.0,
-            left: 12.0,
-            bottom: 10.0,
-            right: 12.0,
+            top: 14.0,
+            left: 16.0,
+            bottom: 14.0,
+            right: 16.0,
         })
     }
 
@@ -283,7 +283,7 @@ impl GroupBox {
         native.setBoxType(NSBoxType::Custom);
         native.setTitlePosition(NSTitlePosition::NoTitle);
         native.setBorderWidth(0.0);
-        native.setCornerRadius(8.0);
+        native.setCornerRadius(10.0);
         native.setFillColor(&NSColor::quaternarySystemFillColor());
         // Animate the group boundary with an explicitly layer-backed child subtree.
         native.setWantsLayer(content.ns_view().wantsLayer());
@@ -550,6 +550,35 @@ impl NativeView for Disclosure {
     fn ns_view(&self) -> &NSView { self.stack.ns_view() }
 }
 
+/// Open only disclosures containing the requested setting. Native clicks run
+/// lazy-content callbacks and keep the header's accessibility state in sync.
+pub(crate) fn reveal_disclosures(view: &NSView, title: &str) {
+    fn contains(view: &NSView, title: &str) -> bool {
+        view.accessibilityLabel().is_some_and(|name| {
+            let name = name.to_string();
+            name == title || name.starts_with(&format!("{title} ("))
+        }) || view
+            .downcast_ref::<NSTextField>()
+            .is_some_and(|field| field.stringValue().to_string() == title)
+            || view.subviews().iter().any(|child| contains(&child, title))
+    }
+    if view.isHidden() {
+        return;
+    }
+    let children = view.subviews();
+    if let Some(header) =
+        children.iter().find_map(|child| child.downcast::<DisclosureHeader>().ok())
+    {
+        if children.iter().any(|child| child.isHidden() && contains(&child, title)) {
+            // The mounted disclosure owns its target and content for this call.
+            unsafe { header.performClick(None) };
+        }
+    }
+    for child in view.subviews() {
+        reveal_disclosures(&child, title);
+    }
+}
+
 define_class!(
     #[unsafe(super(NSStackView))]
     #[thread_kind = MainThreadOnly]
@@ -559,7 +588,15 @@ define_class!(
     impl ResponsiveStackView {
         #[unsafe(method(layout))]
         fn layout_stack(&self) {
-            let orientation = if self.bounds().size.width >= *self.ivars() { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
+            // A horizontal stack can inflate its ancestor's fitting width before
+            // the window shrinks. Check the actual window edge too, so an
+            // oversized layout cannot keep this stack stuck in its wide mode.
+            let mut width = self.bounds().size.width;
+            if let Some(window) = self.window() {
+                let origin = self.convertPoint_toView(crate::CGPoint::new(0.0, 0.0), None);
+                width = width.min(window.contentRectForFrameRect(window.frame()).size.width - origin.x);
+            }
+            let orientation = if width >= *self.ivars() { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
             if self.orientation() != orientation {
                 self.setOrientation(orientation);
                 self.setAlignment(if orientation == NSUserInterfaceLayoutOrientation::Horizontal { NSLayoutAttribute::Top } else { NSLayoutAttribute::Leading });

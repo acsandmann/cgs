@@ -973,7 +973,7 @@ pub struct SettingsList<T: 'static> {
     image: Rc<RefCell<Option<Box<dyn Fn(&T) -> Option<Retained<NSImage>>>>>>,
     fitted_height: Option<(Retained<NSLayoutConstraint>, f64)>,
     row_count: Rc<Cell<usize>>,
-    empty: crate::Caption,
+    empty: crate::SecondaryLabel,
     trailing_summary: Rc<Cell<bool>>,
     navigation: Rc<Cell<bool>>,
 }
@@ -1056,7 +1056,8 @@ impl<T: 'static> SettingsList<T> {
             bottom: 0.0,
             right: 0.0,
         });
-        let empty = crate::Caption::new(ui, "No items");
+        let empty = crate::SecondaryLabel::new(ui, "No items");
+        empty.ns_text_field().setAlignment(NSTextAlignment::Center);
         surface.ns_view().addSubview(empty.ns_view());
         crate::view::prepare(empty.ns_view());
         empty
@@ -1068,6 +1069,11 @@ impl<T: 'static> SettingsList<T> {
             .ns_view()
             .centerYAnchor()
             .constraintEqualToAnchor(&surface.ns_view().centerYAnchor())
+            .setActive(true);
+        empty
+            .ns_view()
+            .widthAnchor()
+            .constraintLessThanOrEqualToAnchor_multiplier(&surface.ns_view().widthAnchor(), 0.9)
             .setActive(true);
         Self {
             table,
@@ -1154,9 +1160,12 @@ impl<T: 'static> SettingsList<T> {
     }
 
     pub fn empty_message(self, message: &str) -> Self {
-        self.empty.set_text(message);
+        self.set_empty_message(message);
         self
     }
+
+    /// Update guidance when a collection's search or filters change.
+    pub fn set_empty_message(&self, message: &str) { self.empty.set_text(message); }
 
     pub fn on_select(self, f: impl FnMut(Option<usize>) + 'static) -> Self {
         self.table.set_on_select(f);

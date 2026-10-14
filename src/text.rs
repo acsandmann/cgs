@@ -86,8 +86,14 @@ impl Label {
     pub fn wrapping(self) -> Self {
         if let Some(cell) = self.0.cell() {
             cell.setWraps(true);
+            cell.setScrollable(false);
         }
+        self.0.setUsesSingleLineMode(false);
         self.0.setMaximumNumberOfLines(0);
+        self.0.setContentCompressionResistancePriority_forOrientation(
+            250.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
         self
     }
 
