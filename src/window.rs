@@ -229,10 +229,7 @@ impl SettingsWindow {
     }
 
     fn from_window(window: Window, title: &str, autosave: bool) -> Self {
-        let window = window.title(title).min_size(CGSize::new(
-            crate::Metrics::SIDEBAR_MIN_WIDTH + crate::Metrics::DETAIL_MIN_WIDTH,
-            420.0,
-        ));
+        let window = window.title(title);
         let window = if autosave {
             window.autosave_frame(title)
         } else {
@@ -553,9 +550,13 @@ impl Drop for Popover {
 pub struct HelpPopover(Popover);
 impl HelpPopover {
     pub fn new(ui: &Ui, text: &str) -> Self {
+        Self::with_content(ui, crate::WrappingLabel::new(ui, text))
+    }
+
+    pub fn with_content(ui: &Ui, content: impl NativeView) -> Self {
         Self(Popover::new(
             ui,
-            View::new(ui).content(crate::WrappingLabel::new(ui, text), crate::Insets {
+            View::new(ui).content(content, crate::Insets {
                 top: 12.0,
                 left: 12.0,
                 bottom: 12.0,

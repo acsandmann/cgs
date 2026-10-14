@@ -13,8 +13,31 @@ use crate::{Label, NativeControl, NativeView, Ui, Validation};
 type TextCallback = Box<dyn FnMut(String)>;
 type TextCallbacks = Rc<RefCell<[Option<TextCallback>; 2]>>;
 
+define_class!(
+    #[unsafe(super(NSTextField))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsTextField"]
+    struct NaturalTextField;
+    impl NaturalTextField {
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_size(&self) -> crate::CGSize {
+            let mut size: crate::CGSize = unsafe { msg_send![super(self), intrinsicContentSize] };
+            let font_size = self.font().map_or(NSFont::systemFontSize(), |font| font.pointSize());
+            // Leave room to edit empty fields and numbers without imposing a
+            // fixed width. A unit bezel supplies its own surrounding padding.
+            size.width = size.width.max(font_size * if self.isBezeled() { 6.0 } else { 3.0 });
+            size
+        }
+    }
+);
+fn natural_text_field(ui: &Ui) -> Retained<NSTextField> {
+    let field: Retained<NaturalTextField> =
+        unsafe { msg_send![NaturalTextField::alloc(ui.mtm()), init] };
+    field.into_super()
+}
+
 macro_rules! text_input {
-    ($name:ident,$native:ident,$accessor:ident) => {
+    ($name:ident,$native:ident,$accessor:ident,$constructor:expr) => {
         pub struct $name {
             native: Retained<$native>,
             delegate: Option<Retained<DelegateBridge>>,
@@ -22,7 +45,7 @@ macro_rules! text_input {
         }
         impl $name {
             pub fn new(ui: &Ui) -> Self {
-                let native = $native::new(ui.mtm());
+                let native = ($constructor)(ui);
                 native.setFont(Some(&crate::Font::body()));
                 Self {
                     native,
@@ -106,14 +129,18 @@ macro_rules! text_input {
         }
     };
 }
-text_input!(TextField, NSTextField, ns_text_field);
+text_input!(TextField, NSTextField, ns_text_field, natural_text_field);
 impl TextField {
     pub fn with_validation(self, ui: &Ui) -> crate::Validated<Self> {
         crate::Validated::new(ui, self)
     }
 }
-text_input!(SearchField, NSSearchField, ns_search_field);
-text_input!(TokenField, NSTokenField, ns_token_field);
+text_input!(SearchField, NSSearchField, ns_search_field, |ui: &Ui| {
+    NSSearchField::new(ui.mtm())
+});
+text_input!(TokenField, NSTokenField, ns_token_field, |ui: &Ui| {
+    NSTokenField::new(ui.mtm())
+});
 
 pub struct TextArea {
     scroll: crate::ScrollView,

@@ -38,25 +38,62 @@ impl PreviewView {
         let Some(layer) = self.layer() else { return };
         // Resolve semantic colors using this view’s appearance before assigning CGColors.
         self.effectiveAppearance().performAsCurrentDrawingAppearance(&RcBlock::new(|| {
-            let background = NSColor::controlBackgroundColor();
-            let border = if self.ivars().get() {
-                NSColor::controlAccentColor()
-            } else {
-                NSColor::separatorColor()
+            // Wireframe windows: a light fill with a defined stroke, so overlapping
+            // windows layer cleanly. An unselected screen is a faint, borderless well on
+            // its grouped surface; selection tints it and outlines it in the accent color.
+            let selected = self.ivars().get();
+            let surface = grouped_surface();
+            let accent = NSColor::controlAccentColor();
+            let mix = |color: &NSColor, fraction: f64, ink: &NSColor| {
+                color
+                    .blendedColorWithFraction_ofColor(fraction, ink)
+                    .unwrap_or_else(|| ink.colorWithAlphaComponent(fraction))
             };
-            let tile = NSColor::tertiaryLabelColor();
+            let ink = if selected {
+                accent.clone()
+            } else {
+                NSColor::labelColor()
+            };
+            let background = mix(&surface, if selected { 0.12 } else { 0.04 }, &ink);
+            let tile = mix(&background, if selected { 0.16 } else { 0.08 }, &ink);
+            let stroke = mix(&background, if selected { 0.6 } else { 0.28 }, &ink);
             CATransaction::begin();
             CATransaction::setDisableActions(true);
             layer.setBackgroundColor(Some(&background.CGColor()));
-            layer.setBorderColor(Some(&border.CGColor()));
+            layer.setBorderColor(Some(&accent.CGColor()));
+            layer.setBorderWidth(if selected { 1.5 } else { 0.0 });
             for view in self.subviews() {
                 if let Some(layer) = view.layer() {
                     layer.setBackgroundColor(Some(&tile.CGColor()));
-                    layer.setBorderColor(Some(&background.CGColor()));
+                    layer.setBorderColor(Some(&stroke.CGColor()));
                 }
             }
             CATransaction::commit();
         }));
+    }
+}
+
+/// The opaque color of a grouped settings surface (`GroupBox`) over the window
+/// background, so previews blend into it instead of reading as darker panels.
+fn grouped_surface() -> objc2::rc::Retained<NSColor> {
+    let srgb = objc2_app_kit::NSColorSpace::sRGBColorSpace();
+    let base = NSColor::windowBackgroundColor();
+    let fill = NSColor::quaternarySystemFillColor();
+    match (
+        base.colorUsingColorSpace(&srgb),
+        fill.colorUsingColorSpace(&srgb),
+    ) {
+        (Some(base), Some(fill)) => {
+            let alpha = fill.alphaComponent();
+            let over = |top: f64, bottom: f64| top * alpha + bottom * (1.0 - alpha);
+            NSColor::colorWithSRGBRed_green_blue_alpha(
+                over(fill.redComponent(), base.redComponent()),
+                over(fill.greenComponent(), base.greenComponent()),
+                over(fill.blueComponent(), base.blueComponent()),
+                1.0,
+            )
+        }
+        _ => base,
     }
 }
 
@@ -187,7 +224,7 @@ impl LayoutPreview {
             let index = index.unwrap_or_else(|| {
                 let layer = CALayer::layer();
                 layer.setCornerRadius(3.0);
-                layer.setBorderWidth(0.5);
+                layer.setBorderWidth(1.0);
                 layer.setMasksToBounds(true);
                 let view = LayerHost::new(&self.ui, &layer);
                 view.ns_view().setTranslatesAutoresizingMaskIntoConstraints(true);

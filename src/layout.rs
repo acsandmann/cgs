@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::NSArray;
 
@@ -192,6 +193,22 @@ impl Grid {
         self
     }
 
+    /// Share the available width evenly, without fixing or limiting the grid’s size.
+    pub fn equal_columns(self) -> Self {
+        self.native.setXPlacement(NSGridCellPlacement::Fill);
+        if let Some(first) = self.children.first() {
+            for cell in
+                self.children.iter().skip(1).take(self.native.numberOfColumns() as usize - 1)
+            {
+                cell.ns_view()
+                    .widthAnchor()
+                    .constraintEqualToAnchor(&first.ns_view().widthAnchor())
+                    .setActive(true);
+            }
+        }
+        self
+    }
+
     pub fn ns_grid_view(&self) -> &NSGridView { &self.native }
 }
 impl NativeView for Grid {
@@ -268,6 +285,8 @@ impl GroupBox {
         native.setBorderWidth(0.0);
         native.setCornerRadius(8.0);
         native.setFillColor(&NSColor::quaternarySystemFillColor());
+        // Animate the group boundary with an explicitly layer-backed child subtree.
+        native.setWantsLayer(content.ns_view().wantsLayer());
         native.setContentViewMargins(crate::CGSize::new(0.0, 0.0));
         let host = native.contentView().unwrap();
         host.addSubview(content.ns_view());
@@ -355,10 +374,33 @@ impl NativeView for ScrollView {
     fn ns_view(&self) -> &NSView { &self.native }
 }
 
+// A disclosure header is one native button target, including its labels and whitespace.
+define_class!(
+    #[unsafe(super(NSButton))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsDisclosureHeader"]
+    #[ivars = Retained<NSStackView>]
+    struct DisclosureHeader;
+    impl DisclosureHeader {
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_size(&self) -> crate::CGSize { self.ivars().fittingSize() }
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: crate::CGPoint) -> *mut NSView {
+            let hit: Option<Retained<NSView>> = unsafe { msg_send![super(self), hitTest: point] };
+            if hit.is_some() { (self as *const Self).cast_mut().cast() } else { std::ptr::null_mut() }
+        }
+    }
+);
+
 pub struct Disclosure {
     stack: VStack,
     button: crate::Button,
     body: Box<dyn NativeView>,
+    header: Rc<VStack>,
+    heading: Rc<HStack>,
+    arrow: crate::Button,
+    symbol: Option<crate::ImageView>,
+    toggle: Rc<RefCell<Box<dyn FnMut(bool) -> bool>>>,
 }
 impl Disclosure {
     pub fn new(ui: &Ui, title: &str, content: impl NativeView) -> Self {
@@ -366,23 +408,135 @@ impl Disclosure {
         let body = Box::new(content);
         body.set_hidden(true);
         let weak = Weak::new(body.ns_view());
-        let button = crate::Button::new(ui, title).disclosure().on_click(move || {
+        let arrow = crate::Button::new(ui, "").disclosure();
+        arrow.ns_view().setAccessibilityElement(false);
+        let header =
+            Rc::new(VStack::new(ui).spacing(3.0).push(crate::SectionTitle::new(ui, title)));
+        let heading = Rc::new(HStack::new(ui).push(arrow.ns_view().retain()).push(header.clone()));
+        heading.ns_view().setAccessibilityElement(false);
+        let native: Retained<DisclosureHeader> = unsafe {
+            msg_send![
+                super(
+                    DisclosureHeader::alloc(ui.mtm()).set_ivars(heading.ns_stack_view().retain())
+                ),
+                init
+            ]
+        };
+        prepare(&native);
+        native.setButtonType(NSButtonType::PushOnPushOff);
+        native.setBordered(false);
+        native.setTitle(&objc2_foundation::NSString::from_str(""));
+        native.addSubview(heading.ns_view());
+        crate::view::pin(&native, heading.ns_view(), crate::uniform_insets(0.0));
+        let button = crate::Button::from_native(ui, native.into_super());
+        let weak_button = Weak::new(button.ns_button());
+        let weak_arrow = Weak::new(arrow.ns_button());
+        let toggle: Rc<RefCell<Box<dyn FnMut(bool) -> bool>>> =
+            Rc::new(RefCell::new(Box::new(|_| true)));
+        let callback = toggle.clone();
+        let button = button.on_click(move || {
             if let Some(view) = weak.load() {
-                view.setHidden(!view.isHidden());
+                let expanded = view.isHidden();
+                let root = view.window().and_then(|window| window.contentView());
+                if let Some(root) = &root {
+                    root.layoutSubtreeIfNeeded();
+                }
+                NSAnimationContext::beginGrouping();
+                let context = NSAnimationContext::currentContext();
+                let animate = view.window().is_some_and(|window| window.isVisible())
+                    && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+                context.setDuration(if animate { 0.18 } else { 0.0 });
+                context.setAllowsImplicitAnimation(animate);
+                if callback.borrow_mut()(expanded) {
+                    view.setHidden(!expanded);
+                    if let Some(arrow) = weak_arrow.load() {
+                        arrow.setState(if expanded { 1 } else { 0 });
+                    }
+                } else if let Some(button) = weak_button.load() {
+                    button.setState(if expanded { 0 } else { 1 });
+                }
+                if let Some(root) = &root {
+                    root.layoutSubtreeIfNeeded();
+                }
+                NSAnimationContext::endGrouping();
             }
         });
         button.set_title("");
         button.accessibility_label(title);
-        let heading = HStack::new(ui).push(crate::Label::new(ui, title));
-        heading.ns_stack_view().insertArrangedSubview_atIndex(button.ns_view(), 0);
         let stack = VStack::new(ui);
-        stack.add(heading);
-        stack.ns_stack_view().addArrangedSubview(body.ns_view());
-        Self { stack, button, body }
+        // One backing subtree lets AppKit interpolate the header, body, and group geometry
+        // in the same Auto Layout transaction, without separate fades or rendering timers.
+        stack.ns_view().setWantsLayer(true);
+        stack.add(button.ns_view().retain());
+        stack.add(body.ns_view().retain());
+        Self {
+            stack,
+            button,
+            body,
+            header,
+            heading,
+            arrow,
+            symbol: None,
+            toggle,
+        }
+    }
+
+    /// Prepare lazy content before expansion, or decline collapsing an invalid editor.
+    pub fn on_toggle(self, callback: impl FnMut(bool) -> bool + 'static) -> Self {
+        *self.toggle.borrow_mut() = Box::new(callback);
+        self
+    }
+
+    /// Keep the header’s padding inside its native button hit target.
+    pub fn header_insets(self, insets: Insets) -> Self {
+        self.heading.ns_stack_view().setEdgeInsets(insets);
+        self.button.ns_view().invalidateIntrinsicContentSize();
+        self
+    }
+
+    pub fn description(self, ui: &Ui, text: &str) -> Self {
+        self.header.add(crate::Caption::new(ui, text));
+        self
+    }
+
+    /// Show the disclosure indicator at the trailing edge, so the title shares the
+    /// leading edge of neighbouring settings rows.
+    pub fn trailing_indicator(self, ui: &Ui) -> Self {
+        let stack = self.heading.ns_stack_view();
+        stack.removeArrangedSubview(self.arrow.ns_view());
+        stack.addArrangedSubview(crate::Spacer::new(ui).ns_view());
+        stack.addArrangedSubview(self.arrow.ns_view());
+        self
+    }
+
+    /// A row-weight title for disclosures listed among ordinary settings rows.
+    pub fn compact(self) -> Self {
+        if let Some(title) = self.header.ns_stack_view().arrangedSubviews().firstObject()
+            && let Some(title) = title.downcast_ref::<objc2_app_kit::NSTextField>()
+        {
+            title.setFont(Some(&crate::Font::body()));
+        }
+        self
+    }
+
+    pub fn symbol(mut self, ui: &Ui, name: &str) -> Self {
+        if let Some(image) = crate::ImageView::symbol(ui, name) {
+            image.width(22.0);
+            image.height(22.0);
+            image.ns_image_view().setContentTintColor(Some(&NSColor::labelColor()));
+            self.heading.ns_stack_view().insertArrangedSubview_atIndex(image.ns_view(), 1);
+            self.symbol = Some(image);
+        }
+        self
     }
 
     pub fn set_expanded(&self, value: bool) {
         self.body.set_hidden(!value);
+        self.arrow.ns_button().setState(if value {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
         self.button.ns_button().setState(if value {
             NSControlStateValueOn
         } else {
@@ -394,4 +548,54 @@ impl Disclosure {
 }
 impl NativeView for Disclosure {
     fn ns_view(&self) -> &NSView { self.stack.ns_view() }
+}
+
+define_class!(
+    #[unsafe(super(NSStackView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsResponsiveStack"]
+    #[ivars = f64]
+    struct ResponsiveStackView;
+    impl ResponsiveStackView {
+        #[unsafe(method(layout))]
+        fn layout_stack(&self) {
+            let orientation = if self.bounds().size.width >= *self.ivars() { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
+            if self.orientation() != orientation {
+                self.setOrientation(orientation);
+                self.setAlignment(if orientation == NSUserInterfaceLayoutOrientation::Horizontal { NSLayoutAttribute::Top } else { NSLayoutAttribute::Leading });
+                self.invalidateIntrinsicContentSize();
+            }
+            unsafe { let _: () = msg_send![super(self), layout]; }
+        }
+    }
+);
+/// Places content side by side when it fits, and vertically at smaller widths.
+pub struct ResponsiveStack {
+    native: Retained<ResponsiveStackView>,
+    children: Vec<Box<dyn NativeView>>,
+}
+impl ResponsiveStack {
+    pub fn new(ui: &Ui, wide_min_width: f64) -> Self {
+        let native: Retained<ResponsiveStackView> = unsafe {
+            msg_send![
+                super(ResponsiveStackView::alloc(ui.mtm()).set_ivars(wide_min_width)),
+                init
+            ]
+        };
+        prepare(&native);
+        native.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        native.setAlignment(NSLayoutAttribute::Leading);
+        native.setSpacing(16.0);
+        Self { native, children: Vec::new() }
+    }
+
+    pub fn push(mut self, content: impl NativeView) -> Self {
+        prepare(content.ns_view());
+        self.native.addArrangedSubview(content.ns_view());
+        self.children.push(Box::new(content));
+        self
+    }
+}
+impl NativeView for ResponsiveStack {
+    fn ns_view(&self) -> &NSView { &self.native }
 }

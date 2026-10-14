@@ -442,9 +442,22 @@ impl PageHost {
         }
         let root = self.view.ns_view();
         root.layoutSubtreeIfNeeded();
-        let section = find(root, section, true).and_then(|heading| unsafe { heading.superview() });
-        let root = section.as_deref().unwrap_or(root);
-        let Some(view) = find(root, title, false).or_else(|| find(root, title, true)) else {
+        // A disclosure or composite header may wrap its title separately from
+        // its controls. Walk out to the nearest containing section before falling
+        // back to the whole visible page.
+        let mut scope =
+            find(root, section, true).and_then(|heading| unsafe { heading.superview() });
+        let mut target = None;
+        while let Some(parent) = scope {
+            target = find(&parent, title, false).or_else(|| find(&parent, title, true));
+            if target.is_some() || std::ptr::eq(&*parent, root) {
+                break;
+            }
+            scope = unsafe { parent.superview() };
+        }
+        let Some(view) =
+            target.or_else(|| find(root, title, false)).or_else(|| find(root, title, true))
+        else {
             return;
         };
         view.scrollRectToVisible(view.bounds());

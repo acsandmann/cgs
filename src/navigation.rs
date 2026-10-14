@@ -194,7 +194,6 @@ impl NavigationSplitView {
         let split = SplitView::new(ui).pane(ui, sidebar, true).pane(ui, detail, false);
         let items = split.native.splitViewItems();
         items.objectAtIndex(0).setMinimumThickness(Metrics::SIDEBAR_MIN_WIDTH);
-        items.objectAtIndex(1).setMinimumThickness(Metrics::DETAIL_MIN_WIDTH);
         Self(split)
     }
 
@@ -781,6 +780,43 @@ impl Toolbar {
                 self.native
                     .insertItemWithItemIdentifier_atIndex(&id, self.native.items().len() as isize);
             }
+        }
+    }
+
+    /// A contextual trailing action, independent of navigation, search, and page filters.
+    /// The caller keeps the control and its callback owner alive while it is attached.
+    pub fn set_trailing_control(&self, ui: &Ui, control: Option<&dyn NativeView>) {
+        let Some(delegate) = &self.delegate else { return };
+        let id = NSString::from_str("cgs.page-trailing");
+        if let Some(index) = self.native.items().iter().position(|item| item.itemIdentifier() == id)
+        {
+            let item = self.native.items().objectAtIndex(index);
+            if control.is_some_and(|control| {
+                item.view().is_some_and(|view| std::ptr::eq(&*view, control.ns_view()))
+            }) {
+                return;
+            }
+            item.setView(None);
+            self.native.removeItemAtIndex(index as isize);
+        }
+        delegate
+            .ivars()
+            .navigation
+            .borrow_mut()
+            .retain(|item| item.itemIdentifier() != id);
+        if let Some(control) = control {
+            let item = NSToolbarItem::initWithItemIdentifier(NSToolbarItem::alloc(ui.mtm()), &id);
+            item.setLabel(
+                &control
+                    .ns_view()
+                    .accessibilityLabel()
+                    .unwrap_or_else(|| NSString::from_str("Help")),
+            );
+            item.setView(Some(control.ns_view()));
+            item.setBordered(false);
+            delegate.ivars().navigation.borrow_mut().push(item);
+            self.native
+                .insertItemWithItemIdentifier_atIndex(&id, self.native.items().len() as isize);
         }
     }
 

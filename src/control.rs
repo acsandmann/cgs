@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AllocAnyThread, MainThreadOnly, Message};
+use objc2::{AllocAnyThread, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{
     NSArray, NSNumber, NSNumberFormatter, NSNumberFormatterStyle, NSObjectProtocol, NSString,
@@ -44,6 +44,10 @@ impl Button {
         let native = NSButton::new(ui.mtm());
         native.setTitle(&NSString::from_str(title));
         native.setBezelStyle(action_button_bezel());
+        Self::from_native(ui, native)
+    }
+
+    pub(crate) fn from_native(ui: &Ui, native: Retained<NSButton>) -> Self {
         let target = ActionTarget::new(ui);
         target.attach(&native);
         Self {
@@ -76,7 +80,6 @@ impl Button {
             .topAnchor()
             .constraintEqualToAnchor_constant(&self.native.topAnchor(), 5.0)
             .setActive(true);
-        self.width(140.0);
         self.height(size.height + 30.0);
         self.illustration = Some(preview);
         self
@@ -583,6 +586,23 @@ macro_rules! numeric_control {
         native_control!($name, $native, $accessor);
     };
 }
+define_class!(
+    #[unsafe(super(NSSlider))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsSlider"]
+    struct NaturalSlider;
+    impl NaturalSlider {
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_size(&self) -> crate::CGSize {
+            let mut size: crate::CGSize = unsafe { msg_send![super(self), intrinsicContentSize] };
+            // AppKit sliders otherwise have no intrinsic width. This is a
+            // compressible preference, not a constraint on the containing window.
+            size.width = size.width.max(NSFont::systemFontSize() * 6.0);
+            size
+        }
+    }
+);
+
 /// An accent-colored native slider, with optional snapping and tactile detents.
 /// Native tracking preserves keyboard, accessibility, and appearance support.
 pub struct Slider {
@@ -592,7 +612,9 @@ pub struct Slider {
 }
 impl Slider {
     pub fn new(ui: &Ui) -> Self {
-        let native = NSSlider::new(ui.mtm());
+        let native: Retained<NaturalSlider> =
+            unsafe { msg_send![NaturalSlider::alloc(ui.mtm()), init] };
+        let native = native.into_super();
         native.setTrackFillColor(Some(&NSColor::controlAccentColor()));
         let target = ActionTarget::new(ui);
         target.attach(&native);
@@ -682,7 +704,7 @@ impl Slider {
 }
 native_control!(Slider, NSSlider, ns_slider);
 
-/// A spacious native slider paired with a compact field for exact values.
+/// A native slider paired with a field for exact values.
 /// The caller binds both controls to its model; the field can accept values
 /// outside the slider's convenient range without losing precision.
 pub struct NumberSlider {
@@ -690,8 +712,6 @@ pub struct NumberSlider {
 }
 impl NumberSlider {
     pub fn new(ui: &Ui, slider: std::rc::Rc<Slider>, field: std::rc::Rc<NumberField>) -> Self {
-        slider.width(160.0);
-        field.width(68.0);
         Self {
             stack: HStack::new(ui).spacing(12.0).push(slider).push(field),
         }

@@ -112,6 +112,16 @@ impl SettingsRow {
         self
     }
 
+    /// Explain the setting in a native help tag on its label and control.
+    pub fn tooltip(self, text: &str) -> Self {
+        if !text.trim().is_empty() {
+            let text = objc2_foundation::NSString::from_str(text);
+            self.label.ns_view().setToolTip(Some(&text));
+            self.control.ns_view().setToolTip(Some(&text));
+        }
+        self
+    }
+
     pub fn description(mut self, text: &str) -> Self {
         self.label = Rc::new(
             VStack::new(&self.ui)
@@ -285,12 +295,6 @@ impl SettingsGroup {
                 .setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
             self.dividers.push(divider);
         }
-        if row.control_view().downcast_ref::<objc2_app_kit::NSPopUpButton>().is_some() {
-            row.control_view()
-                .widthAnchor()
-                .constraintEqualToConstant(if self.surface.is_none() { 200.0 } else { 220.0 })
-                .setActive(true);
-        }
         grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
         grid.columnAtIndex(0).setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
         grid.columnAtIndex(1).setXPlacement(if self.surface.is_none() {
@@ -298,9 +302,6 @@ impl SettingsGroup {
         } else {
             objc2_app_kit::NSGridCellPlacement::Trailing
         });
-        if self.surface.is_none() {
-            grid.columnAtIndex(1).setWidth(220.0);
-        }
         self.rows.push(row);
         self
     }
@@ -316,6 +317,7 @@ pub struct Section {
     stack: VStack,
     group: Option<SettingsGroup>,
     plain: bool,
+    trailing_controls: bool,
 }
 impl Section {
     pub fn new(ui: &Ui, title: &str) -> Self {
@@ -328,6 +330,7 @@ impl Section {
             stack,
             group: None,
             plain: false,
+            trailing_controls: true,
         }
     }
 
@@ -335,8 +338,22 @@ impl Section {
     pub fn form(ui: &Ui, title: &str) -> Self {
         Self {
             plain: true,
+            trailing_controls: false,
             ..Self::new(ui, title)
         }
+    }
+
+    /// Align natural-width controls at the trailing edge of a plain preferences form.
+    pub fn trailing_controls(mut self) -> Self {
+        self.trailing_controls = true;
+        if let Some(group) = &self.group {
+            group
+                .grid
+                .ns_grid_view()
+                .columnAtIndex(1)
+                .setXPlacement(objc2_app_kit::NSGridCellPlacement::Trailing);
+        }
+        self
     }
 
     pub fn subsection(ui: &Ui, title: &str) -> Self {
@@ -363,7 +380,15 @@ impl Section {
                 .setActive(true);
             group
         });
-        self.group = Some(group.row(row));
+        let group = group.row(row);
+        if self.trailing_controls {
+            group
+                .grid
+                .ns_grid_view()
+                .columnAtIndex(1)
+                .setXPlacement(objc2_app_kit::NSGridCellPlacement::Trailing);
+        }
+        self.group = Some(group);
         self
     }
 
@@ -422,7 +447,8 @@ impl SettingsPage {
             .constraintLessThanOrEqualToAnchor(&parent.widthAnchor())
             .setActive(true);
         let width = child.widthAnchor().constraintLessThanOrEqualToConstant(640.0);
-        width.setActive(true);
+        // Settings content follows the window unless an application opts into a cap.
+        width.setActive(false);
         let fill = child.widthAnchor().constraintEqualToAnchor(&parent.widthAnchor());
         fill.setPriority(750.0);
         fill.setActive(true);
@@ -482,6 +508,7 @@ impl SettingsPage {
     /// Collections and visual editors need more room than short preference forms.
     pub fn content_width(self, width: f64) -> Self {
         self.width.setConstant(width);
+        self.width.setActive(true);
         self
     }
 
@@ -519,7 +546,6 @@ impl SettingsPage {
         view.centerXAnchor()
             .constraintEqualToAnchor(&self.root.ns_view().centerXAnchor())
             .setActive(true);
-        view.widthAnchor().constraintLessThanOrEqualToConstant(580.0).setActive(true);
         view.widthAnchor()
             .constraintLessThanOrEqualToAnchor(&self.root.ns_view().widthAnchor())
             .setActive(true);

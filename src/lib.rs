@@ -1,5 +1,6 @@
 mod app;
 mod bridge;
+mod chips;
 mod collection;
 pub mod compositor;
 mod control;
@@ -16,6 +17,7 @@ mod text;
 mod view;
 mod window;
 pub use app::*;
+pub use chips::*;
 pub use collection::*;
 pub use compositor::*;
 pub use control::*;
