@@ -680,7 +680,7 @@ impl PathField {
         let ui_copy = *ui;
         let directories = Rc::new(Cell::new(false));
         let directory_mode = directories.clone();
-        let choose = crate::Button::new(ui, "Choose…").on_click(move || {
+        let choose = crate::Button::new(ui, "Choose…").push().on_click(move || {
             let panel = OpenPanel::new(&ui_copy);
             let panel = if directory_mode.get() {
                 panel.directories()

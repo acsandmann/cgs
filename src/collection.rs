@@ -817,6 +817,7 @@ impl SettingsListCell {
         inline: bool,
         has_icon: bool,
         navigation: bool,
+        external: bool,
         opens: bool,
     ) -> Retained<Self> {
         let title = Rc::new(Label::new(ui, ""));
@@ -831,7 +832,7 @@ impl SettingsListCell {
         });
         let chevron = navigation.then(|| {
             let image = NSImageView::new(ui.mtm());
-            image.setImage(crate::Symbol::named("chevron.forward").as_deref());
+            image.setImage(crate::Symbol::named(if external { "arrow.up.right" } else { "chevron.forward" }).as_deref());
             image.widthAnchor().constraintEqualToConstant(12.0).setActive(true);
             image.setContentTintColor(Some(&crate::Color::secondary_label()));
             image.setAccessibilityElement(false);
@@ -972,6 +973,7 @@ pub struct SettingsList<T: 'static> {
     empty: crate::SecondaryLabel,
     trailing_summary: Rc<Cell<bool>>,
     navigation: Rc<Cell<bool>>,
+    external: Rc<Cell<bool>>,
 }
 impl<T: 'static> SettingsList<T> {
     pub fn new(
@@ -994,6 +996,8 @@ impl<T: 'static> SettingsList<T> {
         let inline = trailing_summary.clone();
         let navigation = Rc::new(Cell::new(false));
         let row_navigation = navigation.clone();
+        let external = Rc::new(Cell::new(false));
+        let row_external = external.clone();
         let table = Table::new(ui).column("item", "", 0.0).on_double_click(move |index| {
             if let Some(open) = double_open.borrow_mut().as_mut() {
                 open(index);
@@ -1012,6 +1016,7 @@ impl<T: 'static> SettingsList<T> {
                         inline.get(),
                         row_symbol.borrow().is_some() || row_image.borrow().is_some(),
                         row_navigation.get(),
+                        row_external.get(),
                         // Opening a sheet can synchronously ask AppKit to rebuild this cell
                         // while the open callback holds its mutable borrow.
                         opens.try_borrow().map_or(true, |open| open.is_some()),
@@ -1082,6 +1087,7 @@ impl<T: 'static> SettingsList<T> {
             empty,
             trailing_summary,
             navigation,
+            external,
         }
     }
 
@@ -1146,6 +1152,12 @@ impl<T: 'static> SettingsList<T> {
             table.setAction(Some(objc2::sel!(invoke:)));
         }
         self
+    }
+
+    /// Native single-click resource rows with an external-link indicator.
+    pub fn external_links(self) -> Self {
+        self.external.set(true);
+        self.navigation().trailing_summary()
     }
 
     /// Display a short value beside the title, as in a native keyboard shortcuts list.

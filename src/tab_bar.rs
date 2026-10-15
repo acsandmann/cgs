@@ -616,17 +616,23 @@ fn emit(action: &Action, event: TabBarAction) {
         }
     }
 }
-/// One panel and one glass surface; updates preserve the native window and unchanged controls.
+/// One native tab strip, optionally hosted in a panel. Updates preserve unchanged controls.
 pub struct TabBar {
-    panel: Retained<TabPanel>,
+    panel: Option<Retained<TabPanel>>,
     content: Retained<TabContent>,
-    _surface: Box<dyn NativeView>,
+    surface: Box<dyn NativeView>,
 }
 impl TabBar {
     /// Default thickness; any thickness from about 20 points works.
     pub const HEIGHT: f64 = 28.0;
 
-    pub fn new(ui: &Ui) -> Self {
+    pub fn new(ui: &Ui) -> Self { Self::build(ui, false) }
+
+    /// The same native tab strip hosted inside an existing view hierarchy.
+    /// Allocates no panel or window; use NativeView and set_frame for layout.
+    pub fn embedded(ui: &Ui) -> Self { Self::build(ui, true) }
+
+    fn build(ui: &Ui, embedded: bool) -> Self {
         let action: Action = Rc::new(ActionState {
             callback: RefCell::new(None),
             alive: Cell::new(true),
@@ -743,31 +749,30 @@ impl TabBar {
             }
             Box::new(fallback)
         };
-        let panel: Retained<TabPanel> = unsafe {
-            msg_send![super(TabPanel::alloc(ui.mtm()).set_ivars(())), initWithContentRect: rect(0.0,0.0,400.0,28.0), styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel, backing: NSBackingStoreType::Buffered, defer: false]
-        };
-        unsafe {
-            panel.setReleasedWhenClosed(false);
-        }
-        panel.setAcceptsMouseMovedEvents(true);
-        panel.setFloatingPanel(false);
-        panel.setHasShadow(false);
-        panel.setOpaque(false);
-        panel.setBackgroundColor(Some(&NSColor::clearColor()));
-        panel.setLevel(NSNormalWindowLevel);
-        panel.setHidesOnDeactivate(false);
-        panel.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        panel.setContentView(Some(surface.ns_view()));
+        let panel = (!embedded).then(|| {
+            let panel: Retained<TabPanel> = unsafe {
+                msg_send![super(TabPanel::alloc(ui.mtm()).set_ivars(())), initWithContentRect: rect(0.0,0.0,400.0,28.0), styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel, backing: NSBackingStoreType::Buffered, defer: false]
+            };
+            unsafe {
+                panel.setReleasedWhenClosed(false);
+            }
+            panel.setAcceptsMouseMovedEvents(true);
+            panel.setFloatingPanel(false);
+            panel.setHasShadow(false);
+            panel.setOpaque(false);
+            panel.setBackgroundColor(Some(&NSColor::clearColor()));
+            panel.setLevel(NSNormalWindowLevel);
+            panel.setHidesOnDeactivate(false);
+            panel.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            panel.setContentView(Some(surface.ns_view()));
+            panel
+        });
         content.update_material();
-        Self {
-            panel,
-            content,
-            _surface: surface,
-        }
+        Self { panel, content, surface }
     }
 
     pub fn on_action(self, f: impl FnMut(TabBarAction) + 'static) -> Self {
@@ -988,50 +993,79 @@ impl TabBar {
     }
 
     pub fn set_frame(&self, frame: CGRect) {
-        let previous = self.panel.frame();
-        if previous != frame {
-            let resized = previous.size != frame.size;
-            if resized {
-                self.content.stop_motion();
-                self.set_corner_radius(frame.size.width.min(frame.size.height) / 2.0);
-            }
-            self.panel.setFrame_display(frame, true);
-            if resized {
-                self.content.arrange(true, true, false);
-            }
+        let previous = self
+            .panel
+            .as_ref()
+            .map_or_else(|| self.surface.ns_view().frame(), |panel| panel.frame());
+        if previous == frame {
+            return;
+        }
+        let resized = previous.size != frame.size;
+        if resized {
+            self.content.stop_motion();
+            self.set_corner_radius(frame.size.width.min(frame.size.height) / 2.0);
+        }
+        if let Some(panel) = &self.panel {
+            panel.setFrame_display(frame, true);
+        } else {
+            self.surface.ns_view().setFrame(frame);
+            self.surface.ns_view().layoutSubtreeIfNeeded();
+        }
+        if resized {
+            self.content.arrange(true, true, false);
         }
     }
 
     fn set_corner_radius(&self, radius: f64) {
-        if let Some(view) = self.panel.contentView() {
-            if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
-                && let Ok(glass) = view.clone().downcast::<NSGlassEffectView>()
-            {
-                glass.setCornerRadius(radius);
-            } else if let Some(layer) = view.layer() {
-                layer.setCornerRadius(radius);
-            }
+        let view = self.surface.ns_view();
+        if objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
+            && let Some(glass) = view.downcast_ref::<NSGlassEffectView>()
+        {
+            glass.setCornerRadius(radius);
+        } else if let Some(layer) = view.layer() {
+            layer.setCornerRadius(radius);
         }
     }
 
     /// Reassert relative order: the anchor may have been raised since the previous call.
     pub fn show_above(&self, number: isize) {
-        if number > 0 {
-            self.panel.orderWindow_relativeTo(NSWindowOrderingMode::Above, number);
+        if number > 0
+            && let Some(panel) = &self.panel
+        {
+            panel.orderWindow_relativeTo(NSWindowOrderingMode::Above, number);
         }
     }
 
     pub fn hide(&self) {
         self.content.stop_motion();
-        if self.is_visible() {
-            self.panel.orderOut(None);
+        if let Some(panel) = &self.panel {
+            if panel.isVisible() {
+                panel.orderOut(None);
+            }
+        } else {
+            self.surface.set_hidden(true);
         }
     }
 
-    pub fn is_visible(&self) -> bool { self.panel.isVisible() }
+    pub fn is_visible(&self) -> bool {
+        self.panel.as_ref().map_or_else(
+            || {
+                !self.surface.ns_view().isHiddenOrHasHiddenAncestor()
+                    && self.surface.ns_view().window().is_some_and(|window| window.isVisible())
+            },
+            |panel| panel.isVisible(),
+        )
+    }
 
-    pub fn ns_panel(&self) -> &NSPanel { &self.panel }
+    /// The owner of a windowed strip. Embedded strips have no panel.
+    pub fn ns_panel(&self) -> &NSPanel {
+        self.panel.as_deref().expect("embedded tab strips have no panel")
+    }
 }
+impl NativeView for TabBar {
+    fn ns_view(&self) -> &NSView { self.surface.ns_view() }
+}
+
 impl Drop for TabBar {
     fn drop(&mut self) {
         self.hide();
@@ -1045,7 +1079,9 @@ impl Drop for TabBar {
         if let Ok(mut callback) = action.callback.try_borrow_mut() {
             callback.take();
         }
-        self.panel.setContentView(None);
-        self.panel.close();
+        if let Some(panel) = &self.panel {
+            panel.setContentView(None);
+            panel.close();
+        }
     }
 }

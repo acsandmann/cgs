@@ -7,7 +7,7 @@ use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAccessibility, NSAnimationContext, NSAppearanceCustomization, NSColor, NSView, NSWorkspace,
 };
-use objc2_quartz_core::{CALayer, CATransaction};
+use objc2_quartz_core::{CAAutoresizingMask, CALayer, CATransaction};
 
 use crate::{CGPoint, CGRect, CGSize, LayerHost, NativeView, Ui};
 
@@ -36,6 +36,7 @@ impl NativeView for PreviewView {
 #[derive(Default)]
 struct PreviewState {
     selected: Cell<bool>,
+    illustration: bool,
     /// An accent ring just outside the canvas, shown while selected.
     ring: Option<Retained<CALayer>>,
 }
@@ -80,11 +81,18 @@ impl PreviewView {
             let stroke = mix(&background, if dark { 0.25 } else { 0.18 }, &label);
             CATransaction::begin();
             CATransaction::setDisableActions(true);
-            layer.setBackgroundColor(Some(&background.CGColor()));
+            layer.setBackgroundColor(Some(
+                &if self.ivars().illustration {
+                    NSColor::clearColor()
+                } else {
+                    background.clone()
+                }
+                .CGColor(),
+            ));
             // Freestanding previews show the screen’s edge, even where windows reach it;
             // choices in a gallery sit on their tile instead.
             layer.setBorderColor(Some(&stroke.CGColor()));
-            layer.setBorderWidth(if self.ivars().ring.is_none() {
+            layer.setBorderWidth(if self.ivars().ring.is_none() && !self.ivars().illustration {
                 1.0
             } else {
                 0.0
@@ -95,8 +103,56 @@ impl PreviewView {
             }
             for view in self.subviews() {
                 if let Some(layer) = view.layer() {
-                    layer.setBackgroundColor(Some(&tile.CGColor()));
-                    layer.setBorderColor(Some(&stroke.CGColor()));
+                    let paper = if self.ivars().illustration {
+                        if dark {
+                            mix(&NSColor::windowBackgroundColor(), 0.10, &label)
+                        } else {
+                            NSColor::controlBackgroundColor()
+                        }
+                    } else {
+                        tile.clone()
+                    };
+                    layer.setBackgroundColor(Some(&paper.CGColor()));
+                    layer.setBorderColor(Some(
+                        &if self.ivars().illustration {
+                            label.colorWithAlphaComponent(
+                                if NSWorkspace::sharedWorkspace()
+                                    .accessibilityDisplayShouldIncreaseContrast()
+                                {
+                                    0.5
+                                } else {
+                                    0.16
+                                },
+                            )
+                        } else {
+                            stroke.clone()
+                        }
+                        .CGColor(),
+                    ));
+                    if self.ivars().illustration {
+                        // Chrome layers resize with their window during native frame animation.
+                        // Illustration window layers contain only the five CALayers below.
+                        if let Some(parts) = unsafe { layer.sublayers() } {
+                            parts.objectAtIndex(0).setBackgroundColor(Some(
+                                &mix(&paper, if dark { 0.06 } else { 0.035 }, &label).CGColor(),
+                            ));
+                            parts.objectAtIndex(1).setBackgroundColor(Some(
+                                &label.colorWithAlphaComponent(0.08).CGColor(),
+                            ));
+                            for (i, color) in [
+                                NSColor::systemRedColor(),
+                                NSColor::systemYellowColor(),
+                                NSColor::systemGreenColor(),
+                            ]
+                            .iter()
+                            .enumerate()
+                            {
+                                parts.objectAtIndex(i + 2).setBackgroundColor(Some(
+                                    &color.colorWithAlphaComponent(0.8).CGColor(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             CATransaction::commit();
@@ -178,14 +234,19 @@ impl LayoutPreview {
         }
     }
 
-    pub fn new(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, false) }
+    pub fn new(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, false, false) }
+
+    /// Freestanding miniature windows with native chrome on a transparent canvas.
+    /// Shares stable window identity, native animation, appearance and Reduce Motion
+    /// behavior with ordinary desktop previews; no work runs while it is idle.
+    pub fn illustration(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, false, true) }
 
     /// A preview for a choice among several, which rings itself with the accent color
     /// while selected, like thumbnails in System Settings. The ring sits outside the
     /// canvas, so leave `RING_OUTSET` points around it.
-    pub fn selectable(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, true) }
+    pub fn selectable(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, true, false) }
 
-    fn with_state(ui: &Ui, size: CGSize, selectable: bool) -> Self {
+    fn with_state(ui: &Ui, size: CGSize, selectable: bool, illustration: bool) -> Self {
         assert!(
             size.width.is_finite()
                 && size.width > 0.0
@@ -198,7 +259,7 @@ impl LayoutPreview {
         root.setBorderWidth(1.0);
         // A ring outside the bounds can't be clipped; selectable choices keep their
         // sample windows inside the canvas instead.
-        root.setMasksToBounds(!selectable);
+        root.setMasksToBounds(!selectable && !illustration);
         let ring = selectable.then(|| {
             let ring = CALayer::layer();
             let outset = Self::RING_OUTSET;
@@ -214,6 +275,7 @@ impl LayoutPreview {
         });
         let state = PreviewState {
             selected: Cell::new(false),
+            illustration,
             ring,
         };
         let host: Retained<PreviewView> =
@@ -280,11 +342,61 @@ impl LayoutPreview {
             let existing = index.is_some();
             let index = index.unwrap_or_else(|| {
                 let layer = CALayer::layer();
-                layer.setCornerRadius(3.0);
-                layer.setBorderWidth(1.0);
-                layer.setMasksToBounds(true);
+                layer.setCornerRadius(if self.host.ivars().illustration {
+                    7.0
+                } else {
+                    3.0
+                });
+                layer.setBorderWidth(if self.host.ivars().illustration {
+                    0.75
+                } else {
+                    1.0
+                });
+                layer.setMasksToBounds(!self.host.ivars().illustration);
                 let view = LayerHost::new(&self.ui, &layer);
                 view.ns_view().setTranslatesAutoresizingMaskIntoConstraints(true);
+                view.ns_view().setFrame(frame);
+                if self.host.ivars().illustration {
+                    layer.setBounds(CGRect::new(CGPoint::ZERO, frame.size));
+                    layer.setShadowColor(Some(&NSColor::blackColor().CGColor()));
+                    layer.setShadowOpacity(0.12);
+                    layer.setShadowRadius(7.0);
+                    layer.setShadowOffset(CGSize::new(0.0, -3.0));
+                    let part = |rect: CGRect, radius, mask| {
+                        let part = CALayer::layer();
+                        part.setFrame(rect);
+                        part.setCornerRadius(radius);
+                        part.setAutoresizingMask(mask);
+                        layer.addSublayer(&part);
+                    };
+                    part(
+                        CGRect::new(
+                            CGPoint::new(6.0, 6.0),
+                            CGSize::new(frame.size.width - 12.0, frame.size.height - 27.0),
+                        ),
+                        3.0,
+                        CAAutoresizingMask::LayerWidthSizable
+                            | CAAutoresizingMask::LayerHeightSizable,
+                    );
+                    part(
+                        CGRect::new(
+                            CGPoint::new(0.0, frame.size.height - 20.0),
+                            CGSize::new(frame.size.width, 0.5),
+                        ),
+                        0.0,
+                        CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerMinYMargin,
+                    );
+                    for i in 0..3 {
+                        part(
+                            CGRect::new(
+                                CGPoint::new(8.0 + i as f64 * 7.0, frame.size.height - 12.0),
+                                CGSize::new(4.0, 4.0),
+                            ),
+                            2.0,
+                            CAAutoresizingMask::LayerMinYMargin,
+                        );
+                    }
+                }
                 self.host.addSubview(view.ns_view());
                 windows.push(WindowView {
                     id: window.id,
