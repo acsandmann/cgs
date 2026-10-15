@@ -100,6 +100,12 @@ impl Button {
 
     pub fn set_title(&self, title: &str) { self.native.setTitle(&NSString::from_str(title)); }
 
+    /// A standard push button for page content, which keeps glass off the content layer.
+    pub fn push(self) -> Self {
+        self.native.setBezelStyle(NSBezelStyle::Push);
+        self
+    }
+
     pub fn borderless(self) -> Self {
         self.native.setBordered(false);
         self
@@ -193,6 +199,12 @@ impl Switch {
 
     pub fn get_value(&self) -> bool { self.native.state() == NSControlStateValueOn }
 
+    /// The smaller switch System Settings uses in its grouped rows.
+    pub fn compact(self) -> Self {
+        self.native.setControlSize(NSControlSize::Mini);
+        self
+    }
+
     pub fn on_change(self, mut f: impl FnMut(bool) + 'static) -> Self {
         self.target.set(move |sender| {
             if let Some(control) = sender.downcast_ref::<NSSwitch>() {
@@ -260,13 +272,24 @@ pub struct Popup {
     native: Retained<NSPopUpButton>,
     target: Retained<ActionTarget>,
     menu: Option<crate::Menu>,
+    /// Menu index of each choice when separators divide them; empty when they don't.
+    positions: std::rc::Rc<std::cell::RefCell<Vec<isize>>>,
 }
 impl Popup {
     pub fn new(ui: &Ui) -> Self {
         let native = NSPopUpButton::new(ui.mtm());
         let target = ActionTarget::new(ui);
         target.attach(&native);
-        Self { native, target, menu: None }
+        Self {
+            native,
+            target,
+            menu: None,
+            positions: Default::default(),
+        }
+    }
+
+    fn position(&self, index: usize) -> isize {
+        self.positions.borrow().get(index).copied().unwrap_or(index as isize)
     }
 
     /// Native pull-down menu for secondary collection actions.
@@ -315,36 +338,70 @@ impl Popup {
     }
 
     pub fn set_items(&self, values: impl IntoIterator<Item = impl AsRef<str>>) {
-        let values: Vec<_> = values.into_iter().collect();
-        let titles = self.native.itemTitles();
-        if titles.len() == values.len()
-            && titles
-                .iter()
-                .zip(&values)
-                .all(|(title, value)| title.to_string() == value.as_ref())
+        self.set_sections([values]);
+    }
+
+    /// Choices in groups divided by native separators, such as a default above explicit
+    /// values. Indices passed to and reported by the popup count choices only.
+    pub fn sections(
+        self,
+        sections: impl IntoIterator<Item = impl IntoIterator<Item = impl AsRef<str>>>,
+    ) -> Self {
+        self.set_sections(sections);
+        self
+    }
+
+    pub fn set_sections(
+        &self,
+        sections: impl IntoIterator<Item = impl IntoIterator<Item = impl AsRef<str>>>,
+    ) {
+        let mut titles = Vec::new();
+        let mut positions = Vec::new();
+        for section in sections {
+            let start = titles.len();
+            for value in section {
+                if start > 0 && titles.len() == start {
+                    titles.push(None);
+                }
+                positions.push(titles.len() as isize);
+                titles.push(Some(value.as_ref().to_owned()));
+            }
+        }
+        let separated = titles.len() != positions.len();
+        let menu = self.native.menu().unwrap();
+        let current = menu.itemArray();
+        if current.len() == titles.len()
+            && current.iter().zip(&titles).all(|(item, title)| match title {
+                Some(title) => !item.isSeparatorItem() && item.title().to_string() == *title,
+                None => item.isSeparatorItem(),
+            })
         {
             return;
         }
         self.native.removeAllItems();
-        for value in values {
-            // addItemWithTitle merges duplicate titles, which breaks index-based choices.
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(self.native.mtm()),
-                    &NSString::from_str(value.as_ref()),
-                    None,
-                    &NSString::from_str(""),
-                )
+        for title in titles {
+            let item = match title {
+                // addItemWithTitle merges duplicate titles, which breaks index-based choices.
+                Some(title) => unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(self.native.mtm()),
+                        &NSString::from_str(&title),
+                        None,
+                        &NSString::from_str(""),
+                    )
+                },
+                None => NSMenuItem::separatorItem(self.native.mtm()),
             };
-            self.native.menu().unwrap().addItem(&item);
+            menu.addItem(&item);
         }
+        *self.positions.borrow_mut() = if separated { positions } else { Vec::new() };
     }
 
     /// Let AppKit render a native menu badge beside a choice.
     pub fn set_item_badge(&self, index: usize, label: Option<&str>) {
         use objc2::AnyThread;
         use objc2_foundation::NSObjectProtocol;
-        let Some(item) = self.native.itemAtIndex(index as isize) else {
+        let Some(item) = self.native.itemAtIndex(self.position(index)) else {
             return;
         };
         if !item.respondsToSelector(objc2::sel!(setBadge:)) {
@@ -369,24 +426,34 @@ impl Popup {
     }
 
     pub fn set_selected(&self, index: usize) {
-        if self.native.indexOfSelectedItem() != index as isize {
-            self.native.selectItemAtIndex(index as isize);
+        let position = self.position(index);
+        if self.native.indexOfSelectedItem() != position {
+            self.native.selectItemAtIndex(position);
         }
     }
 
     pub fn selected(&self) -> Option<usize> {
-        usize::try_from(self.native.indexOfSelectedItem()).ok()
+        choice(&self.positions.borrow(), self.native.indexOfSelectedItem())
     }
 
     pub fn on_change(self, mut f: impl FnMut(usize) + 'static) -> Self {
+        let positions = self.positions.clone();
         self.target.set(move |sender| {
-            if let Some(control) = sender.downcast_ref::<NSPopUpButton>() {
-                if let Ok(index) = usize::try_from(control.indexOfSelectedItem()) {
-                    f(index);
-                }
+            if let Some(control) = sender.downcast_ref::<NSPopUpButton>()
+                && let Some(index) = choice(&positions.borrow(), control.indexOfSelectedItem())
+            {
+                f(index);
             }
         });
         self
+    }
+}
+/// The choice at a menu index, skipping separators.
+fn choice(positions: &[isize], position: isize) -> Option<usize> {
+    if positions.is_empty() {
+        usize::try_from(position).ok()
+    } else {
+        positions.iter().position(|&p| p == position)
     }
 }
 native_control!(Popup, NSPopUpButton, ns_popup_button);
@@ -405,6 +472,30 @@ impl SegmentedControl {
         let target = ActionTarget::new(ui);
         target.attach(&native);
         Self { native, target }
+    }
+
+    /// Segments drawn as SF Symbols, each named by `label` for VoiceOver and help tags.
+    /// A symbol missing on this system falls back to its label.
+    pub fn symbols(ui: &Ui, segments: &[(&str, &str)]) -> Self {
+        let control = Self::new(ui, &[]);
+        let native = &control.native;
+        native.setSegmentCount(segments.len() as isize);
+        for (index, (symbol, label)) in segments.iter().enumerate() {
+            let segment = index as isize;
+            let label = NSString::from_str(label);
+            match NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str(symbol),
+                Some(&label),
+            ) {
+                Some(image) => {
+                    native.setImage_forSegment(Some(&image), segment);
+                    native.setWidth_forSegment(32.0, segment);
+                }
+                None => native.setLabel_forSegment(&label, segment),
+            }
+            native.setToolTip_forSegment(Some(&label), segment);
+        }
+        control
     }
 
     pub fn set_selected(&self, index: usize) {
@@ -722,6 +813,22 @@ impl NumberSlider {
     pub fn new(ui: &Ui, slider: std::rc::Rc<Slider>, field: std::rc::Rc<NumberField>) -> Self {
         Self {
             stack: HStack::new(ui).spacing(12.0).push(slider).push(field),
+        }
+    }
+
+    /// A standard-length slider and a compact field with its unit inside the bezel.
+    pub fn with_unit(
+        ui: &Ui,
+        slider: std::rc::Rc<Slider>,
+        field: std::rc::Rc<NumberField>,
+        unit: &str,
+    ) -> Self {
+        slider.width(crate::Metrics::SLIDER_WIDTH);
+        let value = field.unit_field(ui, unit);
+        value.width(crate::Metrics::VALUE_FIELD_WIDTH);
+        Self {
+            // The bezel hosts the field's view; keep its Rust owner with the row.
+            stack: HStack::new(ui).spacing(8.0).push(slider).push(value).keep(field),
         }
     }
 }

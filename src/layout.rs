@@ -583,7 +583,7 @@ define_class!(
     #[unsafe(super(NSStackView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsResponsiveStack"]
-    #[ivars = f64]
+    #[ivars = ResponsiveLayout]
     struct ResponsiveStackView;
     impl ResponsiveStackView {
         #[unsafe(method(layout))]
@@ -596,16 +596,24 @@ define_class!(
                 let origin = self.convertPoint_toView(crate::CGPoint::new(0.0, 0.0), None);
                 width = width.min(window.contentRectForFrameRect(window.frame()).size.width - origin.x);
             }
-            let orientation = if width >= *self.ivars() { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
+            let ivars = self.ivars();
+            let orientation = if width >= ivars.breakpoint { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
             if self.orientation() != orientation {
                 self.setOrientation(orientation);
-                self.setAlignment(if orientation == NSUserInterfaceLayoutOrientation::Horizontal { NSLayoutAttribute::Top } else { NSLayoutAttribute::Leading });
+                let side_by_side = if ivars.centered.get() { NSLayoutAttribute::CenterY } else { NSLayoutAttribute::Top };
+                self.setAlignment(if orientation == NSUserInterfaceLayoutOrientation::Horizontal { side_by_side } else { NSLayoutAttribute::Leading });
                 self.invalidateIntrinsicContentSize();
             }
             unsafe { let _: () = msg_send![super(self), layout]; }
         }
     }
 );
+struct ResponsiveLayout {
+    breakpoint: f64,
+    /// Center side-by-side content vertically, rather than aligning its tops.
+    centered: Cell<bool>,
+}
+
 /// Places content side by side when it fits, and vertically at smaller widths.
 pub struct ResponsiveStack {
     native: Retained<ResponsiveStackView>,
@@ -615,7 +623,10 @@ impl ResponsiveStack {
     pub fn new(ui: &Ui, wide_min_width: f64) -> Self {
         let native: Retained<ResponsiveStackView> = unsafe {
             msg_send![
-                super(ResponsiveStackView::alloc(ui.mtm()).set_ivars(wide_min_width)),
+                super(ResponsiveStackView::alloc(ui.mtm()).set_ivars(ResponsiveLayout {
+                    breakpoint: wide_min_width,
+                    centered: Cell::new(false),
+                })),
                 init
             ]
         };
@@ -624,6 +635,12 @@ impl ResponsiveStack {
         native.setAlignment(NSLayoutAttribute::Leading);
         native.setSpacing(16.0);
         Self { native, children: Vec::new() }
+    }
+
+    /// Center content vertically while it sits side by side.
+    pub fn centered(self) -> Self {
+        self.native.ivars().centered.set(true);
+        self
     }
 
     pub fn push(mut self, content: impl NativeView) -> Self {

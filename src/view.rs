@@ -445,8 +445,8 @@ impl PageHost {
         // A disclosure or composite header may wrap its title separately from
         // its controls. Walk out to the nearest containing section before falling
         // back to the whole visible page.
-        let mut scope =
-            find(root, section, true).and_then(|heading| unsafe { heading.superview() });
+        let heading = find(root, section, true);
+        let mut scope = heading.as_ref().and_then(|heading| unsafe { heading.superview() });
         let mut target = None;
         while let Some(parent) = scope {
             crate::layout::reveal_disclosures(&parent, title);
@@ -463,6 +463,10 @@ impl PageHost {
         let Some(view) =
             target.or_else(|| find(root, title, false)).or_else(|| find(root, title, true))
         else {
+            // A setting edited elsewhere, such as in a sheet: show the section that opens it.
+            if let Some(heading) = heading {
+                heading.scrollRectToVisible(heading.bounds());
+            }
             return;
         };
         view.scrollRectToVisible(view.bounds());
@@ -510,10 +514,16 @@ impl Metrics {
     pub const DETAIL_MIN_WIDTH: f64 = 400.0;
     pub const PAGE_INSET: f64 = 20.0;
     pub const PAGE_TOP_INSET: f64 = 20.0;
+    /// The shortest row in a grouped settings card, so rows read evenly whatever their control.
+    pub const ROW_MIN_HEIGHT: f64 = 22.0;
     pub const ROW_SPACING: f64 = 6.0;
     pub const SECTION_SPACING: f64 = 16.0;
     pub const SIDEBAR_MIN_WIDTH: f64 = 160.0;
     pub const SIDEBAR_WIDTH: f64 = 200.0;
+    /// A continuous slider beside a value field, as in System Settings.
+    pub const SLIDER_WIDTH: f64 = 160.0;
+    /// A short numeric field with its unit inside the bezel.
+    pub const VALUE_FIELD_WIDTH: f64 = 60.0;
 }
 
 struct ResponsiveContent {

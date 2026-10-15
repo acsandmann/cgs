@@ -33,7 +33,7 @@ define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsChipFlow"]
-    #[ivars = Cell<f64>]
+    #[ivars = FlowIvars]
     struct ChipFlow;
     impl ChipFlow {
         #[unsafe(method(isFlipped))]
@@ -47,7 +47,8 @@ define_class!(
             let widest = children.iter().map(|view| view.fittingSize().width).fold(0.0, f64::max);
             // A long list grows downward instead of inflating NSGridView's
             // minimum fitting width. Keep a single chip fully readable.
-            CGSize::new(width.min(220.0).max(widest), self.ivars().get())
+            let ivars = self.ivars();
+            CGSize::new(width.min(ivars.preferred_width.get()).max(widest), ivars.height.get())
         }
 
         #[unsafe(method(layout))]
@@ -67,18 +68,27 @@ define_class!(
                 row_height = row_height.max(size.height);
             }
             let height = y + row_height;
-            if self.ivars().replace(height) != height {
+            if self.ivars().height.replace(height) != height {
                 self.invalidateIntrinsicContentSize();
             }
         }
     }
 );
 
+struct FlowIvars {
+    height: Cell<f64>,
+    /// The widest the row asks to be before it wraps.
+    preferred_width: Cell<f64>,
+}
+
 impl ChipFlow {
     fn new(ui: &Ui) -> Retained<Self> {
         let row: Retained<Self> = unsafe {
             msg_send![
-                super(Self::alloc(ui.mtm()).set_ivars(Cell::new(24.0))),
+                super(Self::alloc(ui.mtm()).set_ivars(FlowIvars {
+                    height: Cell::new(24.0),
+                    preferred_width: Cell::new(220.0),
+                })),
                 init
             ]
         };
@@ -193,6 +203,7 @@ struct Inner {
     unit: String,
     range: (f64, f64),
     min_count: Cell<usize>,
+    compact: Cell<bool>,
     row: Retained<ChipFlow>,
     add: Rc<Button>,
     chips: RefCell<Vec<Rc<Chip>>>,
@@ -232,6 +243,7 @@ impl ValueChips {
                 unit: unit.into(),
                 range: (min, max),
                 min_count: Cell::new(1),
+                compact: Cell::new(false),
                 row: ChipFlow::new(ui),
                 add: Rc::new(add),
                 chips: RefCell::new(Vec::new()),
@@ -247,6 +259,20 @@ impl ValueChips {
     /// How a value appears on its chip, without the unit.
     pub fn format(self, format: impl Fn(f64) -> String + 'static) -> Self {
         *self.0.format.borrow_mut() = Box::new(format);
+        self.0.rendered.set(false);
+        self
+    }
+
+    /// Small chips that stay on one line while it fits, for a trailing settings control.
+    pub fn compact(self) -> Self {
+        self.0.compact.set(true);
+        self.0.row.ivars().preferred_width.set(f64::MAX);
+        // Take room a settings label would prefer, but not room its text needs.
+        self.0.row.setContentCompressionResistancePriority_forOrientation(
+            crate::text::LABEL_PREFERRED_WIDTH + 1.0,
+            NSLayoutConstraintOrientation::Horizontal,
+        );
+        self.0.add.ns_button().setControlSize(objc2_app_kit::NSControlSize::Small);
         self.0.rendered.set(false);
         self
     }
@@ -284,8 +310,9 @@ impl ValueChips {
                 chip.remove.ns_view().setAlphaValue(0.0);
             }
             // Room inside the leading edge for the remove control, keeping the title centered.
+            let room = if inner.compact.get() { 16.0 } else { 18.0 };
             chip.width
-                .setConstant(chip.button.ns_view().intrinsicContentSize().width + 18.0);
+                .setConstant(chip.button.ns_view().intrinsicContentSize().width + room);
         }
         *inner.values.borrow_mut() = values.to_vec();
         inner.rendered.set(true);
@@ -322,6 +349,10 @@ impl Inner {
                 ]
             };
             native.setBezelStyle(NSBezelStyle::Push);
+            if self.compact.get() {
+                native.setControlSize(objc2_app_kit::NSControlSize::Small);
+                native.setFont(Some(&crate::Font::caption()));
+            }
             let owner = Rc::downgrade(self);
             let button =
                 Button::from_native(&self.ui, native.clone().into_super()).on_click(move || {

@@ -146,16 +146,17 @@ impl SettingsRow {
         self
     }
 
-    pub fn description(mut self, text: &str) -> Self {
+    pub fn description(self, text: &str) -> Self {
         if text.trim().is_empty() {
             return self;
         }
-        self.label = Rc::new(
-            VStack::new(&self.ui)
-                .spacing(4.0)
-                .push(self.label)
-                .push(Caption::new(&self.ui, text)),
-        );
+        let caption = Caption::new(&self.ui, text);
+        self.description_view(caption)
+    }
+
+    /// Show `view` below the label, such as a caption its owner keeps current.
+    pub fn description_view(mut self, view: impl NativeView) -> Self {
+        self.label = Rc::new(VStack::new(&self.ui).spacing(4.0).push(self.label).push(view));
         self
     }
 
@@ -210,6 +211,11 @@ impl SettingsRow {
     pub fn set_validation(&self, value: &Validation) { self.validation.set_validation(value); }
 
     pub fn control_view(&self) -> &NSView { self.control.ns_view() }
+
+    /// A handle for showing or hiding this row, with its divider, after it joins a section.
+    pub fn visibility(&self) -> RowVisibility {
+        RowVisibility(objc2::rc::Weak::new(self.label.ns_view()))
+    }
 
     /// A weak handle to the row's control, for enabling it from sync callbacks.
     pub fn control(&self) -> crate::WeakView {
@@ -271,6 +277,36 @@ macro_rules! setting_row {
         }
     };
 }
+/// Shows or hides one settings row in place; a grouped card hides the row's divider too.
+#[derive(Clone)]
+pub struct RowVisibility(objc2::rc::Weak<NSView>);
+impl RowVisibility {
+    pub fn set_hidden(&self, hidden: bool) {
+        let Some(label) = self.0.load() else { return };
+        let Some(grid) = (unsafe { label.superview() })
+            .and_then(|view| view.downcast::<objc2_app_kit::NSGridView>().ok())
+        else {
+            label.setHidden(hidden);
+            return;
+        };
+        let Some(row) = grid.cellForView(&label).and_then(|cell| cell.row()) else {
+            return;
+        };
+        let index = grid.indexOfRow(&row);
+        row.setHidden(hidden);
+        // A divider sits above every row but the first; the first row's follows it.
+        let divider = if index > 0 { index - 1 } else { index + 1 };
+        if divider < grid.numberOfRows()
+            && grid
+                .cellAtColumnIndex_rowIndex(0, divider)
+                .contentView()
+                .is_some_and(|view| view.downcast_ref::<objc2_app_kit::NSBox>().is_some())
+        {
+            grid.rowAtIndex(divider).setHidden(hidden);
+        }
+    }
+}
+
 setting_row!(SwitchRow);
 setting_row!(PopupRow);
 setting_row!(TextRow);
@@ -342,7 +378,15 @@ impl SettingsGroup {
                 .setXPlacement(objc2_app_kit::NSGridCellPlacement::Fill);
             self.lines.push(line);
         } else {
-            grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&row.take_form_cells()));
+            let cells = row.take_form_cells();
+            let added = grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&cells));
+            if self.surface.is_some() {
+                // Rows with short controls, such as switches, keep the card's even rhythm.
+                let height = cells.iter().map(|cell| cell.fittingSize().height).fold(0.0, f64::max);
+                let padding = ((Metrics::ROW_MIN_HEIGHT - height) / 2.0).max(0.0);
+                added.setTopPadding(padding);
+                added.setBottomPadding(padding);
+            }
         }
         if self.surface.is_some() && !row.wide {
             // Prefer enough room for explanations before compressing them to a

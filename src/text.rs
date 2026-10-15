@@ -16,6 +16,18 @@ impl Font {
 
     pub fn caption() -> Retained<NSFont> { NSFont::systemFontOfSize(NSFont::smallSystemFontSize()) }
 
+    /// A caption that marks the chosen item, such as a selected thumbnail's name.
+    pub fn caption_emphasized() -> Retained<NSFont> {
+        NSFont::systemFontOfSize_weight(NSFont::smallSystemFontSize(), unsafe {
+            NSFontWeightSemibold
+        })
+    }
+
+    /// The name of an inspected item, between a page title and a section title.
+    pub fn title3() -> Retained<NSFont> {
+        NSFont::systemFontOfSize_weight(15.0, unsafe { NSFontWeightSemibold })
+    }
+
     pub fn title() -> Retained<NSFont> {
         NSFont::systemFontOfSize_weight(20.0, unsafe { NSFontWeightSemibold })
     }

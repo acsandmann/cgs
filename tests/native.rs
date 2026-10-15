@@ -1415,6 +1415,153 @@ fn inline_hosts_size_only_the_visible_inspector(ui: &Ui) {
     assert!(host.ns_view().subviews().is_empty());
 }
 
+fn find<T: objc2::DowncastTarget + 'static>(view: &objc2_app_kit::NSView) -> Option<Retained<T>> {
+    if let Some(value) = view.downcast_ref::<T>() {
+        return Some(value.retain());
+    }
+    view.subviews().iter().find_map(|child| find(&child))
+}
+
+fn sectioned_popups_report_choices_not_separators(ui: &Ui) {
+    let chosen = Rc::new(Cell::new(None));
+    let seen = chosen.clone();
+    let popup = Popup::new(ui)
+        .sections([vec!["Default (Next to Selection)"], vec![
+            "Next to Selection",
+            "End of Layout",
+        ]])
+        .on_change(move |index| seen.set(Some(index)));
+    let native = popup.ns_popup_button();
+    assert_eq!(native.numberOfItems(), 4);
+    assert!(native.itemAtIndex(1).unwrap().isSeparatorItem());
+    popup.set_selected(2);
+    assert_eq!(
+        native.titleOfSelectedItem().unwrap().to_string(),
+        "End of Layout"
+    );
+    assert_eq!(popup.selected(), Some(2));
+    native.selectItemAtIndex(2);
+    action(native);
+    assert_eq!(chosen.get(), Some(1), "the separator is not a choice");
+    // Without separators, indices are menu indices again.
+    popup.set_items(["One", "Two"]);
+    popup.set_selected(1);
+    assert_eq!(native.titleOfSelectedItem().unwrap().to_string(), "Two");
+}
+
+fn row_visibility_hides_a_row_with_its_divider(ui: &Ui) {
+    let hidden = SettingsRow::new(ui, "Custom ratio", TextField::new(ui));
+    let visibility = hidden.visibility();
+    let section = Section::new(ui, "Single Window")
+        .row(SettingsRow::new(ui, "Shape", Popup::new(ui)))
+        .row(hidden);
+    let grid = find::<objc2_app_kit::NSGridView>(section.ns_view()).unwrap();
+    assert_eq!(grid.numberOfRows(), 3, "two rows and their divider");
+    visibility.set_hidden(true);
+    assert!(grid.rowAtIndex(1).isHidden() && grid.rowAtIndex(2).isHidden());
+    assert!(!grid.rowAtIndex(0).isHidden());
+    visibility.set_hidden(false);
+    assert!(!grid.rowAtIndex(1).isHidden() && !grid.rowAtIndex(2).isHidden());
+}
+
+fn symbol_segments_name_each_choice(ui: &Ui) {
+    let control = SegmentedControl::symbols(ui, &[
+        ("rectangle.lefthalf.inset.filled", "Left"),
+        ("cgs.no-such-symbol", "Right"),
+    ]);
+    let native = control.ns_segmented_control();
+    assert_eq!(native.segmentCount(), 2);
+    let image = native.imageForSegment(0).expect("a symbol segment");
+    assert_eq!(image.accessibilityDescription().unwrap().to_string(), "Left");
+    assert_eq!(
+        native.labelForSegment(1).unwrap().to_string(),
+        "Right",
+        "a missing symbol falls back to its label"
+    );
+    assert_eq!(
+        Switch::new(ui).compact().ns_switch().controlSize(),
+        objc2_app_kit::NSControlSize::Mini
+    );
+}
+
+fn thumbnail_pickers_are_one_radio_group(ui: &Ui) {
+    let selections = Rc::new(RefCell::new(Vec::new()));
+    let activations = Rc::new(RefCell::new(Vec::new()));
+    let (s, a) = (selections.clone(), activations.clone());
+    let previews: Vec<_> = (0..3)
+        .map(|_| Rc::new(LayoutPreview::new(ui, CGSize::new(64.0, 40.0))))
+        .collect();
+    let picker = ThumbnailPicker::new(
+        ui,
+        "Layouts",
+        4.0,
+        ["One", "Two", "Three"]
+            .into_iter()
+            .zip(&previews)
+            .map(|(name, preview)| {
+                (name.to_owned(), Box::new(preview.clone()) as Box<dyn NativeView>)
+            })
+            .collect(),
+    )
+    .on_select(move |index| s.borrow_mut().push(index))
+    .on_double_click(move |index| a.borrow_mut().push(index))
+    .menu(1, Menu::new(ui).item(MenuItem::new(ui, "Set as Default")));
+    let group = picker.ns_view();
+    assert!(group.acceptsFirstResponder());
+    assert_eq!(
+        group.accessibilityRole().unwrap().to_string(),
+        unsafe { objc2_app_kit::NSAccessibilityRadioGroupRole }.to_string()
+    );
+    fn tiles(view: &objc2_app_kit::NSView, out: &mut Vec<Retained<objc2_app_kit::NSView>>) {
+        if view.accessibilityRole().is_some_and(|role| {
+            role.to_string() == unsafe { objc2_app_kit::NSAccessibilityRadioButtonRole }.to_string()
+        }) {
+            out.push(view.retain());
+        }
+        for child in view.subviews() {
+            tiles(&child, out);
+        }
+    }
+    let mut found = Vec::new();
+    tiles(group, &mut found);
+    assert_eq!(found.len(), 3, "each thumbnail is a radio button");
+    let value = |tile: &objc2_app_kit::NSView| {
+        tile.accessibilityValue()
+            .and_then(|value| value.downcast::<objc2_foundation::NSNumber>().ok())
+            .is_some_and(|value| value.boolValue())
+    };
+    assert!(value(&found[0]) && !value(&found[1]));
+    // Arrow keys move the selection and report it; the ends don't wrap.
+    group.keyDown(&event(124, "", Modifiers::empty()));
+    group.keyDown(&event(124, "", Modifiers::empty()));
+    group.keyDown(&event(124, "", Modifiers::empty()));
+    assert_eq!(*selections.borrow(), [1, 2]);
+    assert_eq!(picker.selected(), 2);
+    assert!(value(&found[2]) && !value(&found[0]));
+    // VoiceOver presses select too; programmatic selection doesn't report.
+    let _: bool = unsafe { msg_send![&*found[0], accessibilityPerformPress] };
+    assert_eq!(*selections.borrow(), [1, 2, 0]);
+    picker.set_selected(1);
+    assert_eq!(selections.borrow().len(), 3);
+    picker.set_marker(Some(2), "Default", "Default layout");
+    assert_eq!(
+        found[2].accessibilityLabel().unwrap().to_string(),
+        "Three, Default layout"
+    );
+    assert_eq!(found[1].accessibilityLabel().unwrap().to_string(), "Two");
+    let menu: Option<Retained<objc2_app_kit::NSMenu>> =
+        unsafe { msg_send![&*found[1], menuForEvent: &*event(0, "", Modifiers::empty())] };
+    assert_eq!(
+        menu.unwrap().numberOfItems(),
+        1,
+        "each thumbnail has its own menu"
+    );
+    let none: Option<Retained<objc2_app_kit::NSMenu>> =
+        unsafe { msg_send![&*found[0], menuForEvent: &*event(0, "", Modifiers::empty())] };
+    assert!(none.is_none());
+    assert!(activations.borrow().is_empty());
+}
+
 fn main() {
     // A single libtest-compatible case lets nextest list this harness without running AppKit.
     if std::env::args().any(|arg| arg == "--list") {
@@ -1485,6 +1632,10 @@ fn main() {
         settings_lists_do_not_materialize_offscreen_rows(&ui);
         reused_cells_clear_missing_images(&ui);
         unchanged_popup_items_preserve_selection_and_native_items(&ui);
+        sectioned_popups_report_choices_not_separators(&ui);
+        row_visibility_hides_a_row_with_its_divider(&ui);
+        symbol_segments_name_each_choice(&ui);
+        thumbnail_pickers_are_one_radio_group(&ui);
         numeric_fields_reject_invalid_commits(&ui);
         delegates_and_selection_use_current_data(&ui);
         recording_is_scoped_and_cancellable(&ui);

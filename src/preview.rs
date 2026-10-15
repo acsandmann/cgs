@@ -38,25 +38,29 @@ impl PreviewView {
         let Some(layer) = self.layer() else { return };
         // Resolve semantic colors using this view’s appearance before assigning CGColors.
         self.effectiveAppearance().performAsCurrentDrawingAppearance(&RcBlock::new(|| {
-            // Wireframe windows: a light fill with a defined stroke, so overlapping
-            // windows layer cleanly. An unselected screen is a faint, borderless well on
-            // its grouped surface; selection adds a quiet accent tint without an outline.
+            // A desktop tinted with the accent color, and windows as solid cards with a
+            // defined edge, so overlapping windows layer cleanly at thumbnail size.
+            // Selection deepens the tint without an outline.
             let selected = self.ivars().get();
             let surface = grouped_surface();
             let accent = NSColor::controlAccentColor();
+            let label = NSColor::labelColor();
             let mix = |color: &NSColor, fraction: f64, ink: &NSColor| {
                 color
                     .blendedColorWithFraction_ofColor(fraction, ink)
                     .unwrap_or_else(|| ink.colorWithAlphaComponent(fraction))
             };
-            let ink = if selected {
-                accent.clone()
+            // Light text means a dark appearance, including its high-contrast variant.
+            let dark = label
+                .colorUsingColorSpace(&objc2_app_kit::NSColorSpace::sRGBColorSpace())
+                .is_some_and(|color| color.redComponent() > 0.5);
+            let background = mix(&surface, if selected { 0.30 } else { 0.20 }, &accent);
+            let tile = if dark {
+                mix(&surface, 0.18, &label)
             } else {
-                NSColor::labelColor()
+                NSColor::controlBackgroundColor()
             };
-            let background = mix(&surface, if selected { 0.10 } else { 0.02 }, &ink);
-            let tile = mix(&background, if selected { 0.10 } else { 0.06 }, &ink);
-            let stroke = mix(&background, if selected { 0.32 } else { 0.24 }, &ink);
+            let stroke = mix(&background, 0.35, &label);
             CATransaction::begin();
             CATransaction::setDisableActions(true);
             layer.setBackgroundColor(Some(&background.CGColor()));
