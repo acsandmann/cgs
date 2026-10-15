@@ -82,6 +82,7 @@ pub struct SettingsRow {
     control: Box<dyn NativeView>,
     validation: Rc<ValidationMessage>,
     wide: bool,
+    baseline: Option<Retained<NSView>>,
 }
 impl SettingsRow {
     pub fn new(ui: &Ui, title: &str, control: impl NativeView) -> Self {
@@ -111,7 +112,15 @@ impl SettingsRow {
             control: Box::new(control),
             validation,
             wide: false,
+            baseline: None,
         }
+    }
+
+    /// Line the label up with `view`’s first baseline, rather than centering it on the
+    /// whole control, such as when a caption or other lines sit beneath the control.
+    pub fn label_baseline(mut self, view: &NSView) -> Self {
+        self.baseline = Some(view.retain());
+        self
     }
 
     /// Let the control extend into the label column, past the group's shared
@@ -380,6 +389,16 @@ impl SettingsGroup {
         } else {
             let cells = row.take_form_cells();
             let added = grid.addRowWithViews(&objc2_foundation::NSArray::from_slice(&cells));
+            if let Some(anchor) = &row.baseline {
+                let cell = added.cellAtIndex(0);
+                cell.setYPlacement(objc2_app_kit::NSGridCellPlacement::None);
+                let baseline = cells[0]
+                    .firstBaselineAnchor()
+                    .constraintEqualToAnchor(&anchor.firstBaselineAnchor());
+                cell.setCustomPlacementConstraints(
+                    &objc2_foundation::NSArray::from_retained_slice(&[baseline]),
+                );
+            }
             if self.surface.is_some() {
                 // Rows with short controls, such as switches, keep the card's even rhythm.
                 let height = cells.iter().map(|cell| cell.fittingSize().height).fold(0.0, f64::max);

@@ -55,19 +55,30 @@ define_class!(
         fn layout_chips(&self) {
             unsafe { let _: () = msg_send![super(self), layout]; }
             let available = self.bounds().size.width.max(1.0);
-            let (mut x, mut y, mut row_height) = (0.0, 0.0, 0.0_f64);
+            // Fill rows left to right, then shift each to the trailing edge if asked.
+            let mut rows: Vec<Vec<(Retained<NSView>, CGSize)>> = vec![Vec::new()];
+            let mut x = 0.0;
             for child in self.subviews() {
                 let size = child.fittingSize();
                 if x > 0.0 && x + size.width > available + 0.5 {
+                    rows.push(Vec::new());
                     x = 0.0;
-                    y += row_height + 6.0;
-                    row_height = 0.0;
                 }
-                child.setFrame(CGRect::new(CGPoint::new(x, y), size));
                 x += size.width + 6.0;
-                row_height = row_height.max(size.height);
+                rows.last_mut().unwrap().push((child, size));
             }
-            let height = y + row_height;
+            let mut y = 0.0;
+            for row in &rows {
+                let width = row.iter().map(|(_, size)| size.width + 6.0).sum::<f64>() - 6.0;
+                let mut x = if self.ivars().trailing.get() { (available - width).max(0.0) } else { 0.0 };
+                let height = row.iter().map(|(_, size)| size.height).fold(0.0, f64::max);
+                for (child, size) in row {
+                    child.setFrame(CGRect::new(CGPoint::new(x, y), *size));
+                    x += size.width + 6.0;
+                }
+                y += height + 6.0;
+            }
+            let height = (y - 6.0).max(0.0);
             if self.ivars().height.replace(height) != height {
                 self.invalidateIntrinsicContentSize();
             }
@@ -77,6 +88,8 @@ define_class!(
 
 struct FlowIvars {
     height: Cell<f64>,
+    /// Align each line with the trailing edge, as a trailing settings control.
+    trailing: Cell<bool>,
     /// The widest the row asks to be before it wraps.
     preferred_width: Cell<f64>,
 }
@@ -87,6 +100,7 @@ impl ChipFlow {
             msg_send![
                 super(Self::alloc(ui.mtm()).set_ivars(FlowIvars {
                     height: Cell::new(24.0),
+                    trailing: Cell::new(false),
                     preferred_width: Cell::new(220.0),
                 })),
                 init
@@ -267,6 +281,7 @@ impl ValueChips {
     pub fn compact(self) -> Self {
         self.0.compact.set(true);
         self.0.row.ivars().preferred_width.set(f64::MAX);
+        self.0.row.ivars().trailing.set(true);
         // Take room a settings label would prefer, but not room its text needs.
         self.0.row.setContentCompressionResistancePriority_forOrientation(
             crate::text::LABEL_PREFERRED_WIDTH + 1.0,
@@ -309,11 +324,19 @@ impl ValueChips {
             if !removable {
                 chip.remove.ns_view().setAlphaValue(0.0);
             }
-            // Room inside the leading edge for the remove control, keeping the title centered.
-            let room = if inner.compact.get() { 16.0 } else { 18.0 };
-            chip.width
-                .setConstant(chip.button.ns_view().intrinsicContentSize().width + room);
         }
+        // One width for every chip, so a list reads as an even row of tokens, with room
+        // inside the leading edge for the remove control, keeping titles centered.
+        let room = if inner.compact.get() { 16.0 } else { 18.0 };
+        let chips = inner.chips.borrow();
+        let width = chips
+            .iter()
+            .map(|chip| chip.button.ns_view().intrinsicContentSize().width)
+            .fold(0.0, f64::max);
+        for chip in chips.iter() {
+            chip.width.setConstant(width + room);
+        }
+        drop(chips);
         *inner.values.borrow_mut() = values.to_vec();
         inner.rendered.set(true);
         inner.row.setNeedsLayout(true);
@@ -443,6 +466,7 @@ impl Inner {
                 button.setHighlighted(false);
                 button.reveal(false);
                 button.setAlphaValue(0.6);
+                haptic(objc2_app_kit::NSHapticFeedbackPattern::Generic);
                 if let Some(popover) = self.popover.borrow_mut().take() {
                     popover.close();
                 }
@@ -463,6 +487,8 @@ impl Inner {
                     order.remove(from);
                     order.insert(to, from);
                     self.arrange(&chips, &order);
+                    // Each new slot clicks into place, as a stepped slider does.
+                    haptic(objc2_app_kit::NSHapticFeedbackPattern::Alignment);
                 }
             } else {
                 let point = button.convertPoint_fromView(location, None);
@@ -486,6 +512,7 @@ impl Inner {
             // Restore slot identities before the owner synchronizes the saved values.
             self.arrange(&chips, &(0..chips.len()).collect::<Vec<_>>());
             if released && inside && from != to {
+                haptic(objc2_app_kit::NSHapticFeedbackPattern::LevelChange);
                 self.emit(ChipEdit::Move(from, to));
             }
         } else if released && clicked {
@@ -606,4 +633,14 @@ impl Inner {
             old.close();
         }
     }
+}
+
+/// Trackpad feedback for a reordering gesture, on hardware that supports it.
+fn haptic(pattern: objc2_app_kit::NSHapticFeedbackPattern) {
+    use objc2_app_kit::NSHapticFeedbackPerformer;
+    objc2_app_kit::NSHapticFeedbackManager::defaultPerformer()
+        .performFeedbackPattern_performanceTime(
+            pattern,
+            objc2_app_kit::NSHapticFeedbackPerformanceTime::Now,
+        );
 }

@@ -15,7 +15,7 @@ define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsLayoutPreview"]
-    #[ivars = Cell<bool>]
+    #[ivars = PreviewState]
     struct PreviewView;
     impl PreviewView {
         // Illustrations never intercept their enclosing native control’s clicks.
@@ -33,15 +33,22 @@ impl NativeView for PreviewView {
     fn ns_view(&self) -> &NSView { self }
 }
 
+#[derive(Default)]
+struct PreviewState {
+    selected: Cell<bool>,
+    /// An accent ring just outside the canvas, shown while selected.
+    ring: Option<Retained<CALayer>>,
+}
+
 impl PreviewView {
     fn update_palette(&self) {
         let Some(layer) = self.layer() else { return };
         // Resolve semantic colors using this view’s appearance before assigning CGColors.
         self.effectiveAppearance().performAsCurrentDrawingAppearance(&RcBlock::new(|| {
-            // A desktop tinted with the accent color, and windows as solid cards with a
+            // A neutral desktop, and windows as solid cards with a
             // defined edge, so overlapping windows layer cleanly at thumbnail size.
-            // Selection deepens the tint without an outline.
-            let selected = self.ivars().get();
+            // Selection tints the desktop, and rings selectable previews with the accent.
+            let selected = self.ivars().selected.get();
             let surface = grouped_surface();
             let accent = NSColor::controlAccentColor();
             let label = NSColor::labelColor();
@@ -54,18 +61,38 @@ impl PreviewView {
             let dark = label
                 .colorUsingColorSpace(&objc2_app_kit::NSColorSpace::sRGBColorSpace())
                 .is_some_and(|color| color.redComponent() > 0.5);
-            let background = mix(&surface, if selected { 0.30 } else { 0.20 }, &accent);
+            // A quiet neutral desktop; selection adds only a hint of the accent.
+            let background = if selected {
+                mix(&surface, if dark { 0.22 } else { 0.12 }, &accent)
+            } else {
+                mix(&surface, if dark { 0.06 } else { 0.07 }, &label)
+            };
             let tile = if dark {
-                mix(&surface, 0.18, &label)
+                mix(&surface, 0.22, &label)
             } else {
                 NSColor::controlBackgroundColor()
             };
-            let stroke = mix(&background, 0.35, &label);
+            let tile = if selected {
+                mix(&tile, 0.08, &accent)
+            } else {
+                tile
+            };
+            let stroke = mix(&background, if dark { 0.25 } else { 0.18 }, &label);
             CATransaction::begin();
             CATransaction::setDisableActions(true);
             layer.setBackgroundColor(Some(&background.CGColor()));
-            layer.setBorderColor(Some(&accent.CGColor()));
-            layer.setBorderWidth(0.0);
+            // Freestanding previews show the screen’s edge, even where windows reach it;
+            // choices in a gallery sit on their tile instead.
+            layer.setBorderColor(Some(&stroke.CGColor()));
+            layer.setBorderWidth(if self.ivars().ring.is_none() {
+                1.0
+            } else {
+                0.0
+            });
+            if let Some(ring) = &self.ivars().ring {
+                ring.setBorderColor(Some(&accent.CGColor()));
+                ring.setHidden(!selected);
+            }
             for view in self.subviews() {
                 if let Some(layer) = view.layer() {
                     layer.setBackgroundColor(Some(&tile.CGColor()));
@@ -141,30 +168,56 @@ pub struct LayoutPreview {
     initialized: Cell<bool>,
 }
 impl LayoutPreview {
+    pub const RING_OUTSET: f64 = 4.0;
+
     /// Mark the inspected choice using the system accent without changing its geometry.
+    /// Selectable previews also show a native accent ring around the canvas.
     pub fn set_selected(&self, selected: bool) {
-        if self.host.ivars().replace(selected) != selected {
+        if self.host.ivars().selected.replace(selected) != selected {
             self.host.update_palette();
         }
     }
 
-    pub fn new(ui: &Ui, size: CGSize) -> Self {
+    pub fn new(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, false) }
+
+    /// A preview for a choice among several, which rings itself with the accent color
+    /// while selected, like thumbnails in System Settings. The ring sits outside the
+    /// canvas, so leave `RING_OUTSET` points around it.
+    pub fn selectable(ui: &Ui, size: CGSize) -> Self { Self::with_state(ui, size, true) }
+
+    fn with_state(ui: &Ui, size: CGSize, selectable: bool) -> Self {
         assert!(
             size.width.is_finite()
                 && size.width > 0.0
                 && size.height.is_finite()
                 && size.height > 0.0
         );
+        let radius = (size.height * 0.1).min(9.0);
         let root = CALayer::layer();
-        root.setCornerRadius((size.height * 0.1).min(9.0));
+        root.setCornerRadius(radius);
         root.setBorderWidth(1.0);
-        root.setMasksToBounds(true);
-        let host: Retained<PreviewView> = unsafe {
-            msg_send![
-                super(PreviewView::alloc(ui.mtm()).set_ivars(Cell::new(false))),
-                init
-            ]
+        // A ring outside the bounds can't be clipped; selectable choices keep their
+        // sample windows inside the canvas instead.
+        root.setMasksToBounds(!selectable);
+        let ring = selectable.then(|| {
+            let ring = CALayer::layer();
+            let outset = Self::RING_OUTSET;
+            ring.setFrame(CGRect::new(
+                CGPoint::new(-outset, -outset),
+                CGSize::new(size.width + 2.0 * outset, size.height + 2.0 * outset),
+            ));
+            ring.setCornerRadius(radius + outset);
+            ring.setBorderWidth(2.5);
+            ring.setHidden(true);
+            root.addSublayer(&ring);
+            ring
+        });
+        let state = PreviewState {
+            selected: Cell::new(false),
+            ring,
         };
+        let host: Retained<PreviewView> =
+            unsafe { msg_send![super(PreviewView::alloc(ui.mtm()).set_ivars(state)), init] };
         host.setAccessibilityElement(true);
         host.setAccessibilityRole(Some(unsafe { objc2_app_kit::NSAccessibilityImageRole }));
         host.setWantsLayer(true);

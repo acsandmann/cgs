@@ -400,6 +400,7 @@ pub struct Disclosure {
     heading: Rc<HStack>,
     arrow: crate::Button,
     symbol: Option<crate::ImageView>,
+    summary: Option<crate::SecondaryLabel>,
     toggle: Rc<RefCell<Box<dyn FnMut(bool) -> bool>>>,
 }
 impl Disclosure {
@@ -477,6 +478,7 @@ impl Disclosure {
             heading,
             arrow,
             symbol: None,
+            summary: None,
             toggle,
         }
     }
@@ -507,6 +509,36 @@ impl Disclosure {
         stack.addArrangedSubview(crate::Spacer::new(ui).ns_view());
         stack.addArrangedSubview(self.arrow.ns_view());
         self
+    }
+
+    /// A one-line summary of the hidden settings at the header’s trailing edge, such as
+    /// the values they currently hold, so collapsed content stays informative.
+    pub fn summary(mut self, ui: &Ui) -> Self {
+        let label = crate::SecondaryLabel::single_line(ui, "");
+        let stack = self.heading.ns_stack_view();
+        let arrow = self.arrow.ns_view();
+        let trailing = stack.arrangedSubviews().lastObject().is_some_and(|last| &*last == arrow);
+        if trailing {
+            stack.insertArrangedSubview_atIndex(
+                label.ns_view(),
+                stack.arrangedSubviews().len() as isize - 1,
+            );
+        } else {
+            stack.addArrangedSubview(crate::Spacer::new(ui).ns_view());
+            stack.addArrangedSubview(label.ns_view());
+        }
+        label.ns_view().setAccessibilityElement(false);
+        self.summary = Some(label);
+        self
+    }
+
+    pub fn set_summary(&self, text: &str) {
+        if let Some(label) = &self.summary {
+            label.set_text(text);
+            self.button.ns_button().setAccessibilityValueDescription(Some(
+                &objc2_foundation::NSString::from_str(text),
+            ));
+        }
     }
 
     /// A row-weight title for disclosures listed among ordinary settings rows.
@@ -598,6 +630,13 @@ define_class!(
             }
             let ivars = self.ivars();
             let orientation = if width >= ivars.breakpoint { NSUserInterfaceLayoutOrientation::Horizontal } else { NSUserInterfaceLayoutOrientation::Vertical };
+            let compact = orientation == NSUserInterfaceLayoutOrientation::Vertical;
+            if ivars.hide_trailing.get()
+                && let Some(last) = self.arrangedSubviews().lastObject()
+                && last.isHidden() != compact
+            {
+                last.setHidden(compact);
+            }
             if self.orientation() != orientation {
                 self.setOrientation(orientation);
                 let side_by_side = if ivars.centered.get() { NSLayoutAttribute::CenterY } else { NSLayoutAttribute::Top };
@@ -612,6 +651,8 @@ struct ResponsiveLayout {
     breakpoint: f64,
     /// Center side-by-side content vertically, rather than aligning its tops.
     centered: Cell<bool>,
+    /// Hide the last item, such as an optional preview, instead of stacking it.
+    hide_trailing: Cell<bool>,
 }
 
 /// Places content side by side when it fits, and vertically at smaller widths.
@@ -626,6 +667,7 @@ impl ResponsiveStack {
                 super(ResponsiveStackView::alloc(ui.mtm()).set_ivars(ResponsiveLayout {
                     breakpoint: wide_min_width,
                     centered: Cell::new(false),
+                    hide_trailing: Cell::new(false),
                 })),
                 init
             ]
@@ -640,6 +682,13 @@ impl ResponsiveStack {
     /// Center content vertically while it sits side by side.
     pub fn centered(self) -> Self {
         self.native.ivars().centered.set(true);
+        self
+    }
+
+    /// At narrow widths, hide the last item rather than placing it below the others,
+    /// for supplementary content such as a preview.
+    pub fn hiding_trailing(self) -> Self {
+        self.native.ivars().hide_trailing.set(true);
         self
     }
 

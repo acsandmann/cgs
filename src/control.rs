@@ -37,7 +37,6 @@ pub(crate) fn action_button_bezel() -> NSBezelStyle {
 pub struct Button {
     native: Retained<NSButton>,
     target: Retained<ActionTarget>,
-    illustration: Option<crate::LayoutPreview>,
 }
 impl Button {
     pub fn new(ui: &Ui, title: &str) -> Self {
@@ -50,42 +49,8 @@ impl Button {
     pub(crate) fn from_native(ui: &Ui, native: Retained<NSButton>) -> Self {
         let target = ActionTarget::new(ui);
         target.attach(&native);
-        Self {
-            native,
-            target,
-            illustration: None,
-        }
+        Self { native, target }
     }
-
-    /// A compact native toggle with a live, noninteractive layout illustration.
-    pub fn layout_illustration(mut self, preview: crate::LayoutPreview) -> Self {
-        self.native.setButtonType(NSButtonType::PushOnPushOff);
-        #[allow(deprecated)] // AppKit’s flexible native image-and-title button bezel.
-        self.native.setBezelStyle(NSBezelStyle::RegularSquare);
-        self.native.setBordered(false);
-        self.native.setContentTintColor(Some(&NSColor::labelColor()));
-        let size = preview.canvas_size();
-        let image = NSImage::initWithSize(NSImage::alloc(), size);
-        self.native.setImage(Some(&image));
-        self.native.setImagePosition(NSCellImagePosition::ImageAbove);
-        self.native.addSubview(preview.ns_view());
-        preview.ns_view().setAccessibilityElement(false);
-        preview
-            .ns_view()
-            .centerXAnchor()
-            .constraintEqualToAnchor(&self.native.centerXAnchor())
-            .setActive(true);
-        preview
-            .ns_view()
-            .topAnchor()
-            .constraintEqualToAnchor_constant(&self.native.topAnchor(), 5.0)
-            .setActive(true);
-        self.height(size.height + 30.0);
-        self.illustration = Some(preview);
-        self
-    }
-
-    pub fn layout_preview(&self) -> Option<&crate::LayoutPreview> { self.illustration.as_ref() }
 
     pub fn on_click(self, mut f: impl FnMut() + 'static) -> Self {
         self.target.set(move |_| f());
@@ -132,6 +97,150 @@ impl Button {
     }
 }
 native_control!(Button, NSButton, ns_button);
+
+/// One choice in a gallery of layouts: a live illustration above its name, and an
+/// optional quiet marker, such as “Default”, on a second line. Selection rings the
+/// illustration with the accent color, as thumbnails do in System Settings, and
+/// assistive apps hear each tile as a radio button with its marker in its name.
+/// Whether a tile is selected, and its marker.
+type TileState = std::rc::Rc<std::cell::RefCell<Option<(bool, Option<String>)>>>;
+
+pub struct LayoutTile {
+    button: Button,
+    preview: crate::LayoutPreview,
+    title: String,
+    state: TileState,
+}
+impl LayoutTile {
+    pub fn new(ui: &Ui, title: &str, canvas: crate::CGSize) -> Self {
+        let preview = crate::LayoutPreview::selectable(ui, canvas);
+        let native = NSButton::new(ui.mtm());
+        native.setButtonType(NSButtonType::PushOnPushOff);
+        #[allow(deprecated)] // AppKit’s flexible native image-and-title button bezel.
+        native.setBezelStyle(NSBezelStyle::RegularSquare);
+        native.setBordered(false);
+        native.setContentTintColor(Some(&NSColor::labelColor()));
+        // An empty image reserves the illustration’s room, with its ring, above the title.
+        let outset = crate::LayoutPreview::RING_OUTSET;
+        let room = crate::CGSize::new(canvas.width, canvas.height + 2.0 * outset);
+        native.setImage(Some(&NSImage::initWithSize(NSImage::alloc(), room)));
+        native.setImagePosition(NSCellImagePosition::ImageAbove);
+        native.addSubview(preview.ns_view());
+        native.setAccessibilityRole(Some(unsafe { NSAccessibilityRadioButtonRole }));
+        let view = preview.ns_view();
+        view.setAccessibilityElement(false);
+        view.centerXAnchor()
+            .constraintEqualToAnchor(&native.centerXAnchor())
+            .setActive(true);
+        view.topAnchor()
+            .constraintEqualToAnchor_constant(&native.topAnchor(), outset + 2.0)
+            .setActive(true);
+        let button = Button::from_native(ui, native);
+        // The illustration, then two caption lines: the name and its marker.
+        button.height(room.height + 2.0 + 2.0 * NSFont::smallSystemFontSize() + 16.0);
+        let tile = Self {
+            button,
+            preview,
+            title: title.into(),
+            state: Default::default(),
+        };
+        tile.set_state(false, None);
+        tile
+    }
+
+    pub fn on_click(mut self, mut f: impl FnMut() + 'static) -> Self {
+        let native = objc2::rc::Weak::new(self.button.ns_button());
+        let state = self.state.clone();
+        self.button = self.button.on_click(move || {
+            f();
+            // A click toggles the native state; selection is only ever set by `set_state`.
+            if let (Some(native), Some((selected, _))) = (native.load(), &*state.borrow()) {
+                native.setState(if *selected {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        });
+        self
+    }
+
+    pub fn preview(&self) -> &crate::LayoutPreview { &self.preview }
+
+    /// Whether this tile is the chosen one, and its marker, such as “Default”.
+    pub fn set_state(&self, selected: bool, marker: Option<&str>) {
+        let state = Some((selected, marker.map(str::to_owned)));
+        if *self.state.borrow() == state {
+            return;
+        }
+        *self.state.borrow_mut() = state;
+        let native = self.button.ns_button();
+        native.setState(if selected {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        self.preview.set_selected(selected);
+        native.setAttributedTitle(&two_line_title(&self.title, marker, selected));
+        let name = match marker {
+            Some(marker) => format!("{}, {}", self.title, marker.to_lowercase()),
+            None => self.title.clone(),
+        };
+        native.setAccessibilityLabel(Some(&NSString::from_str(&name)));
+    }
+
+    pub fn ns_button(&self) -> &NSButton { self.button.ns_button() }
+}
+impl NativeView for LayoutTile {
+    fn ns_view(&self) -> &NSView { self.button.ns_view() }
+}
+
+/// A centered caption, emphasized while selected, over a quieter marker line. Every tile
+/// reserves the second line, so names stay aligned across the gallery.
+fn two_line_title(
+    title: &str,
+    marker: Option<&str>,
+    selected: bool,
+) -> Retained<objc2_foundation::NSAttributedString> {
+    use objc2_foundation::{NSAttributedString, NSDictionary, NSMutableAttributedString};
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setAlignment(NSTextAlignment::Center);
+    paragraph.setParagraphSpacing(1.0);
+    let line = |text: &str, font: &NSFont, color: &NSColor| unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(text),
+            Some(&NSDictionary::from_slices(
+                &[
+                    NSFontAttributeName,
+                    NSForegroundColorAttributeName,
+                    NSParagraphStyleAttributeName,
+                ],
+                &[
+                    font as &AnyObject,
+                    color as &AnyObject,
+                    &*paragraph as &AnyObject,
+                ],
+            )),
+        )
+    };
+    let text = NSMutableAttributedString::new();
+    let name = if selected {
+        crate::Font::caption_emphasized()
+    } else {
+        crate::Font::caption()
+    };
+    text.appendAttributedString(&line(&format!("{title}\n"), &name, &NSColor::labelColor()));
+    text.appendAttributedString(&line(
+        marker.unwrap_or(" "),
+        &NSFont::systemFontOfSize_weight(NSFont::labelFontSize() - 1.0, unsafe {
+            NSFontWeightMedium
+        }),
+        &NSColor::secondaryLabelColor(),
+    ));
+    Retained::into_super(text)
+}
+
 pub struct IconButton(Button);
 impl IconButton {
     pub fn new(ui: &Ui, symbol: &str, label: &str) -> Self {
@@ -704,6 +813,7 @@ pub struct Slider {
     native: Retained<NSSlider>,
     target: Retained<ActionTarget>,
     last_value: std::rc::Rc<std::cell::Cell<f64>>,
+    step: std::rc::Rc<std::cell::Cell<Option<f64>>>,
 }
 impl Slider {
     pub fn new(ui: &Ui) -> Self {
@@ -717,6 +827,7 @@ impl Slider {
             native,
             target,
             last_value: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+            step: Default::default(),
         }
     }
 
@@ -733,7 +844,38 @@ impl Slider {
         if self.native.maxValue() != max {
             self.native.setMaxValue(max);
         }
+        self.update_ticks();
         self.last_value.set(self.native.doubleValue());
+    }
+
+    /// Move in multiples of `step`, such as 5 for percentages, with an alignment haptic
+    /// at each one while dragging. Range endpoints stay reachable when they fall between
+    /// steps. Tick marks appear when the range spans whole steps and a few of them.
+    pub fn step(self, step: f64) -> Self {
+        self.set_step(step);
+        self
+    }
+
+    pub fn set_step(&self, step: f64) {
+        assert!(step.is_finite() && step > 0.0);
+        self.step.set(Some(step));
+        self.update_ticks();
+    }
+
+    fn update_ticks(&self) {
+        let Some(step) = self.step.get() else { return };
+        let (min, max) = (self.native.minValue(), self.native.maxValue());
+        let whole = |value: f64| ((value / step).round() * step - value).abs() < 1e-6;
+        let count = ((max - min) / step).round() as isize + 1;
+        let ticks = if whole(min) && whole(max) && (2..=21).contains(&count) {
+            count
+        } else {
+            0
+        };
+        if self.native.numberOfTickMarks() != ticks {
+            self.native.setNumberOfTickMarks(ticks);
+            self.native.setTickMarkPosition(NSTickMarkPosition::Below);
+        }
     }
 
     /// Equally spaced notches, including both endpoints. Each changed detent
@@ -769,13 +911,27 @@ impl Slider {
 
     pub fn on_change(self, mut f: impl FnMut(f64) + 'static) -> Self {
         let last = self.last_value.clone();
+        let step = self.step.clone();
         self.target.set(move |sender| {
             let Some(control) = sender.downcast_ref::<NSSlider>() else {
                 return;
             };
             let mut value = control.doubleValue();
-            if control.allowsTickMarkValuesOnly() {
-                value = control.closestTickMarkValueToValue(value);
+            let snapped = if control.allowsTickMarkValuesOnly() {
+                Some(control.closestTickMarkValueToValue(value))
+            } else {
+                step.get().map(|step| {
+                    let (min, max) = (control.minValue(), control.maxValue());
+                    let nearest = ((value / step).round() * step).clamp(min, max);
+                    // An endpoint between steps wins when it’s closer than the step.
+                    [min, max]
+                        .into_iter()
+                        .find(|bound| (value - bound).abs() < (value - nearest).abs())
+                        .unwrap_or(nearest)
+                })
+            };
+            if let Some(snapped) = snapped {
+                value = snapped;
                 control.setDoubleValue(value);
                 let changed = last.replace(value) != value;
                 let tracking = NSApplication::sharedApplication(control.mtm())
@@ -925,6 +1081,28 @@ impl NumberField {
         self.field = self.field.on_change(move |text| {
             if let Some(value) = formatted_number(&formatter, &NSString::from_str(&text)) {
                 f(value);
+            }
+        });
+        self
+    }
+
+    /// Leave the field empty, showing `placeholder`, such as an inherited value.
+    pub fn set_inherited(&self, placeholder: &str) {
+        let field = self.field.ns_text_field();
+        field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+        if field.currentEditor().is_none() && !field.stringValue().is_empty() {
+            field.setStringValue(&NSString::from_str(""));
+        }
+    }
+
+    /// Commit valid values, or `None` when the field is left empty.
+    pub fn on_change_optional(mut self, mut f: impl FnMut(Option<f64>) + 'static) -> Self {
+        let formatter = self.formatter.clone();
+        self.field = self.field.on_commit(move |text| {
+            if text.trim().is_empty() {
+                f(None);
+            } else if let Some(value) = formatted_number(&formatter, &NSString::from_str(&text)) {
+                f(Some(value));
             }
         });
         self
