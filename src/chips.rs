@@ -282,9 +282,10 @@ impl ValueChips {
         self.0.compact.set(true);
         self.0.row.ivars().preferred_width.set(f64::MAX);
         self.0.row.ivars().trailing.set(true);
-        // Take room a settings label would prefer, but not room its text needs.
+        // Stay on one line while there's room, but wrap rather than set a minimum width:
+        // below the fitting priority, so the row never widens its window.
         self.0.row.setContentCompressionResistancePriority_forOrientation(
-            crate::text::LABEL_PREFERRED_WIDTH + 1.0,
+            49.0,
             NSLayoutConstraintOrientation::Horizontal,
         );
         self.0.add.ns_button().setControlSize(objc2_app_kit::NSControlSize::Small);
