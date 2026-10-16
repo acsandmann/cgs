@@ -1288,6 +1288,30 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
                 })
                 .collect()
         };
+        let first_control = overflow
+            .iter()
+            .find(|control| {
+                control.accessibilityLabel().is_some_and(|label| label.to_string() == "First")
+            })
+            .unwrap();
+        for selected in [0, 1, usize::MAX, 1] {
+            bar.set_selected_index(selected);
+            assert_eq!(
+                first_control.downcast_ref::<objc2_app_kit::NSButton>().unwrap().state()
+                    == NSControlStateValueOn,
+                selected == 0
+            );
+            assert_eq!(
+                second_control.downcast_ref::<objc2_app_kit::NSButton>().unwrap().state()
+                    == NSControlStateValueOn,
+                selected == 1
+            );
+            assert_eq!(second_control.isAccessibilitySelected(), selected == 1);
+            if selected == 1 {
+                let frame = second_control.frame();
+                assert!(frame.origin.x >= 0.0 && frame.origin.x + frame.size.width <= 218.0);
+            }
+        }
         bar.set_tabs(items(&["First", "Second", "Third"]), 2);
         bar.set_tabs(items(&["Second", "Third"]), 0);
         assert!(unsafe { second_control.superview() }.is_some());
@@ -1562,6 +1586,188 @@ fn thumbnail_pickers_are_one_radio_group(ui: &Ui) {
     assert!(activations.borrow().is_empty());
 }
 
+// Opt-in because this posts real mouse events and opens a foreign helper window.
+fn tab_bar_cross_process_input(ui: &Ui) {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
+    use objc2_core_graphics::*;
+
+    struct Anchor(std::process::Child);
+    impl Drop for Anchor {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn order() -> Vec<u32> {
+        let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, 0).unwrap();
+        let list = unsafe {
+            objc2_core_foundation::CFRetained::cast_unchecked::<
+                objc2_core_foundation::CFArray<objc2_core_foundation::CFType>,
+            >(list)
+        };
+        list.iter()
+            .filter_map(|value| {
+                let dict = value.downcast::<CFDictionary>().ok()?;
+                let dict = unsafe {
+                    objc2_core_foundation::CFRetained::cast_unchecked::<
+                        CFDictionary<CFString, objc2_core_foundation::CFType>,
+                    >(dict)
+                };
+                dict.get(&CFString::from_static_str("kCGWindowNumber"))?
+                    .downcast_ref::<CFNumber>()?
+                    .as_i32()
+                    .map(|id| id as u32)
+            })
+            .collect()
+    }
+    fn pump(ui: &Ui) {
+        let app = objc2_app_kit::NSApplication::sharedApplication(ui.mtm());
+        let until = objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.15);
+        while let Some(event) = app.nextEventMatchingMask_untilDate_inMode_dequeue(
+            objc2_app_kit::NSEventMask::Any,
+            Some(&until),
+            unsafe { objc2_foundation::NSDefaultRunLoopMode },
+            true,
+        ) {
+            app.sendEvent(&event);
+        }
+        app.updateWindows();
+    }
+    let mut child = Anchor(
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--stack-anchor")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let anchor: u32 = line.trim().parse().unwrap();
+    assert!(
+        CGPreflightPostEventAccess(),
+        "real input test requires Accessibility/event-posting permission"
+    );
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let received = actions.clone();
+    let bar = TabBar::new(ui).on_action(move |a| received.borrow_mut().push(a));
+    bar.set_frame(CGRect::new(CGPoint::new(120.0, 210.0), CGSize::new(460.0, 40.0)));
+    bar.set_tabs(
+        vec![TabBarItem {
+            title: "Click me".into(),
+            icon: None,
+        }],
+        0,
+    );
+    bar.show_above(anchor as isize);
+    pump(ui);
+    let number = bar.ns_panel().windowNumber() as u32;
+    let ids = order();
+    println!("foreign anchor {anchor}, AppKit/WindowServer panel {number}");
+    assert!(
+        ids.contains(&number),
+        "AppKit number must identify the real WindowServer panel"
+    );
+    assert!(
+        ids.iter().position(|&id| id == number).unwrap()
+            < ids.iter().position(|&id| id == anchor).unwrap(),
+        "bar must be above the foreign anchor: {ids:?}"
+    );
+    let front = objc2_app_kit::NSWorkspace::sharedWorkspace().frontmostApplication().unwrap();
+    assert_ne!(
+        front.processIdentifier(),
+        std::process::id() as i32,
+        "another application must remain active"
+    );
+    fn post(kind: CGEventType, cocoa: CGPoint) {
+        let p = CGPoint::new(cocoa.x, CGDisplayBounds(CGMainDisplayID()).size.height - cocoa.y);
+        let event = CGEvent::new_mouse_event(None, kind, p, CGMouseButton::Left).unwrap();
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    }
+    fn control(view: &objc2_app_kit::NSView, label: &str) -> Option<Retained<NSControl>> {
+        if view.accessibilityLabel().is_some_and(|s| s.to_string() == label) {
+            return view.downcast_ref::<NSControl>().map(|v| v.retain());
+        }
+        view.subviews().iter().find_map(|v| control(&v, label))
+    }
+    // Post through WindowServer, rather than sendAction or NSWindow.sendEvent.
+    for edge in [
+        TabBarEdge::Top,
+        TabBarEdge::Bottom,
+        TabBarEdge::Left,
+        TabBarEdge::Right,
+    ] {
+        let size = if matches!(edge, TabBarEdge::Top | TabBarEdge::Bottom) {
+            CGSize::new(460.0, 40.0)
+        } else {
+            CGSize::new(40.0, 460.0)
+        };
+        bar.set_edge(edge);
+        bar.set_frame(CGRect::new(CGPoint::new(120.0, 210.0), size));
+        pump(ui);
+        let frame = bar.ns_panel().frame();
+        let center = CGPoint::new(
+            frame.origin.x + size.width / 2.0,
+            frame.origin.y + size.height / 2.0,
+        );
+        post(CGEventType::LeftMouseDown, center);
+        post(CGEventType::LeftMouseUp, center);
+        pump(ui);
+        assert!(
+            matches!(actions.borrow().as_slice(), [TabBarAction::Select(0)]),
+            "real {edge:?} click must reach the native button: {:?}",
+            actions.borrow()
+        );
+        actions.borrow_mut().clear();
+        post(CGEventType::MouseMoved, center);
+        pump(ui);
+        let close = control(&bar.ns_panel().contentView().unwrap(), "Close Click me").unwrap();
+        assert!(!close.isHidden());
+        let point = close.convertPoint_toView(
+            CGPoint::new(close.bounds().size.width / 2.0, close.bounds().size.height / 2.0),
+            None,
+        );
+        let point = CGPoint::new(frame.origin.x + point.x, frame.origin.y + point.y);
+        post(CGEventType::LeftMouseDown, point);
+        post(CGEventType::LeftMouseUp, point);
+        pump(ui);
+        assert!(
+            matches!(actions.borrow().as_slice(), [TabBarAction::Close(0)]),
+            "real {edge:?} close click must reach its own control: {:?}",
+            actions.borrow()
+        );
+        actions.borrow_mut().clear();
+        assert!(!bar.ns_panel().isKeyWindow());
+        assert_eq!(
+            objc2_app_kit::NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .unwrap()
+                .processIdentifier(),
+            front.processIdentifier()
+        );
+    }
+    let unrelated = Window::new(ui).size(CGSize::new(400.0, 300.0));
+    unrelated.ns_window().orderFrontRegardless();
+    pump(ui);
+    bar.show_above(anchor as isize);
+    pump(ui);
+    let ids = order();
+    let position = |id| ids.iter().position(|&wid| wid == id).unwrap();
+    assert!(position(unrelated.ns_window().windowNumber() as u32) < position(number));
+    assert!(
+        position(number) < position(anchor),
+        "relative ordering must leave unrelated windows above the bar"
+    );
+    bar.hide();
+    pump(ui);
+    assert!(!order().contains(&number));
+    bar.show_above(anchor as isize);
+    pump(ui);
+    assert!(bar.is_visible());
+}
+
 fn main() {
     // A single libtest-compatible case lets nextest list this harness without running AppKit.
     if std::env::args().any(|arg| arg == "--list") {
@@ -1572,6 +1778,34 @@ fn main() {
     }
     let ui =
         Ui::new(MainThreadMarker::new().expect("native tests must run on the macOS main thread"));
+    if std::env::args().any(|arg| arg == "--stack-anchor") {
+        use std::io::Write;
+        let app = objc2_app_kit::NSApplication::sharedApplication(ui.mtm());
+        app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+        app.finishLaunching();
+        let window = Window::new(&ui).size(CGSize::new(500.0, 200.0));
+        window.ns_window().setFrame_display(
+            CGRect::new(CGPoint::new(100.0, 200.0), CGSize::new(500.0, 200.0)),
+            true,
+        );
+        // A real foreign WindowServer anchor above existing windows, while the
+        // user's application stays active. No helper activation is required.
+        window.ns_window().orderFrontRegardless();
+        app.updateWindows();
+        objc2_foundation::NSRunLoop::mainRunLoop()
+            .runUntilDate(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.15));
+        println!("{}", window.ns_window().windowNumber());
+        std::io::stdout().flush().unwrap();
+        app.run();
+        return;
+    }
+    if std::env::args().any(|arg| arg == "--stack-line-input") {
+        let app = objc2_app_kit::NSApplication::sharedApplication(ui.mtm());
+        app.setActivationPolicy(NSApplicationActivationPolicy::Prohibited);
+        app.finishLaunching();
+        tab_bar_cross_process_input(&ui);
+        return;
+    }
     if std::env::args().any(|arg| arg == "--layouts") {
         autoreleasepool(|_| {
             inline_hosts_size_only_the_visible_inspector(&ui);

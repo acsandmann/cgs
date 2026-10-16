@@ -1,6 +1,6 @@
 [package]
 name = "cgs"
-version = "0.3.9"
+version = "0.3.10"
 description = "a ui library for macos built on appkit"
 license = "GPL-3.0"
 edition = "2024"
@@ -22,7 +22,9 @@ name = "native"
 harness = false
 
 [dev-dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSDraggingItem"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGWindow", "CGEvent", "CGEventTypes", "CGDirectDisplay"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSDraggingItem", "libc"] }
 
 [package.metadata.docs.rs]
 default-target = "aarch64-apple-darwin"

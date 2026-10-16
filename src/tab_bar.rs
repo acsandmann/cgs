@@ -309,22 +309,29 @@ impl TabContent {
             let x = INSET + i as f64 * (tab_width + GAP) - offset;
             let button = tab.select.ns_button();
             let frame = self.place(x, INSET, tab_width, thickness - 2.0 * INSET);
-            button.setFrame(frame);
+            if button.frame() != frame {
+                button.setFrame(frame);
+            }
             let visual_frame = self.place(x, 0.0, tab_width, thickness);
             let upward = s.upward.get();
-            if tab.visual.ivars().vertical.replace(vertical) != vertical
-                || tab.visual.ivars().upward.replace(upward) != upward
-            {
+            let vertical_changed = tab.visual.ivars().vertical.replace(vertical) != vertical;
+            let upward_changed = tab.visual.ivars().upward.replace(upward) != upward;
+            if vertical_changed || upward_changed {
                 tab.visual.setNeedsDisplay(true);
             }
             if tab.visual.frame() != visual_frame {
                 let layer = tab.visual.layer().unwrap();
-                let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
-                let had_size = from.bounds().size.width > 0.0 && from.bounds().size.height > 0.0;
-                let old_position = layer_value(&from, "position");
-                let old_bounds = layer_value(&from, "bounds");
+                let animation = animate.then(|| {
+                    let from =
+                        unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
+                    (
+                        from.bounds().size.width > 0.0 && from.bounds().size.height > 0.0,
+                        layer_value(&from, "position"),
+                        layer_value(&from, "bounds"),
+                    )
+                });
                 without_actions(|| tab.visual.setFrame(visual_frame));
-                if animate && had_size {
+                if let Some((true, old_position, old_bounds)) = animation {
                     animate_value(&layer, "position", old_position.as_deref(), 0.20);
                     animate_value(&layer, "bounds", old_bounds.as_deref(), 0.20);
                 } else if !animate {
@@ -340,9 +347,9 @@ impl TabContent {
                 0
             };
             let separator = self.separated(i);
-            if tab.visual.ivars().style.replace(style) != style
-                || tab.visual.ivars().separator.replace(separator) != separator
-            {
+            let style_changed = tab.visual.ivars().style.replace(style) != style;
+            let separator_changed = tab.visual.ivars().separator.replace(separator) != separator;
+            if style_changed || separator_changed {
                 tab.visual.setNeedsDisplay(true);
             }
             button.setAccessibilitySelected(active);
@@ -396,17 +403,20 @@ impl TabContent {
             outer.setCornerRadius(thickness / 2.0);
         }
         let was_hidden = layer.isHidden();
-        let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
-        let position = layer_value(&from, "position");
-        let bounds = layer_value(&from, "bounds");
         let changed = target.is_some_and(|target| target != layer.frame());
+        let animation = (animate && !was_hidden && changed).then(|| {
+            let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
+            (layer_value(&from, "position"), layer_value(&from, "bounds"))
+        });
         without_actions(|| {
-            layer.setHidden(target.is_none());
-            if let Some(target) = target {
+            if was_hidden != target.is_none() {
+                layer.setHidden(target.is_none());
+            }
+            if let Some(target) = target.filter(|_| changed) {
                 layer.setFrame(target);
             }
         });
-        if animate && !was_hidden && changed {
+        if let Some((position, bounds)) = animation {
             animate_value(layer, "position", position.as_deref(), 0.18);
             animate_value(layer, "bounds", bounds.as_deref(), 0.18);
         } else if !animate && changed {
@@ -520,7 +530,8 @@ fn animate_value(layer: &CALayer, key: &str, from: Option<&AnyObject>, duration:
     let animation = CABasicAnimation::animationWithKeyPath(Some(&key));
     unsafe {
         animation.setFromValue(from);
-        animation.setToValue(layer_value(layer, &key.to_string()).as_deref());
+        let to: Option<Retained<AnyObject>> = msg_send![layer, valueForKey: &*key];
+        animation.setToValue(to.as_deref());
     }
     animation.setDuration(duration);
     animation.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
@@ -790,20 +801,8 @@ impl TabBar {
                     .zip(&items)
                     .all(|(tab, item)| tab.title == item.title && tab.icon == item.icon)
             {
-                let previous = s.selected.replace(selected);
-                if previous == selected {
-                    return;
-                }
                 drop(tabs);
-                // Reveal may change every frame during overflow. Otherwise only two
-                // cached labels and capsules need redrawing; controls remain unchanged.
-                self.content.arrange(true, false, self.motion_enabled());
-                let tabs = s.tabs.borrow();
-                for index in [previous, selected] {
-                    if let Some(tab) = tabs.get(index) {
-                        tab.visual.setNeedsDisplay(true);
-                    }
-                }
+                self.set_selected_index(selected);
                 return;
             }
         }
@@ -814,10 +813,17 @@ impl TabBar {
         }
         let mut tabs = s.tabs.borrow_mut();
         let mut old: Vec<_> = tabs.drain(..).map(Some).collect();
+        let mut first_remaining = 0;
         for (i, item) in items.into_iter().enumerate() {
-            let existing = old.iter().position(|tab| {
-                tab.as_ref().is_some_and(|tab| tab.title == item.title && tab.icon == item.icon)
-            });
+            while first_remaining < old.len() && old[first_remaining].is_none() {
+                first_remaining += 1;
+            }
+            let existing = old[first_remaining..]
+                .iter()
+                .position(|tab| {
+                    tab.as_ref().is_some_and(|tab| tab.title == item.title && tab.icon == item.icon)
+                })
+                .map(|index| first_remaining + index);
             if let Some(tab) = existing.and_then(|index| old[index].take()).or_else(|| {
                 if !count_changed {
                     old.get_mut(i).and_then(Option::take)
@@ -967,6 +973,17 @@ impl TabBar {
             s.close_hovered.set(None);
         }
         self.content.arrange(true, true, animate);
+    }
+
+    /// Update selection without replacing or cloning the tab items.
+    /// An index outside the tab list leaves no tab selected.
+    pub fn set_selected_index(&self, selected: usize) {
+        let s = self.content.ivars();
+        if s.selected.replace(selected) == selected {
+            return;
+        }
+        // arrange updates selection styling and separators, and reveals overflow.
+        self.content.arrange(true, false, self.motion_enabled());
     }
 
     fn motion_enabled(&self) -> bool {
