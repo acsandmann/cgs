@@ -9,7 +9,7 @@
 //! --frame=X,Y,WIDTH positions that overlay in AppKit screen coordinates.
 //! --active-reference --embedded activates only the separate reference window.
 //! --diagnostics reports actual focus state on display and every action.
-//! Preview controls add a tab, rapidly retarget selection, and resize the strip.
+//! Drag a tab along the strip to reorder it. Preview controls add a tab, rapidly retarget selection, and resize the strip.
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -105,6 +105,24 @@ fn main() {
                     });
                 }
             }
+            TabBarAction::Move { from, to } => {
+                let mut names = names.borrow_mut();
+                let title = names.remove(from);
+                names.insert(to, title);
+                let previous = selection.get();
+                selection.set(if previous == from {
+                    to
+                } else if from < previous && previous <= to {
+                    previous - 1
+                } else if to <= previous && previous < from {
+                    previous + 1
+                } else {
+                    previous
+                });
+            }
+        }
+        if diagnostics {
+            println!("{action:?}");
         }
         if let Some(slot) = weak.upgrade() {
             if let Some(bar) = slot.borrow().as_ref() {

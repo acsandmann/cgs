@@ -11,7 +11,8 @@ use objc2::{AnyThread, ClassType, DefinedClass, MainThreadOnly, Message, define_
 use objc2_app_kit::*;
 use objc2_foundation::{NSAttributedString, NSDictionary, NSString};
 use objc2_quartz_core::{
-    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CATransaction,
+    CABasicAnimation, CALayer, CAMediaTiming, CAMediaTimingFunction, CASpringAnimation,
+    CATransaction,
 };
 
 use crate::{
@@ -34,6 +35,27 @@ pub enum TabBarEdge {
 pub enum TabBarAction {
     Select(usize),
     Close(usize),
+    /// The tab at `from` was dragged to `to`. The strip already shows the new order.
+    Move {
+        from: usize,
+        to: usize,
+    },
+}
+/// A press on a tab that may become a drag.
+#[derive(Clone, Copy)]
+struct Press {
+    index: usize,
+    origin: CGPoint,
+    /// Pointer offset from the tab's leading edge along the tab axis.
+    grab: f64,
+}
+/// A tab following the pointer. Other tabs make room for it at `slot`.
+#[derive(Clone, Copy)]
+struct Drag {
+    from: usize,
+    slot: usize,
+    /// Leading edge of the dragged tab along the tab axis.
+    main: f64,
 }
 struct ActionState {
     callback: RefCell<Option<Box<dyn FnMut(TabBarAction)>>>,
@@ -60,6 +82,16 @@ struct Content {
     action: Action,
     viewport: Retained<NSView>,
     highlight: Retained<CALayer>,
+    press: Cell<Option<Press>>,
+    drag: Cell<Option<Drag>>,
+    /// A raised thumb carried under the dragged tab, then settled into its slot.
+    lift: Retained<CALayer>,
+    /// The tab riding the lift, while dragged and until it lands.
+    lifting: Cell<Option<usize>>,
+    /// Invalidates the landing of an earlier drag.
+    lift_epoch: Cell<u64>,
+    /// Use springs, as for tabs moving under the pointer, rather than the eased default.
+    springy: Cell<bool>,
     retiring: Retained<NSView>,
     fonts: [Retained<NSFont>; 2],
     text_colors: [Retained<NSColor>; 2],
@@ -148,6 +180,48 @@ define_class!(
                 Some(self), None) };
             self.addTrackingArea(&area);
         }
+        // Tabs track their own presses so they can be dragged; close buttons stay controls.
+        // The views returned are owned by the view hierarchy, which outlives the call.
+        #[unsafe(method(hitTest:))] fn hit(&self, point: CGPoint) -> *mut NSView {
+            let hit: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
+            let s = self.ivars();
+            let tab = std::ptr::eq(hit, &*s.viewport)
+                || s.tabs.try_borrow().is_ok_and(|tabs| {
+                    tabs.iter().any(|tab| std::ptr::eq(hit, tab.select.ns_view()))
+                });
+            if tab { (self as *const Self).cast_mut().cast() } else { hit }
+        }
+        // The strip sits over other apps' windows; the first click must act.
+        #[unsafe(method(acceptsFirstMouse:))] fn first_mouse(&self, _: Option<&NSEvent>) -> bool { true }
+        #[unsafe(method(mouseDownCanMoveWindow))] fn moves_window(&self) -> bool { false }
+        #[unsafe(method(mouseDown:))] fn down(&self, event: &NSEvent) {
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            self.cancel_drag();
+            let Some(index) = self.index_at(p) else { return; };
+            let start = self.slot_start(index);
+            self.ivars().press.set(Some(Press { index, origin: p, grab: self.main_of(p) - start }));
+        }
+        #[unsafe(method(mouseDragged:))] fn dragged(&self, event: &NSEvent) {
+            let s = self.ivars();
+            let Some(press) = s.press.get() else { return; };
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if s.drag.get().is_none() {
+                let moved = (p.x - press.origin.x).hypot(p.y - press.origin.y);
+                if moved < DRAG_THRESHOLD || s.tabs.borrow().len() < 2 { return; }
+                self.begin_drag(press);
+            }
+            self.drag_to(self.main_of(p) - press.grab);
+        }
+        #[unsafe(method(mouseUp:))] fn up(&self, event: &NSEvent) {
+            let s = self.ivars();
+            let Some(press) = s.press.take() else { return; };
+            let p = self.convertPoint_fromView(event.locationInWindow(), None);
+            if s.drag.get().is_some() {
+                self.end_drag(p);
+            } else if self.index_at(p) == Some(press.index) {
+                emit(&s.action, TabBarAction::Select(press.index));
+            }
+        }
         #[unsafe(method(mouseEntered:))] fn entered(&self, event: &NSEvent) { self.mouseMoved(event); }
         #[unsafe(method(mouseMoved:))] fn moved(&self, event: &NSEvent) {
             let p = self.convertPoint_fromView(event.locationInWindow(), None);
@@ -223,7 +297,233 @@ impl TabContent {
     fn separated(&self, index: usize) -> bool {
         let s = self.ivars();
         let plain = |i: usize| s.selected.get() != i && s.hovered.get() != Some(i);
-        index > 0 && plain(index) && plain(index - 1)
+        // Hairlines would slide between moving tabs; leave them out until the drop lands.
+        s.lifting.get().is_none() && index > 0 && plain(index) && plain(index - 1)
+    }
+
+    fn main_of(&self, p: CGPoint) -> f64 {
+        if self.ivars().vertical.get() {
+            p.y
+        } else {
+            p.x
+        }
+    }
+
+    /// Leading edge of a slot along the tab axis, in view coordinates.
+    fn slot_start(&self, slot: usize) -> f64 {
+        let (_, _, tab_width) = self.geometry();
+        INSET + slot as f64 * (tab_width + GAP) - self.ivars().offset.get()
+    }
+
+    /// Where a tab sits while another is dragged: the dragged tab takes its slot and
+    /// those it passed over close the gap it left.
+    fn display_slot(&self, index: usize) -> usize {
+        match self.ivars().drag.get() {
+            Some(Drag { from, slot, .. }) if index == from => slot,
+            Some(Drag { from, slot, .. }) if from < slot && (from + 1..=slot).contains(&index) => {
+                index - 1
+            }
+            Some(Drag { from, slot, .. }) if slot < from && (slot..from).contains(&index) => {
+                index + 1
+            }
+            _ => index,
+        }
+    }
+
+    fn motion_enabled(&self) -> bool {
+        self.window().is_some_and(|window| window.isVisible())
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    }
+
+    /// Lift the pressed tab out of the strip once the pointer has moved far enough.
+    fn begin_drag(&self, press: Press) {
+        let s = self.ivars();
+        s.drag.set(Some(Drag {
+            from: press.index,
+            slot: press.index,
+            main: self.slot_start(press.index),
+        }));
+        s.lift_epoch.set(s.lift_epoch.get() + 1);
+        s.lifting.set(Some(press.index));
+        s.hovered.set(None);
+        s.close_hovered.set(None);
+        haptic(NSHapticFeedbackPattern::Generic);
+        let motion = self.motion_enabled();
+        let selected = press.index == s.selected.get();
+        let lift = &s.lift;
+        let rest = self.lift_shadow(false);
+        without_actions(|| {
+            lift.removeAllAnimations();
+            lift.setHidden(false);
+            lift.setOpacity(1.0);
+            self.set_lift_shadow(self.lift_shadow(true));
+            if let Some(layer) = s.tabs.borrow()[press.index].visual.layer() {
+                layer.setZPosition(2.0);
+            }
+        });
+        if motion {
+            // The selected thumb rises in place; any other tab gains one as it lifts.
+            if !selected {
+                let zero = objc2_foundation::NSNumber::new_f32(0.0);
+                animate_value(lift, "opacity", Some(&zero), 0.12);
+            }
+            self.animate_lift_shadow(rest, 0.16, false);
+        }
+        self.arrange(false, false, motion);
+    }
+
+    fn drag_to(&self, main: f64) {
+        let s = self.ivars();
+        let Some(mut drag) = s.drag.get() else {
+            return;
+        };
+        let (length, _, tab_width) = self.geometry();
+        let count = s.tabs.borrow().len();
+        // Scroll an overflowing strip while the tab is held against one of its ends.
+        let max = (count as f64 * (tab_width + GAP) - GAP + 2.0 * INSET - length).max(0.0);
+        let before = s.offset.get();
+        if main < INSET {
+            s.offset.set((before - (INSET - main) * 0.5).max(0.0));
+        } else if main + tab_width > length - INSET {
+            s.offset.set((before + (main + tab_width - length + INSET) * 0.5).min(max));
+        }
+        let first = self.slot_start(0);
+        let last = self.slot_start(count - 1);
+        // Resist travel past either end rather than stopping dead, as a scroll view does.
+        drag.main = if main < first {
+            first - rubber_band(first - main)
+        } else if main > last {
+            last + rubber_band(main - last)
+        } else {
+            main
+        };
+        let slot = ((drag.main - first) / (tab_width + GAP)).round().clamp(0.0, (count - 1) as f64)
+            as usize;
+        if slot != drag.slot {
+            drag.slot = slot;
+            haptic(NSHapticFeedbackPattern::Alignment);
+        }
+        s.drag.set(Some(drag));
+        self.arrange(false, false, self.motion_enabled());
+    }
+
+    /// Drop the dragged tab into its slot, commit the order, and report the move.
+    fn end_drag(&self, p: CGPoint) {
+        let s = self.ivars();
+        let Some(Drag { from, slot: to, .. }) = s.drag.take() else {
+            return;
+        };
+        if from != to {
+            let mut tabs = s.tabs.borrow_mut();
+            let tab = tabs.remove(from);
+            tabs.insert(to, tab);
+            for (i, tab) in tabs.iter().enumerate() {
+                tab.index.set(i);
+            }
+            s.selected.set(moved_index(s.selected.get(), from, to));
+        }
+        s.lifting.set(Some(to));
+        s.hovered.set(self.index_at(p));
+        let motion = self.motion_enabled();
+        let epoch = s.lift_epoch.get();
+        let content = self.retain();
+        CATransaction::begin();
+        let land = block2::RcBlock::new(move || content.land(epoch));
+        unsafe {
+            CATransaction::setCompletionBlock(Some(&land));
+        }
+        s.springy.set(true);
+        self.arrange(false, true, motion);
+        s.springy.set(false);
+        if motion {
+            let to_selected = s.selected.get() == to;
+            // The selected thumb settles back into the strip; another tab's dissolves.
+            self.animate_lift_shadow(self.lift_shadow(true), 0.24, true);
+            if !to_selected {
+                let one = objc2_foundation::NSNumber::new_f32(1.0);
+                without_actions(|| s.lift.setOpacity(0.0));
+                animate_value(&s.lift, "opacity", Some(&one), 0.24);
+            }
+        }
+        CATransaction::commit();
+        if from != to {
+            haptic(NSHapticFeedbackPattern::LevelChange);
+            emit(&s.action, TabBarAction::Move { from, to });
+        }
+    }
+
+    /// The dropped tab has landed: hand the selection back to the strip's own thumb.
+    fn land(&self, epoch: u64) {
+        let s = self.ivars();
+        if s.lift_epoch.get() != epoch || s.drag.get().is_some() {
+            return;
+        }
+        self.clear_lift();
+        self.arrange(false, false, false);
+    }
+
+    fn cancel_drag(&self) {
+        let s = self.ivars();
+        s.press.set(None);
+        if s.drag.take().is_some() || s.lifting.get().is_some() {
+            s.lift_epoch.set(s.lift_epoch.get() + 1);
+            self.clear_lift();
+            self.arrange(false, false, false);
+        }
+    }
+
+    fn clear_lift(&self) {
+        let s = self.ivars();
+        s.lifting.set(None);
+        without_actions(|| {
+            s.lift.removeAllAnimations();
+            s.lift.setHidden(true);
+            if let Ok(tabs) = s.tabs.try_borrow() {
+                for tab in tabs.iter() {
+                    if let Some(layer) = tab.visual.layer() {
+                        layer.setZPosition(0.0);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Shadow opacity, radius, and downward offset of the thumb, raised or at rest.
+    fn lift_shadow(&self, lifted: bool) -> (f32, f64, f64) {
+        let opaque = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency();
+        let dark = dark(self);
+        let opacity = match (opaque, dark, lifted) {
+            (true, ..) => 0.0,
+            (false, true, true) => 0.5,
+            (false, false, true) => 0.22,
+            (false, true, false) => 0.3,
+            (false, false, false) => 0.2,
+        };
+        match (dark, lifted) {
+            (_, true) => (opacity, 6.0, 3.0),
+            (true, false) => (opacity, 2.0, 1.0),
+            (false, false) => (opacity, 1.5, 1.0),
+        }
+    }
+
+    fn set_lift_shadow(&self, (opacity, radius, offset): (f32, f64, f64)) {
+        let lift = &self.ivars().lift;
+        lift.setShadowOpacity(opacity);
+        lift.setShadowRadius(radius);
+        lift.setShadowOffset(CGSize::new(0.0, offset));
+    }
+
+    /// Animate the shadow from `from` to its raised (or, when `settling`, resting) model.
+    fn animate_lift_shadow(&self, from: (f32, f64, f64), duration: f64, settling: bool) {
+        let lift = &self.ivars().lift;
+        without_actions(|| self.set_lift_shadow(self.lift_shadow(!settling)));
+        let (opacity, radius, offset) = from;
+        let opacity = objc2_foundation::NSNumber::new_f32(opacity);
+        let radius = objc2_foundation::NSNumber::new_f64(radius);
+        let offset = objc2_foundation::NSValue::new::<CGSize>(CGSize::new(0.0, offset));
+        animate_value(lift, "shadowOpacity", Some(&opacity), duration);
+        animate_value(lift, "shadowRadius", Some(&radius), duration);
+        animate_value(lift, "shadowOffset", Some(&offset), duration);
     }
 
     /// Bar length along the tab axis, bar thickness across it, and the length of one tab.
@@ -303,16 +603,26 @@ impl TabContent {
             s.retiring.setFrame(viewport_frame);
         }
         let close_fill = s.close_fill.borrow();
+        let drag = s.drag.get();
+        let springy = s.springy.get() || drag.is_some();
+        let mut lift_target = None;
         for (i, tab) in tabs.iter_mut().enumerate() {
             let active = i == s.selected.get();
             let hover = s.hovered.get() == Some(i);
-            let x = INSET + i as f64 * (tab_width + GAP) - offset;
+            let lifted = s.lifting.get() == Some(i);
+            let x = INSET + self.display_slot(i) as f64 * (tab_width + GAP) - offset;
+            // The dragged tab follows the pointer rather than its slot.
+            let held = drag.filter(|drag| drag.from == i).map(|drag| drag.main);
+            let visual_x = held.unwrap_or(x);
             let button = tab.select.ns_button();
             let frame = self.place(x, INSET, tab_width, thickness - 2.0 * INSET);
             if button.frame() != frame {
                 button.setFrame(frame);
             }
-            let visual_frame = self.place(x, 0.0, tab_width, thickness);
+            let visual_frame = self.place(visual_x, 0.0, tab_width, thickness);
+            if lifted {
+                lift_target = Some(self.place(visual_x, INSET, tab_width, thickness - 2.0 * INSET));
+            }
             let upward = s.upward.get();
             let vertical_changed = tab.visual.ivars().vertical.replace(vertical) != vertical;
             let upward_changed = tab.visual.ivars().upward.replace(upward) != upward;
@@ -321,6 +631,7 @@ impl TabContent {
             }
             if tab.visual.frame() != visual_frame {
                 let layer = tab.visual.layer().unwrap();
+                let animate = animate && held.is_none();
                 let animation = animate.then(|| {
                     let from =
                         unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
@@ -332,14 +643,19 @@ impl TabContent {
                 });
                 without_actions(|| tab.visual.setFrame(visual_frame));
                 if let Some((true, old_position, old_bounds)) = animation {
-                    animate_value(&layer, "position", old_position.as_deref(), 0.20);
-                    animate_value(&layer, "bounds", old_bounds.as_deref(), 0.20);
+                    if springy {
+                        spring_value(&layer, "position", old_position.as_deref());
+                        spring_value(&layer, "bounds", old_bounds.as_deref());
+                    } else {
+                        animate_value(&layer, "position", old_position.as_deref(), 0.20);
+                        animate_value(&layer, "bounds", old_bounds.as_deref(), 0.20);
+                    }
                 } else if !animate {
                     layer.removeAllAnimations();
                 }
                 tab.visual.setNeedsDisplay(true);
             }
-            let style = if active {
+            let style = if active || lifted {
                 2
             } else if hover {
                 1
@@ -396,30 +712,56 @@ impl TabContent {
         let layer = &s.highlight;
         let radius = (thickness / 2.0 - INSET).max(0.0);
         if layer.cornerRadius() != radius {
-            without_actions(|| layer.setCornerRadius(radius));
+            without_actions(|| {
+                layer.setCornerRadius(radius);
+                s.lift.setCornerRadius(radius);
+            });
+        }
+        if let Some(target) = lift_target.filter(|&target| target != s.lift.frame()) {
+            let from = (animate && drag.is_none()).then(|| {
+                let from = unsafe { s.lift.presentationLayer() }.unwrap_or_else(|| s.lift.retain());
+                (layer_value(&from, "position"), layer_value(&from, "bounds"))
+            });
+            without_actions(|| s.lift.setFrame(target));
+            if let Some((position, bounds)) = from {
+                spring_value(&s.lift, "position", position.as_deref());
+                spring_value(&s.lift, "bounds", bounds.as_deref());
+            } else {
+                s.lift.removeAnimationForKey(&NSString::from_str("position"));
+                s.lift.removeAnimationForKey(&NSString::from_str("bounds"));
+            }
         }
         // Concentric with the outer capsule, whose radius follows the bar's thickness.
         if let Some(outer) = self.layer() {
             outer.setCornerRadius(thickness / 2.0);
         }
+        // The lift stands in for the thumb while the selected tab is carried; the thumb
+        // waits, hidden, in the slot where it lands.
+        let carried = s.lifting.get().is_some_and(|i| i == s.selected.get());
+        let hidden = target.is_none() || carried;
         let was_hidden = layer.isHidden();
         let changed = target.is_some_and(|target| target != layer.frame());
-        let animation = (animate && !was_hidden && changed).then(|| {
+        let animation = (animate && !was_hidden && !hidden && changed).then(|| {
             let from = unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain());
             (layer_value(&from, "position"), layer_value(&from, "bounds"))
         });
         without_actions(|| {
-            if was_hidden != target.is_none() {
-                layer.setHidden(target.is_none());
+            if was_hidden != hidden {
+                layer.setHidden(hidden);
             }
             if let Some(target) = target.filter(|_| changed) {
                 layer.setFrame(target);
             }
         });
         if let Some((position, bounds)) = animation {
-            animate_value(layer, "position", position.as_deref(), 0.18);
-            animate_value(layer, "bounds", bounds.as_deref(), 0.18);
-        } else if !animate && changed {
+            if springy {
+                spring_value(layer, "position", position.as_deref());
+                spring_value(layer, "bounds", bounds.as_deref());
+            } else {
+                animate_value(layer, "position", position.as_deref(), 0.18);
+                animate_value(layer, "bounds", bounds.as_deref(), 0.18);
+            }
+        } else if (!animate || hidden) && changed {
             layer.removeAllAnimations();
         }
         if redraw {
@@ -432,6 +774,8 @@ impl TabContent {
 const INSET: f64 = 3.0;
 const GAP: f64 = 2.0;
 const CLOSE: f64 = 15.0;
+/// How far a pressed tab must travel before it lifts, as for AppKit drags.
+const DRAG_THRESHOLD: f64 = 4.0;
 struct Visual {
     labels: RefCell<Vec<(Retained<NSAttributedString>, CGSize)>>,
     icon: RefCell<Image>,
@@ -539,6 +883,43 @@ fn animate_value(layer: &CALayer, key: &str, from: Option<&AnyObject>, duration:
     )));
     layer.addAnimation_forKey(&animation, Some(&key));
 }
+/// A critically damped spring, as AppKit uses for content that follows the pointer.
+fn spring_value(layer: &CALayer, key: &str, from: Option<&AnyObject>) {
+    let key = NSString::from_str(key);
+    let animation = CASpringAnimation::animationWithKeyPath(Some(&key));
+    unsafe {
+        animation.setFromValue(from);
+        let to: Option<Retained<AnyObject>> = msg_send![layer, valueForKey: &*key];
+        animation.setToValue(to.as_deref());
+    }
+    animation.setMass(1.0);
+    animation.setStiffness(380.0);
+    animation.setDamping(39.0);
+    animation.setDuration(animation.settlingDuration());
+    layer.addAnimation_forKey(&animation, Some(&key));
+}
+/// Force Touch trackpads tap; other hardware ignores the request.
+fn haptic(pattern: NSHapticFeedbackPattern) {
+    NSHapticFeedbackManager::defaultPerformer()
+        .performFeedbackPattern_performanceTime(pattern, NSHapticFeedbackPerformanceTime::Now);
+}
+/// AppKit's scroll-edge resistance: travel grows ever more slowly toward a limit.
+fn rubber_band(distance: f64) -> f64 {
+    const LIMIT: f64 = 18.0;
+    LIMIT * (1.0 - 1.0 / (distance * 0.55 / LIMIT + 1.0))
+}
+/// Where the tab at `index` ends up once the tab at `from` moves to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < to && (from + 1..=to).contains(&index) {
+        index - 1
+    } else if to < from && (to..from).contains(&index) {
+        index + 1
+    } else {
+        index
+    }
+}
 impl TabContent {
     fn update_material(&self) {
         let s = self.ivars();
@@ -582,11 +963,17 @@ impl TabContent {
                     });
                     s.highlight.setShadowRadius(if dark { 2.0 } else { 1.5 });
                     s.highlight.setShadowOffset(CGSize::new(0.0, 1.0));
+                    s.lift.setBackgroundColor(s.highlight.backgroundColor().as_deref());
+                    s.lift.setBorderWidth(s.highlight.borderWidth());
+                    s.lift.setBorderColor(s.highlight.borderColor().as_deref());
+                    s.lift.setShadowColor(s.highlight.shadowColor().as_deref());
+                    self.set_lift_shadow(self.lift_shadow(s.lifting.get().is_some()));
                 })
             }));
     }
 
     fn stop_motion(&self) {
+        self.cancel_drag();
         self.ivars().highlight.removeAllAnimations();
         for tab in self.ivars().tabs.borrow().iter() {
             tab.visual.layer().unwrap().removeAllAnimations();
@@ -659,6 +1046,14 @@ impl TabBar {
         highlight.setCornerRadius(TabBar::HEIGHT / 2.0 - INSET);
         highlight.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
         highlight.setHidden(true);
+        let lift = CALayer::new();
+        lift.setCornerRadius(TabBar::HEIGHT / 2.0 - INSET);
+        lift.setCornerCurve(unsafe { objc2_quartz_core::kCACornerCurveContinuous });
+        lift.setZPosition(1.0);
+        lift.setHidden(true);
+        if let Some(layer) = viewport.layer() {
+            layer.addSublayer(&lift);
+        }
         let retiring: Retained<TabVisual> = unsafe {
             msg_send![
                 super(TabVisual::alloc(ui.mtm()).set_ivars(Visual {
@@ -687,6 +1082,12 @@ impl TabBar {
                     action,
                     viewport,
                     highlight,
+                    press: Cell::new(None),
+                    drag: Cell::new(None),
+                    lift,
+                    lifting: Cell::new(None),
+                    lift_epoch: Cell::new(0),
+                    springy: Cell::new(false),
                     retiring,
                     fonts: {
                         [
@@ -806,6 +1207,19 @@ impl TabBar {
                 return;
             }
         }
+        // A held or landing tab keeps its place through relabelling, such as a terminal's
+        // animated title. Only a change in the tabs themselves ends the drag.
+        let held = s.drag.get().is_some() || s.lifting.get().is_some();
+        if held && s.tabs.borrow().len() == items.len() {
+            let mut tabs = s.tabs.borrow_mut();
+            for (tab, item) in tabs.iter_mut().zip(items) {
+                self.update_item(tab, item);
+            }
+            drop(tabs);
+            self.set_selected_index(selected);
+            return;
+        }
+        self.content.cancel_drag();
         let animate = self.motion_enabled();
         let count_changed = s.tabs.borrow().len() != items.len();
         for view in s.retiring.subviews() {
@@ -895,51 +1309,7 @@ impl TabBar {
             }
             let tab = &mut tabs[i];
             tab.index.set(i);
-            if tab.title != item.title || tab.visual.ivars().labels.borrow().is_empty() {
-                tab.select.set_title(&item.title);
-                let paragraph = NSMutableParagraphStyle::new();
-                paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-                if item.title.contains('/') || item.title.contains('\\') {
-                    paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
-                }
-                let labels = (0..3)
-                    .map(|style| {
-                        let attrs = NSDictionary::from_slices(
-                            &[
-                                unsafe { NSFontAttributeName },
-                                unsafe { NSForegroundColorAttributeName },
-                                unsafe { NSParagraphStyleAttributeName },
-                            ],
-                            &[
-                                &*s.fonts[usize::from(style == 2)] as &AnyObject,
-                                &*s.text_colors[usize::from(style != 0)] as &AnyObject,
-                                &*paragraph as &AnyObject,
-                            ],
-                        );
-                        let label = unsafe {
-                            NSAttributedString::initWithString_attributes(
-                                NSAttributedString::alloc(),
-                                &NSString::from_str(&item.title),
-                                Some(&attrs),
-                            )
-                        };
-                        let size = label.size();
-                        (label, size)
-                    })
-                    .collect();
-                tab.select.accessibility_label(&item.title);
-                tab.select.tooltip(&item.title);
-                tab.close.accessibility_label(&format!("Close {}", item.title));
-                *tab.visual.ivars().labels.borrow_mut() = labels;
-                tab.visual.setNeedsDisplay(true);
-                tab.title = item.title;
-            }
-            if tab.icon != item.icon {
-                *tab.visual.ivars().icon.borrow_mut() =
-                    item.icon.as_ref().unwrap_or(&s.placeholder).retain();
-                tab.visual.setNeedsDisplay(true);
-                tab.icon = item.icon;
-            }
+            self.update_item(tab, item);
         }
         for tab in old.into_iter().flatten() {
             tab.select.ns_view().removeFromSuperview();
@@ -975,6 +1345,56 @@ impl TabBar {
         self.content.arrange(true, true, animate);
     }
 
+    /// Bring a tab's label, tooltip, accessibility and icon up to date with its item.
+    fn update_item(&self, tab: &mut Tab, item: TabBarItem) {
+        let s = self.content.ivars();
+        if tab.title != item.title || tab.visual.ivars().labels.borrow().is_empty() {
+            tab.select.set_title(&item.title);
+            let paragraph = NSMutableParagraphStyle::new();
+            paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            if item.title.contains('/') || item.title.contains('\\') {
+                paragraph.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+            }
+            let labels = (0..3)
+                .map(|style| {
+                    let attrs = NSDictionary::from_slices(
+                        &[
+                            unsafe { NSFontAttributeName },
+                            unsafe { NSForegroundColorAttributeName },
+                            unsafe { NSParagraphStyleAttributeName },
+                        ],
+                        &[
+                            &*s.fonts[usize::from(style == 2)] as &AnyObject,
+                            &*s.text_colors[usize::from(style != 0)] as &AnyObject,
+                            &*paragraph as &AnyObject,
+                        ],
+                    );
+                    let label = unsafe {
+                        NSAttributedString::initWithString_attributes(
+                            NSAttributedString::alloc(),
+                            &NSString::from_str(&item.title),
+                            Some(&attrs),
+                        )
+                    };
+                    let size = label.size();
+                    (label, size)
+                })
+                .collect();
+            tab.select.accessibility_label(&item.title);
+            tab.select.tooltip(&item.title);
+            tab.close.accessibility_label(&format!("Close {}", item.title));
+            *tab.visual.ivars().labels.borrow_mut() = labels;
+            tab.visual.setNeedsDisplay(true);
+            tab.title = item.title;
+        }
+        if tab.icon != item.icon {
+            *tab.visual.ivars().icon.borrow_mut() =
+                item.icon.as_ref().unwrap_or(&s.placeholder).retain();
+            tab.visual.setNeedsDisplay(true);
+            tab.icon = item.icon;
+        }
+    }
+
     /// Update selection without replacing or cloning the tab items.
     /// An index outside the tab list leaves no tab selected.
     pub fn set_selected_index(&self, selected: usize) {
@@ -986,10 +1406,7 @@ impl TabBar {
         self.content.arrange(true, false, self.motion_enabled());
     }
 
-    fn motion_enabled(&self) -> bool {
-        self.content.window().is_some_and(|window| window.isVisible())
-            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
-    }
+    fn motion_enabled(&self) -> bool { self.content.motion_enabled() }
 
     /// Select a tab as soon as the pointer enters it, rather than on click.
     pub fn set_select_on_hover(&self, enabled: bool) {

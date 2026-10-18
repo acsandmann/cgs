@@ -1322,8 +1322,8 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
         );
         assert_eq!(
             content.hitTest(point).as_deref(),
-            Some(second_control.as_super()),
-            "transitioning visuals must not intercept the new logical tab region"
+            Some(&*content),
+            "tabs, not their transitioning visuals, take presses in the new logical region"
         );
         actions.borrow_mut().clear();
         action(&second_control);
@@ -1373,6 +1373,145 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
     });
     assert!(weak.load().is_none(), "tab panel must release on teardown");
     assert_eq!(Rc::strong_count(&actions), 1, "callback must release");
+}
+
+fn tab_bar_drag_reorders_tabs(ui: &Ui, edge: TabBarEdge) {
+    let vertical = matches!(edge, TabBarEdge::Left | TabBarEdge::Right);
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let received = actions.clone();
+    let bar = TabBar::new(ui).on_action(move |a| received.borrow_mut().push(a));
+    let items = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| TabBarItem {
+                title: (*name).into(),
+                icon: None,
+            })
+            .collect()
+    };
+    bar.set_edge(edge);
+    let size = if vertical {
+        CGSize::new(28.0, 460.0)
+    } else {
+        CGSize::new(460.0, 28.0)
+    };
+    bar.set_frame(CGRect::new(CGPoint::new(0.0, 0.0), size));
+    bar.set_tabs(items(&["First", "Second", "Third"]), 0);
+    let surface = bar.ns_panel().contentView().unwrap();
+    surface.layoutSubtreeIfNeeded();
+    fn find(view: &objc2_app_kit::NSView, label: &str) -> Option<Retained<objc2_app_kit::NSView>> {
+        if view.accessibilityLabel().is_some_and(|l| l.to_string() == label) {
+            return Some(view.retain());
+        }
+        view.subviews().iter().find_map(|child| find(&child, label))
+    }
+    let content = find(&surface, "Window tabs").unwrap();
+    let number = bar.ns_panel().windowNumber();
+    let mouse = |kind: NSEventType, x: f64| {
+        let point = if vertical {
+            CGPoint::new(14.0, x)
+        } else {
+            CGPoint::new(x, 14.0)
+        };
+        let location = content.convertPoint_toView(point, None);
+        let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+            kind, location, objc2_app_kit::NSEventModifierFlags::empty(), 0.0, number, None, 0, 1, 1.0,
+        ).unwrap();
+        match kind {
+            NSEventType::LeftMouseDown => content.mouseDown(&event),
+            NSEventType::LeftMouseDragged => content.mouseDragged(&event),
+            _ => content.mouseUp(&event),
+        }
+    };
+    let center = |label: &str| {
+        let frame = find(&surface, label).unwrap().frame();
+        if vertical {
+            frame.origin.y + frame.size.height / 2.0
+        } else {
+            frame.origin.x + frame.size.width / 2.0
+        }
+    };
+    // A press that wobbles less than the drag threshold is still a click.
+    let first = center("First");
+    mouse(NSEventType::LeftMouseDown, first);
+    mouse(NSEventType::LeftMouseDragged, first + 2.0);
+    mouse(NSEventType::LeftMouseUp, first + 2.0);
+    assert!(matches!(actions.borrow().as_slice(), [TabBarAction::Select(0)]));
+    actions.borrow_mut().clear();
+
+    // Carry the first tab past the others, in steps as a real drag arrives.
+    let third = center("Third");
+    mouse(NSEventType::LeftMouseDown, first);
+    for step in 1..=8 {
+        mouse(
+            NSEventType::LeftMouseDragged,
+            first + (third - first) * step as f64 / 8.0,
+        );
+    }
+    assert!(actions.borrow().is_empty(), "nothing is reported until the drop");
+    mouse(NSEventType::LeftMouseUp, third);
+    assert!(
+        matches!(actions.borrow().as_slice(), [TabBarAction::Move {
+            from: 0,
+            to: 2
+        }]),
+        "{:?}",
+        actions.borrow()
+    );
+    assert!(
+        center("Second") < center("Third") && center("Third") < center("First"),
+        "the strip shows the new order without waiting for its owner"
+    );
+    actions.borrow_mut().clear();
+    let close = find(&surface, "Close First").unwrap().downcast::<NSControl>().unwrap();
+    action(&close);
+    assert!(
+        matches!(actions.borrow().as_slice(), [TabBarAction::Close(2)]),
+        "moved controls dispatch their new index"
+    );
+    actions.borrow_mut().clear();
+
+    // A title animating mid-drag, like a terminal's spinner, must not drop the tab.
+    let (second, first) = (center("Second"), center("First"));
+    mouse(NSEventType::LeftMouseDown, second);
+    mouse(NSEventType::LeftMouseDragged, second + (first - second) / 2.0);
+    for spinner in ["⠋ Third", "⠙ Third"] {
+        bar.set_tabs(items(&["Second", spinner, "First"]), 2);
+        mouse(NSEventType::LeftMouseDragged, first);
+    }
+    mouse(NSEventType::LeftMouseUp, first);
+    assert!(
+        matches!(actions.borrow().as_slice(), [TabBarAction::Move {
+            from: 0,
+            to: 2
+        }]),
+        "{edge:?}: {:?}",
+        actions.borrow()
+    );
+    assert!(center("⠙ Third") < center("First") && center("First") < center("Second"));
+    actions.borrow_mut().clear();
+    bar.set_tabs(items(&["Third", "First", "Second"]), 1);
+    // Adding a tab mid-drag invalidates the slots, so the drag ends without a move.
+    let third = center("Third");
+    mouse(NSEventType::LeftMouseDown, third);
+    mouse(NSEventType::LeftMouseDragged, third + 60.0);
+    bar.set_tabs(items(&["Third", "First", "Second", "Fourth"]), 1);
+    mouse(NSEventType::LeftMouseDragged, third + 200.0);
+    mouse(NSEventType::LeftMouseUp, third + 200.0);
+    assert!(actions.borrow().is_empty(), "{edge:?}: {:?}", actions.borrow());
+    bar.set_tabs(items(&["Second", "Third", "First"]), 2);
+
+    // Releasing in the starting slot reorders nothing.
+    let second = center("Second");
+    mouse(NSEventType::LeftMouseDown, second);
+    mouse(NSEventType::LeftMouseDragged, second + 20.0);
+    mouse(NSEventType::LeftMouseDragged, second);
+    mouse(NSEventType::LeftMouseUp, second);
+    assert!(actions.borrow().is_empty(), "{:?}", actions.borrow());
+
+    // The owner confirming the order it was told about changes nothing.
+    bar.set_tabs(items(&["Second", "Third", "First"]), 2);
+    assert!(center("Second") < center("Third") && center("Third") < center("First"));
 }
 
 fn tab_bar_callback_can_destroy_its_owner(ui: &Ui) {
@@ -1815,6 +1954,9 @@ fn main() {
         return;
     }
     tab_bar_updates_and_releases_native_owners(&ui);
+    for edge in [TabBarEdge::Top, TabBarEdge::Left, TabBarEdge::Right] {
+        tab_bar_drag_reorders_tabs(&ui, edge);
+    }
     tab_bar_callback_can_destroy_its_owner(&ui);
     let app = Application::shared(&ui);
     app.ns_application()
