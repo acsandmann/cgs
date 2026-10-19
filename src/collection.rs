@@ -832,7 +832,14 @@ impl SettingsListCell {
         });
         let chevron = navigation.then(|| {
             let image = NSImageView::new(ui.mtm());
-            image.setImage(crate::Symbol::named(if external { "arrow.up.right" } else { "chevron.forward" }).as_deref());
+            image.setImage(
+                crate::Symbol::named(if external {
+                    "arrow.up.right"
+                } else {
+                    "chevron.forward"
+                })
+                .as_deref(),
+            );
             image.widthAnchor().constraintEqualToConstant(12.0).setActive(true);
             image.setContentTintColor(Some(&crate::Color::secondary_label()));
             image.setAccessibilityElement(false);
