@@ -548,10 +548,14 @@ impl Popup {
     pub fn on_change(self, mut f: impl FnMut(usize) + 'static) -> Self {
         let positions = self.positions.clone();
         self.target.set(move |sender| {
-            if let Some(control) = sender.downcast_ref::<NSPopUpButton>()
-                && let Some(index) = choice(&positions.borrow(), control.indexOfSelectedItem())
-            {
-                f(index);
+            if let Some(control) = sender.downcast_ref::<NSPopUpButton>() {
+                let index = {
+                    let positions = positions.borrow();
+                    choice(&positions, control.indexOfSelectedItem())
+                };
+                if let Some(index) = index {
+                    f(index);
+                }
             }
         });
         self

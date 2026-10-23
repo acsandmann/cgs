@@ -1612,6 +1612,46 @@ fn sectioned_popups_report_choices_not_separators(ui: &Ui) {
     assert_eq!(native.titleOfSelectedItem().unwrap().to_string(), "Two");
 }
 
+fn popup_callback_can_rebuild_sections(ui: &Ui) {
+    let owner = Rc::new(std::cell::OnceCell::<Popup>::new());
+    let weak = Rc::downgrade(&owner);
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let seen = received.clone();
+    let popup = Popup::new(ui)
+        .sections([vec!["Default"], vec!["Same", "Same", "Old"]])
+        .on_change(move |index| {
+            seen.borrow_mut().push(index);
+            let owner = weak.upgrade().unwrap();
+            let popup = owner.get().unwrap();
+            popup.set_sections([vec!["Default"], vec!["Same", "Same"]]);
+            popup.set_selected(index.min(2));
+        });
+    assert!(owner.set(popup).is_ok());
+    let popup = owner.get().unwrap();
+    let native = popup.ns_popup_button();
+    for (position, index) in [(3, 2), (2, 1), (3, 2)] {
+        native.selectItemAtIndex(position);
+        action(native);
+        assert_eq!(received.borrow().last(), Some(&index));
+        assert_eq!(popup.selected(), Some(index));
+        assert_eq!(native.numberOfItems(), 4);
+        assert!(native.itemAtIndex(1).unwrap().isSeparatorItem());
+        assert_eq!(native.itemAtIndex(2).unwrap().title().to_string(), "Same");
+        assert_eq!(native.itemAtIndex(3).unwrap().title().to_string(), "Same");
+    }
+    native.selectItemAtIndex(1);
+    action(native);
+    assert_eq!(
+        *received.borrow(),
+        [2, 1, 2],
+        "separators do not dispatch choices"
+    );
+    popup.set_items(["Flat", "Other"]);
+    native.selectItemAtIndex(1);
+    action(native);
+    assert_eq!(*received.borrow(), [2, 1, 2, 1], "rebuilt indices stay current");
+}
+
 fn row_visibility_hides_a_row_with_its_divider(ui: &Ui) {
     let hidden = SettingsRow::new(ui, "Custom ratio", TextField::new(ui));
     let visibility = hidden.visibility();
@@ -2009,6 +2049,7 @@ fn main() {
         reused_cells_clear_missing_images(&ui);
         unchanged_popup_items_preserve_selection_and_native_items(&ui);
         sectioned_popups_report_choices_not_separators(&ui);
+        popup_callback_can_rebuild_sections(&ui);
         row_visibility_hides_a_row_with_its_divider(&ui);
         symbol_segments_name_each_choice(&ui);
         thumbnail_pickers_are_one_radio_group(&ui);
