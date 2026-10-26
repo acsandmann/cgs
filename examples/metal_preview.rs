@@ -174,25 +174,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     c.set_level(25)?;
     c.set_scene(&scene)?;
-    if let Some(index) = args.iter().position(|s| s == "--from") {
-        let values = args
-            .get(index + 1..index + 5)
-            .ok_or("--from requires X Y WIDTH HEIGHT")?
-            .iter()
-            .map(|s| s.parse::<f64>())
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut origin = scene.clone();
-        for p in &mut origin {
-            p.frame = frame(values[0], values[1], values[2], values[3]);
-            p.corner_radius = 0.;
-        }
-        c.show_animated(
-            &origin,
-            Transition::new(std::time::Duration::from_millis(320), Easing::Spring),
-        )?;
-    } else {
-        c.show()?;
-    }
+    c.show()?;
     println!(
         "overlay_window_id={} sources={:?}",
         c.window_id(),

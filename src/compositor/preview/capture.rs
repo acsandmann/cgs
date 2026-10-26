@@ -6,11 +6,14 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DeclaredClass, define_class, msg_send};
+use objc2::{AnyThread, ClassType, DeclaredClass, define_class, msg_send, sel};
 use objc2_core_foundation::{CFDictionary, CFRetained};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::*;
-use objc2_foundation::{NSError, NSNumber, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSProcessInfo, NSString,
+    ns_string,
+};
 use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
@@ -210,21 +213,25 @@ fn request_inventory(
     let mut inventory = INVENTORY.lock().unwrap();
     if !fresh {
         if let Some((time, content)) = &inventory.content {
-            let available = time.elapsed() < std::time::Duration::from_secs(5)
+            let current = time.elapsed() < std::time::Duration::from_secs(5)
                 && requested.iter().all(|p| {
                     unsafe { content.0.windows() }.iter().any(|w| unsafe {
                         w.windowID() == p.window_id
                             && w.owningApplication().is_some_and(|a| a.processID() == p.process_id)
                     })
                 });
-            if available {
-                if let Some((discovery, wake)) = waiter {
-                    let mut discovery = discovery.lock().unwrap();
-                    discovery.pending = false;
-                    discovery.result = Some(Ok(content.clone()));
-                    drop(discovery);
-                    wake.notify();
-                }
+            // Start known identities immediately, even when discovery must
+            // refresh. Each source still checks the caller's owning PID. Missing
+            // IDs stay pending until fresh discovery returns; stale metadata is
+            // never used to manufacture an SCWindow for an unknown source.
+            if let Some((discovery, wake)) = waiter {
+                let mut discovery = discovery.lock().unwrap();
+                discovery.pending = !current;
+                discovery.result = Some(Ok(content.clone()));
+                drop(discovery);
+                wake.notify();
+            }
+            if current {
                 return;
             }
         }
@@ -571,6 +578,114 @@ impl Bootstrap {
 // after transfer the owner alone controls the stream. Samples still use mailboxes.
 struct WindowDescription(Retained<SCWindow>);
 unsafe impl Send for WindowDescription {}
+
+#[derive(Default)]
+struct DirectDiscovery {
+    started: bool,
+    result: Option<Vec<WindowDescription>>,
+}
+// This private initializer was validated on macOS 27. Other releases use normal
+// SCK discovery. It only constructs metadata: capture still uses authorized SCK.
+fn direct_discovery_supported() -> bool {
+    NSProcessInfo::processInfo().operatingSystemVersion().majorVersion == 27
+        && unsafe { msg_send![SCWindow::class(), instancesRespondToSelector: sel!(initWithDict:)] }
+}
+fn direct_windows(requested: &[(u32, i32)]) -> Vec<WindowDescription> {
+    use objc2::runtime::AnyObject;
+    use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID};
+    objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+        let Some(list) = CGWindowListCopyWindowInfo(CGWindowListOption::OptionAll, kCGNullWindowID)
+        else {
+            return Vec::new();
+        };
+        // CFArray/CFDictionary are toll-free bridged. The retained CF list owns
+        // every dictionary throughout this read-only traversal.
+        let list =
+            unsafe { &*(&*list as *const _ as *const NSArray<NSDictionary<NSString, AnyObject>>) };
+        let mut windows = Vec::with_capacity(requested.len());
+        for entry in list {
+            let Some(id) = entry.objectForKey(ns_string!("kCGWindowNumber")) else {
+                continue;
+            };
+            let Some(pid) = entry.objectForKey(ns_string!("kCGWindowOwnerPID")) else {
+                continue;
+            };
+            let (Some(id_number), Some(pid_number)) =
+                (id.downcast_ref::<NSNumber>(), pid.downcast_ref::<NSNumber>())
+            else {
+                continue;
+            };
+            let identity = (id_number.unsignedIntValue(), pid_number.intValue());
+            if !requested.contains(&identity) {
+                continue;
+            }
+            let Some(bounds) = entry.objectForKey(ns_string!("kCGWindowBounds")) else {
+                continue;
+            };
+            let Some(bounds) = bounds.downcast_ref::<NSDictionary>() else {
+                continue;
+            };
+            let Some(x) = bounds.objectForKey(ns_string!("X")) else {
+                continue;
+            };
+            let Some(y) = bounds.objectForKey(ns_string!("Y")) else {
+                continue;
+            };
+            let Some(width) = bounds.objectForKey(ns_string!("Width")) else {
+                continue;
+            };
+            let Some(height) = bounds.objectForKey(ns_string!("Height")) else {
+                continue;
+            };
+            let Some(layer) = entry.objectForKey(ns_string!("kCGWindowLayer")) else {
+                continue;
+            };
+            let active = NSNumber::new_bool(true);
+            let on_screen = entry.objectForKey(ns_string!("kCGWindowIsOnscreen"));
+            let dict = NSDictionary::<NSString, AnyObject>::from_slices(
+                &[
+                    ns_string!("SCWindowID"),
+                    ns_string!("SCRunningApplicationPID"),
+                    ns_string!("SCWindowLayer"),
+                    ns_string!("SCWindowName"),
+                    ns_string!("SCWindowBoundOriginX"),
+                    ns_string!("SCWindowBoundOriginY"),
+                    ns_string!("SCWindowBoundWidth"),
+                    ns_string!("SCWindowBoundHeight"),
+                    ns_string!("SCWindowIsOnScreen"),
+                    ns_string!("SCWindowIsActive"),
+                ],
+                &[
+                    &id,
+                    &pid,
+                    &layer,
+                    ns_string!(""),
+                    &x,
+                    &y,
+                    &width,
+                    &height,
+                    on_screen.as_deref().unwrap_or(&active),
+                    &active,
+                ],
+            );
+            let window: Option<Retained<SCWindow>> =
+                unsafe { msg_send![SCWindow::alloc(), initWithDict: &*dict] };
+            if let Some(window) = window {
+                if unsafe {
+                    window.windowID() == identity.0
+                        && window
+                            .owningApplication()
+                            .is_some_and(|app| app.processID() == identity.1)
+                } {
+                    windows.push(WindowDescription(window));
+                }
+            }
+        }
+        windows
+    }))
+    .unwrap_or_default()
+}
+
 struct Opened {
     slot: Slot,
     setup_us: [u64; 3],
@@ -729,6 +844,8 @@ pub(super) struct Captures {
     requested: Vec<Preview>,
     windows: Option<Vec<Retained<SCWindow>>>,
     discovery: Arc<Mutex<Discovery>>,
+    direct: Arc<Mutex<DirectDiscovery>>,
+    direct_used: bool,
     queue: DispatchRetained<DispatchQueue>,
     controls: DispatchRetained<DispatchQueue>,
     wake: Arc<Wake>,
@@ -750,6 +867,8 @@ impl Captures {
             requested: Vec::new(),
             windows: None,
             discovery: Arc::default(),
+            direct: Arc::default(),
+            direct_used: false,
             queue: DispatchQueue::new("cgs.preview.capture", None),
             controls: DispatchQueue::new("cgs.preview.control", None),
             wake,
@@ -778,6 +897,8 @@ impl Captures {
         self.opening.clear();
         self.cached.clear();
         self.windows = None;
+        self.direct = Arc::default();
+        self.direct_used = false;
         self.unavailable.clear();
         self.native_sizes.clear();
         self.waiting_for_capacity = false;
@@ -880,6 +1001,25 @@ impl Captures {
     fn discover(&self) { self.discover_fresh(false); }
 
     fn discover_fresh(&self, fresh: bool) {
+        if self.windows.is_none() && !self.requested.is_empty() && direct_discovery_supported() {
+            let mut direct = self.direct.lock().unwrap();
+            if !direct.started {
+                direct.started = true;
+                drop(direct);
+                let result = self.direct.clone();
+                let requested: Vec<_> =
+                    self.requested.iter().map(|p| (p.window_id, p.process_id)).collect();
+                let wake = self.wake.clone();
+                DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
+                    dispatch2::DispatchQoS::UserInitiated,
+                ))
+                .exec_async(move || {
+                    let windows = objc2::rc::autoreleasepool(|_| direct_windows(&requested));
+                    result.lock().unwrap().result = Some(windows);
+                    wake.notify();
+                });
+            }
+        }
         let mut d = self.discovery.lock().unwrap();
         if d.pending {
             return;
@@ -891,6 +1031,13 @@ impl Captures {
 
     pub fn pump(&mut self) -> PreviewResult<()> {
         let pump_start = Instant::now();
+        if let Some(windows) = self.direct.lock().unwrap().result.take() {
+            if self.windows.is_none() && !windows.is_empty() {
+                self.windows = Some(windows.into_iter().map(|w| w.0).collect());
+                self.direct_used = true;
+                self.reconcile = true;
+            }
+        }
         let mut i = 0;
         while i < self.opening.len() {
             let result = self.opening[i].result.lock().unwrap().take();
@@ -939,6 +1086,13 @@ impl Captures {
         }
         if let Some(result) = self.discovery.lock().unwrap().result.take() {
             let content = result.map_err(PreviewError::Capture)?.0;
+            if std::mem::take(&mut self.direct_used) {
+                // Any shortcut that has not produced pixels yields to real SCK
+                // descriptions. Already-usable captures continue without churn.
+                self.opening.clear();
+                self.slots
+                    .retain(|s| s.frame.is_some() || s.mailbox.lock().unwrap().latest.is_some());
+            }
             self.unavailable.clear();
             let inventory = unsafe { content.windows() };
             let cached_count = self.cached.len();

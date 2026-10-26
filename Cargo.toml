@@ -1,6 +1,6 @@
 [package]
 name = "cgs"
-version = "0.3.13"
+version = "0.3.14"
 description = "a ui library for macos built on appkit"
 license = "GPL-3.0"
 edition = "2024"
@@ -12,9 +12,9 @@ objc2-screen-capture-kit = { version = "0.3.2", default-features = false, featur
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVHostTime", "objc2-io-surface"] }
 dispatch2 = { version = "0.3.0" }
-objc2 = { version = "0.6.2", default-features = false, features = ["std"] }
+objc2 = { version = "0.6.2", default-features = false, features = ["std", "exception"] }
 block2 = { version = "0.6.2", default-features = false, features = ["alloc"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSString", "NSNumberFormatter", "NSFormatter", "NSValue", "NSKeyValueCoding", "NSNotification", "NSIndexSet", "NSURL", "NSAttributedString", "NSGeometry", "NSTimer", "NSDate"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSString", "NSNumberFormatter", "NSProcessInfo", "NSFormatter", "NSValue", "NSKeyValueCoding", "NSNotification", "NSIndexSet", "NSURL", "NSAttributedString", "NSGeometry", "NSTimer", "NSDate"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFString", "CFNumber"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGContext", "CGColorSpace", "CGError", "CGGeometry", "CGWindow"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["CAMetalLayer", "CAMetalDisplayLink", "CABase", "CAFrameRateRange", "objc2-metal", "CALayer", "CATransaction", "CAAnimation", "CAMediaTiming", "CAMediaTimingFunction", "block2", "objc2-core-foundation", "objc2-core-graphics"] }

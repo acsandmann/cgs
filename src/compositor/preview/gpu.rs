@@ -146,6 +146,15 @@ impl Gpu {
         })
     }
 
+    pub fn begin_session(&mut self) {
+        self.discard_presentation();
+        self.created = objc2_quartz_core::CACurrentMediaTime();
+        let mut metrics = self.metrics.lock().unwrap();
+        metrics.session += 1;
+        metrics.presented_frames = 0;
+        metrics.first_present_us = 0;
+    }
+
     pub fn has_submitted(&self) -> bool { self.sequence != 0 }
 
     pub fn is_presented(&self, revision: u64) -> bool {
@@ -325,6 +334,7 @@ impl Gpu {
             .all(|p| captures.frame(p).is_some());
         let presentation_metrics = self.metrics.clone();
         let epoch = self.scheduled.lock().unwrap().0;
+        let session = presentation_metrics.lock().unwrap().session;
         let presentation_state = Arc::downgrade(&self.scheduled);
         let presented_revision = self.presented_revision.clone();
         let presentation_wake = self.wake.clone();
@@ -342,6 +352,9 @@ impl Gpu {
             presentation_wake.notify();
             {
                 let mut m = presentation_metrics.lock().unwrap();
+                if m.session != session {
+                    return;
+                }
                 if m.presented_frames == 0 {
                     m.first_present_us = ((presented - created).max(0.) * 1e6) as u64;
                 }

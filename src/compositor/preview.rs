@@ -127,8 +127,6 @@ const IDENTITY: [f32; 16] = [
 pub enum Easing {
     Linear,
     EaseInOut,
-    /// Critically damped motion, normalized to settle at the requested duration.
-    Spring,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Transition {
@@ -141,7 +139,7 @@ impl Transition {
 struct Animation {
     from: Vec<Preview>,
     to: Vec<Preview>,
-    start: Option<Instant>,
+    start: Instant,
     transition: Transition,
     progress: Option<f32>,
     sampled: Option<f32>,
@@ -155,7 +153,7 @@ pub struct PreviewStats {
     pub replaced_frames: u64,
     pub submitted_frames: u64,
     pub presented_frames: u64,
-    /// Hardware presentation timestamp relative to Metal initialization, not
+    /// Hardware presentation timestamp relative to the latest show(), not
     /// when an event-loop observer happens to notice the presentation.
     pub first_present_us: u64,
     pub dropped_presentations: u64,
@@ -413,6 +411,7 @@ impl PreviewCompositor {
     /// is_ready before hiding real source windows for a transition handoff.
     pub fn show(&mut self) -> PreviewResult<()> {
         if !self.visible {
+            self.gpu.begin_session();
             self.visible = true;
             self.revision += 1;
             self._root.setHidden(true);
@@ -429,29 +428,6 @@ impl PreviewCompositor {
             result?;
         }
         Ok(())
-    }
-
-    /// Open the current scene from supplied source geometry. Capture quality
-    /// comes from the destination scene; the timeline starts when a visible
-    /// source has pixels, so asynchronous capture does not consume the animation.
-    pub fn show_animated(&mut self, from: &[Preview], transition: Transition) -> PreviewResult<()> {
-        validate_scene(from)?;
-        let destination = self.scene.clone();
-        let mut origin = from.to_vec();
-        for p in &mut origin {
-            if let Some(to) = destination
-                .iter()
-                .find(|q| p.window_id == q.window_id && p.process_id == q.process_id)
-            {
-                p.mode = to.mode;
-                p.resolution = to.resolution;
-                p.priority = to.priority;
-            }
-        }
-        self.set_scene(&origin)?;
-        self.transition_to(&destination, transition)?;
-        self.animation.as_mut().unwrap().start = None;
-        self.show()
     }
 
     pub fn hide(&mut self) -> PreviewResult<()> {
@@ -587,7 +563,7 @@ impl PreviewCompositor {
         self.animation = Some(Animation {
             from,
             to,
-            start: Some(Instant::now()),
+            start: Instant::now(),
             transition,
             progress: None,
             sampled: None,
@@ -616,9 +592,7 @@ impl PreviewCompositor {
     }
 
     pub fn is_animating(&self) -> bool {
-        self.animation
-            .as_ref()
-            .is_some_and(|a| a.progress.is_none() && a.start.is_some())
+        self.animation.as_ref().is_some_and(|a| a.progress.is_none())
     }
 
     fn interpolate(&mut self, now: Instant) {
@@ -626,19 +600,13 @@ impl PreviewCompositor {
             return;
         };
         let t = a.progress.unwrap_or_else(|| {
-            (a.start.map_or(0., |start| now.saturating_duration_since(start).as_secs_f32())
+            (now.saturating_duration_since(a.start).as_secs_f32()
                 / a.transition.duration.as_secs_f32().max(f32::EPSILON))
             .clamp(0., 1.)
         });
         let t = match a.transition.easing {
             Easing::Linear => t,
             Easing::EaseInOut => t * t * (3. - 2. * t),
-            Easing::Spring => {
-                // Unit step of a critically damped oscillator. Normalizing its
-                // endpoint avoids a discontinuity when the timeline completes.
-                let step = |x: f32| 1. - (1. + 8. * x) * (-8. * x).exp();
-                step(t) / step(1.)
-            }
         };
         if a.sampled == Some(t) {
             return;
@@ -738,25 +706,6 @@ impl PreviewCompositor {
             .unwrap_or(presentation);
         let changed = self.captures.import(&mut self.gpu)?;
         self.dirty |= changed;
-        if let Some(a) = &mut self.animation {
-            if a.start.is_none() && update.is_some() {
-                let visible_origin = a.from.iter().any(|p| p.opacity > 0.);
-                let ready = if visible_origin { &a.from } else { &a.to }
-                    .iter()
-                    .any(|p| p.opacity > 0. && self.captures.frame(p).is_some());
-                let origin_unavailable = a.from.iter().filter(|p| p.opacity > 0.).all(|p| {
-                    matches!(
-                        self.captures.status(p.window_id),
-                        Some(SourceStatus::Failed(_) | SourceStatus::Blank | SourceStatus::Stopped)
-                    )
-                });
-                let fallback_ready = origin_unavailable
-                    && a.to.iter().any(|p| p.opacity > 0. && self.captures.frame(p).is_some());
-                if ready || fallback_ready {
-                    a.start = Some(presentation);
-                }
-            }
-        }
         if update.is_some() || !self.is_animating() {
             self.interpolate(presentation);
         }

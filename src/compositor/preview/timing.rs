@@ -41,6 +41,7 @@ impl Timings {
 }
 #[derive(Default)]
 pub(super) struct Metrics {
+    pub session: u64,
     pub presented_frames: u64,
     pub first_present_us: u64,
     pub cpu: Timings,
