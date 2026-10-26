@@ -21,3 +21,6 @@ fn cg_ok(error: objc2_core_graphics::CGError) -> Result<(), objc2_core_graphics:
 }
 
 pub fn main_connection() -> i32 { unsafe { private::SLSMainConnectionID() } }
+
+mod preview;
+pub use preview::*;

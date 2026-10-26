@@ -130,6 +130,32 @@ impl WindowSurface {
         transaction.set_surface_bounds(self.window_id, self.surface_id, bounds);
     }
 
+    /// Set the color encoding of the attached presentation surface.
+    pub fn set_color_space(&self, color_space: &CGColorSpace) -> Result<(), CgsWindowError> {
+        unsafe {
+            cg_ok(SLSSetSurfaceColorSpace(
+                self.connection,
+                self.window_id,
+                self.surface_id,
+                (color_space as *const CGColorSpace).cast_mut(),
+            ))
+        }
+        .map_err(CgsWindowError::Surface)
+    }
+
+    /// Update backing scale without detaching the context or reallocating the window.
+    pub fn set_scale(&self, scale: f64) -> Result<(), CgsWindowError> {
+        unsafe {
+            cg_ok(SLSSetSurfaceResolution(
+                self.connection,
+                self.window_id,
+                self.surface_id,
+                scale,
+            ))
+        }
+        .map_err(CgsWindowError::Surface)
+    }
+
     #[inline]
     pub fn flush(&self) { CATransaction::flush(); }
 }

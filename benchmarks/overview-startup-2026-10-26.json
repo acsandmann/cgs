@@ -1,0 +1,440 @@
+{
+  "scope": "Native macOS 27.0/M2 Max. Three alternating trials per path; no source windows moved. Actual drawable hardware timestamps. Direct-acquisition experiment removed because it was slower. Final visibility revision measured separately.",
+  "comparison": [
+    {
+      "path": "direct",
+      "trial": 1,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 55.025,
+        "presented": 1,
+        "first_present_ms": 360.49
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 695.201,
+        "foreground_ms": 489.174,
+        "first_ms": 243.396
+      }
+    },
+    {
+      "path": "clock",
+      "trial": 1,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 49.049,
+        "presented": 1,
+        "first_present_ms": 105.099
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 698.813,
+        "foreground_ms": 389.969,
+        "first_ms": 170.877
+      }
+    },
+    {
+      "path": "direct",
+      "trial": 2,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 55.919,
+        "presented": 1,
+        "first_present_ms": 272.268
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 677.027,
+        "foreground_ms": 327.984,
+        "first_ms": 156.49
+      }
+    },
+    {
+      "path": "clock",
+      "trial": 2,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 67.891,
+        "presented": 1,
+        "first_present_ms": 250.466
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 666.971,
+        "foreground_ms": 406.774,
+        "first_ms": 164.145
+      }
+    },
+    {
+      "path": "direct",
+      "trial": 3,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 91.477,
+        "presented": 1,
+        "first_present_ms": 258.9
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 678.489,
+        "foreground_ms": 407.027,
+        "first_ms": 172.234
+      }
+    },
+    {
+      "path": "clock",
+      "trial": 3,
+      "returncode": 0,
+      "reuse_summary": {
+        "windows": 10,
+        "ready": 10,
+        "foreground_ready": 3,
+        "ready_ms": 52.34,
+        "presented": 1,
+        "first_present_ms": 210.469
+      },
+      "warm_summary": {
+        "windows": 10,
+        "captured": 10,
+        "all_ms": 664.271,
+        "foreground_ms": 333.858,
+        "first_ms": 148.921
+      }
+    }
+  ],
+  "visibility_experiment": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "managed_windows": 10,
+    "trials": [
+      {
+        "trial": 1,
+        "returncode": 0,
+        "quality": "thumbnail",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 217.877,
+        "total_ms": 1012.169,
+        "first_frame_p50_ms": 620.796,
+        "first_frame_p95_ms": 740.607,
+        "first_frame_max_ms": 740.607,
+        "cached_frame_bytes": 12288000,
+        "last_valid_frame_ms": 1012.13,
+        "capture_ms": 740.649,
+        "foreground_ms": 280.676,
+        "process_peak_rss_bytes": 85180416,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 10.0,
+          "foreground_ready": 3.0,
+          "ready_ms": 77.836,
+          "presented": 1.0,
+          "first_present_ms": 266.393
+        },
+        "after_hide_reusable_bytes": 12288000,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 736.569,
+          "foreground_ms": 491.912,
+          "first_ms": 185.259
+        },
+        "setup": {
+          "max_filter_us": 5074,
+          "max_create_us": 545,
+          "max_start_us": 3,
+          "max_owner_pump_us": 43
+        }
+      },
+      {
+        "trial": 2,
+        "returncode": 0,
+        "quality": "thumbnail",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 220.54,
+        "total_ms": 1095.673,
+        "first_frame_p50_ms": 641.741,
+        "first_frame_p95_ms": 830.323,
+        "first_frame_max_ms": 830.323,
+        "cached_frame_bytes": 12288000,
+        "last_valid_frame_ms": 1095.645,
+        "capture_ms": 830.354,
+        "foreground_ms": 274.007,
+        "process_peak_rss_bytes": 85278720,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 10.0,
+          "foreground_ready": 3.0,
+          "ready_ms": 23.373,
+          "presented": 1.0,
+          "first_present_ms": 90.517
+        },
+        "after_hide_reusable_bytes": 12288000,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 639.027,
+          "foreground_ms": 480.85,
+          "first_ms": 159.476
+        },
+        "setup": {
+          "max_filter_us": 48734,
+          "max_create_us": 776,
+          "max_start_us": 6,
+          "max_owner_pump_us": 117
+        }
+      },
+      {
+        "trial": 3,
+        "returncode": 0,
+        "quality": "thumbnail",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 219.289,
+        "total_ms": 1072.902,
+        "first_frame_p50_ms": 620.609,
+        "first_frame_p95_ms": 798.614,
+        "first_frame_max_ms": 798.614,
+        "cached_frame_bytes": 12288000,
+        "last_valid_frame_ms": 1072.874,
+        "capture_ms": 798.643,
+        "foreground_ms": 277.831,
+        "process_peak_rss_bytes": 85213184,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 10.0,
+          "foreground_ready": 3.0,
+          "ready_ms": 79.694,
+          "presented": 1.0,
+          "first_present_ms": 254.595
+        },
+        "after_hide_reusable_bytes": 12288000,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 687.327,
+          "foreground_ms": 332.942,
+          "first_ms": 155.597
+        },
+        "setup": {
+          "max_filter_us": 3168,
+          "max_create_us": 11927,
+          "max_start_us": 7,
+          "max_owner_pump_us": 48
+        }
+      },
+      {
+        "trial": 1,
+        "returncode": 0,
+        "quality": "mixed",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 219.156,
+        "total_ms": 1000.391,
+        "first_frame_p50_ms": 492.684,
+        "first_frame_p95_ms": 737.911,
+        "first_frame_max_ms": 737.911,
+        "cached_frame_bytes": 32891136,
+        "last_valid_frame_ms": 1000.363,
+        "capture_ms": 737.939,
+        "foreground_ms": 275.748,
+        "process_peak_rss_bytes": 84983808,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 9.0,
+          "foreground_ready": 2.0,
+          "ready_ms": 69.23,
+          "presented": 1.0,
+          "first_present_ms": 236.541
+        },
+        "after_hide_reusable_bytes": 11059200,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 773.59,
+          "foreground_ms": 339.419,
+          "first_ms": 185.634
+        },
+        "setup": {
+          "max_filter_us": 812,
+          "max_create_us": 966,
+          "max_start_us": 3,
+          "max_owner_pump_us": 205
+        }
+      },
+      {
+        "trial": 2,
+        "returncode": 0,
+        "quality": "mixed",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 218.062,
+        "total_ms": 1038.825,
+        "first_frame_p50_ms": 525.838,
+        "first_frame_p95_ms": 772.433,
+        "first_frame_max_ms": 772.433,
+        "cached_frame_bytes": 32891136,
+        "last_valid_frame_ms": 1038.796,
+        "capture_ms": 772.463,
+        "foreground_ms": 273.695,
+        "process_peak_rss_bytes": 85049344,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 9.0,
+          "foreground_ready": 2.0,
+          "ready_ms": 67.538,
+          "presented": 1.0,
+          "first_present_ms": 251.411
+        },
+        "after_hide_reusable_bytes": 11059200,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 687.898,
+          "foreground_ms": 313.213,
+          "first_ms": 134.61
+        },
+        "setup": {
+          "max_filter_us": 16154,
+          "max_create_us": 726,
+          "max_start_us": 12,
+          "max_owner_pump_us": 48
+        }
+      },
+      {
+        "trial": 3,
+        "returncode": 0,
+        "quality": "mixed",
+        "concurrency": 8,
+        "windows": 10,
+        "captured": 10,
+        "failed": 0,
+        "discovery_ms": 217.614,
+        "total_ms": 985.324,
+        "first_frame_p50_ms": 581.225,
+        "first_frame_p95_ms": 722.524,
+        "first_frame_max_ms": 722.524,
+        "cached_frame_bytes": 32891136,
+        "last_valid_frame_ms": 985.295,
+        "capture_ms": 722.557,
+        "foreground_ms": 272.014,
+        "process_peak_rss_bytes": 85147648,
+        "after_hide_frame_bytes": 0,
+        "reuse": {
+          "windows": 10.0,
+          "ready": 9.0,
+          "foreground_ready": 2.0,
+          "ready_ms": 66.643,
+          "presented": 1.0,
+          "first_present_ms": 234.418
+        },
+        "after_hide_reusable_bytes": 11059200,
+        "warm": {
+          "windows": 10.0,
+          "captured": 10.0,
+          "all_ms": 755.025,
+          "foreground_ms": 266.948,
+          "first_ms": 127.632
+        },
+        "setup": {
+          "max_filter_us": 10294,
+          "max_create_us": 869,
+          "max_start_us": 9,
+          "max_owner_pump_us": 44
+        }
+      }
+    ],
+    "aggregates": [
+      {
+        "quality": "thumbnail",
+        "concurrency": 8,
+        "successful_trials": 3,
+        "median_total_ms": 1072.902,
+        "min_total_ms": 1012.169,
+        "max_total_ms": 1095.673,
+        "median_cached_frame_bytes": 12288000,
+        "median_capture_ms": 798.643,
+        "median_foreground_ms": 277.831,
+        "median_warm_foreground_ms": 480.85,
+        "median_reuse_ready_ms": 77.836,
+        "median_first_present_ms": 254.595,
+        "median_warm_all_ms": 687.327
+      },
+      {
+        "quality": "mixed",
+        "concurrency": 8,
+        "successful_trials": 3,
+        "median_total_ms": 1000.391,
+        "min_total_ms": 985.324,
+        "max_total_ms": 1038.825,
+        "median_cached_frame_bytes": 32891136,
+        "median_capture_ms": 737.939,
+        "median_foreground_ms": 273.695,
+        "median_warm_foreground_ms": 313.213,
+        "median_reuse_ready_ms": 67.538,
+        "median_first_present_ms": 236.541,
+        "median_warm_all_ms": 755.025
+      }
+    ],
+    "scope": "First valid SCK frame imported through PreviewCompositor; excludes presentation latency. New process per trial; optional warm measurement recreates the compositor in that process. Source windows are never moved.",
+    "conclusion": "No consistent improvement over hidden-until-present. Experiment reverted."
+  },
+  "final_delayed_reopen_log": [
+    "window_id=93134 first_frame_ms=263.370 cumulative_ms=523.108",
+    "window_id=90412 first_frame_ms=306.711 cumulative_ms=566.449",
+    "window_id=83508 first_frame_ms=217.023 cumulative_ms=476.761",
+    "window_id=55924 first_frame_ms=475.132 cumulative_ms=734.871",
+    "window_id=39569 first_frame_ms=486.366 cumulative_ms=746.104",
+    "window_id=39374 first_frame_ms=540.735 cumulative_ms=800.473",
+    "window_id=39197 first_frame_ms=519.413 cumulative_ms=779.152",
+    "window_id=90574 first_frame_ms=579.030 cumulative_ms=838.769",
+    "window_id=89 first_frame_ms=698.545 cumulative_ms=958.283",
+    "window_id=55503 first_frame_ms=731.283 cumulative_ms=991.021",
+    "setup max_filter_us=14265 max_create_us=863 max_start_us=11 max_owner_pump_us=48",
+    "summary quality=thumbnail concurrency=8 windows=10 captured=10 failed=0 discovery_ms=218.228 total_ms=991.165 first_frame_p50_ms=519.413 first_frame_p95_ms=731.283 first_frame_max_ms=731.283 cached_frame_bytes=12288000 last_valid_frame_ms=991.021 capture_ms=731.429 foreground_ms=306.711",
+    "after_hide_frame_bytes=0",
+    "after_hide_reusable_bytes=12288000",
+    "reuse_summary windows=10 ready=10 foreground_ready=3 ready_ms=16.600 presented=1 first_present_ms=402.444",
+    "warm_summary windows=10 captured=10 all_ms=758.697 foreground_ms=591.300 first_ms=323.744"
+  ],
+  "native_opening_demo": [
+    "overlay_window_id=96418 sources=[(90412, 76914)]",
+    "elapsed_ms=2053 stats=PreviewStats { captured_frames: 121, replaced_frames: 13, submitted_frames: 91, presented_frames: 71, first_present_us: 264480, dropped_presentations: 0, streams: 1, latest_frame_bytes: 14515200, reusable_frame_bytes: 0, reserved_capture_bytes: 116121600, process_streams: 1, process_capture_jobs: 1, last_capture_to_gpu_us: 2986, last_drawable_wait_us: 0, last_cpu_render_us: 63, last_gpu_us: 204, cpu_render: FrameTimes { samples: 91, p50_us: 58, p95_us: 145, p99_us: 717 }, gpu_render: FrameTimes { samples: 91, p50_us: 202, p95_us: 445, p99_us: 1205 }, capture_to_present: FrameTimes { samples: 64, p50_us: 33290, p95_us: 42182, p99_us: 45013 }, first_frame_us: 89770, max_capture_pump_us: 87, max_filter_us: 697, max_stream_create_us: 537, max_stream_start_us: 4, last_callback_us: 2 }",
+    "source=90412 status=Some(Complete { age: 2.164375ms })"
+  ]
+}

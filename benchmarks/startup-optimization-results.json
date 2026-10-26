@@ -1,0 +1,50 @@
+{
+  "scope": "Preliminary unlocked measurements; final shared-discovery/admission revision not yet validated unlocked. Capture readiness only, not presentation.",
+  "final_unlocked_validation_pending": true,
+  "runs": [
+    {
+      "stage": "one-shot sample concurrency2",
+      "metrics": {
+        "windows": 11,
+        "finished": 11,
+        "iosurface_frames": 11,
+        "first_ms": 242.131,
+        "all_ms": 672.401
+      }
+    },
+    {
+      "stage": "one-shot sample concurrency8",
+      "metrics": {
+        "windows": 11,
+        "finished": 11,
+        "iosurface_frames": 11,
+        "first_ms": 247.824,
+        "all_ms": 602.169
+      }
+    },
+    {
+      "stage": "integrated prototype, before final admission guards and shared discovery",
+      "metrics": {
+        "max_filter_us": 39628,
+        "max_create_us": 925,
+        "max_start_us": 129,
+        "max_owner_pump_us": 209,
+        "quality": "thumbnail",
+        "concurrency": 8,
+        "windows": 11,
+        "captured": 11,
+        "failed": 0,
+        "discovery_ms": 217.017,
+        "total_ms": 1211.743,
+        "first_frame_p50_ms": 607.54,
+        "first_frame_p95_ms": 945.902,
+        "first_frame_max_ms": 945.902,
+        "cached_frame_bytes": 13516800,
+        "last_valid_frame_ms": 1211.512,
+        "capture_ms": 946.133,
+        "foreground_ms": 287.193,
+        "after_hide_frame_bytes": 0
+      }
+    }
+  ]
+}
