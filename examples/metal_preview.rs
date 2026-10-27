@@ -256,6 +256,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--measure-only") {
         compositor(|c| c.hide())?;
         run_for(0.3);
+        println!("shutdown_jobs_after_300ms={}", compositor(|c| c.stats().process_capture_jobs));
+        run_for(1.7);
+        println!("shutdown_jobs_after_2s={}", compositor(|c| c.stats().process_capture_jobs));
         assert_eq!(compositor(|c| c.stats().process_capture_jobs), 0);
         drop(COMPOSITOR.with(|c| c.take()));
         drop(sources);

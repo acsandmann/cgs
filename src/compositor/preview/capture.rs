@@ -907,7 +907,7 @@ pub(super) struct Captures {
     wake: Arc<Wake>,
     unavailable: std::collections::HashMap<u32, String>,
     reconcile: bool,
-    waiting_for_capacity: bool,
+    capacity_limit: usize,
     retired: (u64, u64),
     setup_us: [u64; 3],
     pump_us: u64,
@@ -931,7 +931,7 @@ impl Captures {
             wake,
             unavailable: Default::default(),
             reconcile: false,
-            waiting_for_capacity: false,
+            capacity_limit: 0,
             retired: (0, 0),
             setup_us: [0; 3],
             pump_us: 0,
@@ -958,7 +958,7 @@ impl Captures {
         self.direct_used = false;
         self.unavailable.clear();
         self.native_sizes.clear();
-        self.waiting_for_capacity = false;
+        self.capacity_limit = 0;
         self.reconcile = false;
     }
 
@@ -1166,9 +1166,9 @@ impl Captures {
                 self.reconcile = true;
             }
         }
-        if self.waiting_for_capacity
+        if self.capacity_limit != 0
             && self.slots.len() + self.opening.len() < 8
-            && STREAMS.load(Ordering::Acquire) < 16
+            && STREAMS.load(Ordering::Acquire) < self.capacity_limit
         {
             self.reconcile = true;
         }
@@ -1230,7 +1230,7 @@ impl Captures {
     }
 
     fn reconcile(&mut self) -> PreviewResult<()> {
-        self.waiting_for_capacity = false;
+        self.capacity_limit = 0;
         let windows = self.windows.as_ref().unwrap();
         // Reserve eight surface-sized buffers per admitted source (queue, latest,
         // in-flight reads and texture-view cache), including 64-byte row alignment.
@@ -1303,13 +1303,14 @@ impl Captures {
                 {
                     continue;
                 }
+                let speculative = requested.mode == CaptureMode::Snapshot && requested.priority < 0;
+                let limit = if speculative { 14 } else { 16 };
                 if self.slots.len() + self.opening.len() >= 8 {
-                    self.waiting_for_capacity = true;
+                    self.capacity_limit = self.capacity_limit.max(limit);
                     continue;
                 }
-                let speculative = requested.mode == CaptureMode::Snapshot && requested.priority < 0;
                 let Some(lease) = StreamLease::acquire(speculative) else {
-                    self.waiting_for_capacity = true;
+                    self.capacity_limit = self.capacity_limit.max(limit);
                     continue;
                 };
                 let result = Arc::new(Mutex::new(None));
@@ -1406,7 +1407,7 @@ impl Captures {
             desired.push((request.clone(), dimensions));
             self.unavailable.remove(&request.window_id);
         }
-        if self.waiting_for_capacity {
+        if self.capacity_limit != 0 {
             let mut waiters = WAITERS.lock().unwrap();
             let weak = Arc::downgrade(&self.wake);
             if !waiters.iter().any(|w| w.ptr_eq(&weak)) {

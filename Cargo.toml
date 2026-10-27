@@ -5,6 +5,7 @@ description = "a ui library for macos built on appkit"
 license = "GPL-3.0"
 edition = "2024"
 
+[workspace]
 
 [dependencies]
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2-core-foundation"] }
