@@ -270,7 +270,7 @@ fn request_inventory(
         }
     });
     unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(true, false, &callback);
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, false, &callback);
     }
 }
 
@@ -282,6 +282,7 @@ pub(super) struct Frame {
     pub sequence: u64,
     pub display_time: f64,
     pub bytes: usize,
+    dimensions: (usize, usize),
     received: Instant,
 }
 static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -608,7 +609,19 @@ impl Bootstrap {
 // These immutable window descriptions and unstarted streams use AnyThread APIs.
 // Opened crosses queues exactly once, before it contains any frame/Metal texture;
 // after transfer the owner alone controls the stream. Samples still use mailboxes.
-struct WindowDescription(Retained<SCWindow>);
+#[derive(Clone)]
+struct WindowDescription {
+    window: Retained<SCWindow>,
+    id: u32,
+    pid: i32,
+}
+impl WindowDescription {
+    fn new(window: Retained<SCWindow>) -> Option<Self> {
+        let id = unsafe { window.windowID() };
+        let pid = unsafe { window.owningApplication()?.processID() };
+        Some(Self { window, id, pid })
+    }
+}
 unsafe impl Send for WindowDescription {}
 
 #[derive(Default)]
@@ -709,7 +722,11 @@ fn direct_windows(requested: &[(u32, i32)]) -> Vec<WindowDescription> {
                             .owningApplication()
                             .is_some_and(|app| app.processID() == identity.1)
                 } {
-                    windows.push(WindowDescription(window));
+                    windows.push(WindowDescription {
+                        window,
+                        id: identity.0,
+                        pid: identity.1,
+                    });
                 }
             }
         }
@@ -741,7 +758,7 @@ fn open_source(
     let mut setup_us = [0; 3];
     let begin = Instant::now();
     let filter = unsafe {
-        SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window.0)
+        SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &window.window)
     };
     let size = unsafe { filter.contentRect().size };
     let scale = unsafe { filter.pointPixelScale() } as f64;
@@ -898,7 +915,7 @@ pub(super) struct Captures {
     slots: Vec<Slot>,
     opening: Vec<Opening>,
     requested: Vec<PreviewSource>,
-    windows: Option<Vec<Retained<SCWindow>>>,
+    windows: Option<Vec<WindowDescription>>,
     discovery: Arc<Mutex<Discovery>>,
     direct: Arc<Mutex<DirectDiscovery>>,
     direct_used: bool,
@@ -1052,12 +1069,10 @@ impl Captures {
         });
         if self.windows.as_ref().is_none_or(|windows| {
             identities_changed
-                && self.requested.iter().any(|p| {
-                    !windows.iter().any(|w| unsafe {
-                        w.windowID() == p.window_id
-                            && w.owningApplication().is_some_and(|a| a.processID() == p.process_id)
-                    })
-                })
+                && self
+                    .requested
+                    .iter()
+                    .any(|p| !windows.iter().any(|w| w.id == p.window_id && w.pid == p.process_id))
         }) {
             self.discover();
         }
@@ -1121,7 +1136,7 @@ impl Captures {
         let pump_start = Instant::now();
         if let Some(windows) = self.direct.lock().unwrap().result.take() {
             if self.windows.is_none() && !windows.is_empty() {
-                self.windows = Some(windows.into_iter().map(|w| w.0).collect());
+                self.windows = Some(windows);
                 self.direct_used = true;
                 self.reconcile = true;
             }
@@ -1182,31 +1197,20 @@ impl Captures {
                     .retain(|s| s.frame.is_some() || s.mailbox.lock().unwrap().latest.is_some());
             }
             self.unavailable.clear();
-            let inventory = unsafe { content.windows() };
+            // Copy identity once when discovery changes. Scheduling never sends
+            // Objective-C messages just to compare a window ID or its owning PID.
+            let inventory: Vec<_> =
+                unsafe { content.windows() }.iter().filter_map(WindowDescription::new).collect();
+            let valid = |id, pid| inventory.iter().any(|w| w.id == id && w.pid == pid);
             let cached_count = self.cached.len();
-            self.cached.retain(|f| {
-                inventory.iter().any(|w| unsafe {
-                    w.windowID() == f.window_id
-                        && w.owningApplication().is_some_and(|a| a.processID() == f.process_id)
-                })
-            });
+            self.cached.retain(|f| valid(f.window_id, f.process_id));
             self.reused_dirty |= self.cached.len() != cached_count;
-            REUSABLE.with(|cache| {
-                cache.borrow_mut().retain(|f| {
-                    inventory.iter().any(|w| unsafe {
-                        w.windowID() == f.window_id
-                            && w.owningApplication().is_some_and(|a| a.processID() == f.process_id)
-                    })
-                });
-            });
-            // Drop the full desktop inventory immediately; retain only the
-            // bounded requested descriptions, not thousands of system windows.
+            REUSABLE.with(|cache| cache.borrow_mut().retain(|f| valid(f.window_id, f.process_id)));
+            // Retain only requested descriptions after validating cached identities.
             self.windows = Some(
-                unsafe { content.windows() }
-                    .iter()
-                    .filter(|w| {
-                        self.requested.iter().any(|p| unsafe { w.windowID() == p.window_id })
-                    })
+                inventory
+                    .into_iter()
+                    .filter(|w| self.requested.iter().any(|p| w.id == p.window_id))
                     .collect(),
             );
             self.reconcile = true;
@@ -1278,10 +1282,9 @@ impl Captures {
                 request.mode = CaptureMode::Snapshot;
             }
             let request = &request;
-            let window = windows.iter().find(|w| unsafe {
-                w.windowID() == request.window_id
-                    && w.owningApplication().is_some_and(|a| a.processID() == request.process_id)
-            });
+            let window = windows
+                .iter()
+                .find(|w| w.id == request.window_id && w.pid == request.process_id);
             let Some(window) = window else {
                 if !self.discovery.lock().unwrap().pending {
                     self.unavailable
@@ -1319,7 +1322,7 @@ impl Captures {
                     process_id: request.process_id,
                     result: result.clone(),
                 });
-                let window = WindowDescription(window.clone());
+                let window = window.clone();
                 let request = request.clone();
                 let native = self.native_sizes.get(&request.window_id).copied();
                 let bootstrap =
@@ -1425,11 +1428,10 @@ impl Captures {
                 self.retired.0 += m.sequence;
                 self.retired.1 += m.replaced;
                 drop(m);
-                if windows.iter().any(|w| unsafe {
-                    w.windowID() == s.request.window_id
-                        && w.owningApplication()
-                            .is_some_and(|a| a.processID() == s.request.process_id)
-                }) {
+                if windows
+                    .iter()
+                    .any(|w| w.id == s.request.window_id && w.pid == s.request.process_id)
+                {
                     cache_frame(&mut self.cached, s, &mut self.unavailable);
                 }
             }
@@ -1524,6 +1526,7 @@ impl Captures {
             let first = slot.frame.is_none();
             self.cached.retain(|f| f.window_id != slot.request.window_id);
             slot.frame = Some(Frame {
+                dimensions: (CVPixelBufferGetWidth(&image), CVPixelBufferGetHeight(&image)),
                 texture,
                 sample: Arc::new(sample),
                 bytes,
@@ -1552,8 +1555,8 @@ impl Captures {
         self.source_frame(p).is_none_or(|frame| match p.resolution {
             CaptureResolution::Native => false,
             CaptureResolution::Thumbnail { width, height } => {
-                width as f64 > frame.texture.width() as f64 * 1.125
-                    || height as f64 > frame.texture.height() as f64 * 1.125
+                width as f64 > frame.dimensions.0 as f64 * 1.125
+                    || height as f64 > frame.dimensions.1 as f64 * 1.125
             }
         }) || self
             .cached
@@ -1811,5 +1814,173 @@ fn display_time(sample: &CMSampleBuffer) -> f64 {
         } else {
             (&*raw.cast::<NSNumber>()).unsignedLongLongValue() as f64 / CVGetHostClockFrequency()
         }
+    }
+}
+
+/// One asynchronous desktop-only snapshot for backgrounds whose native image URL
+/// is unavailable (for example a deleted source file or an animated wallpaper).
+/// Shares discovery and the process capture budget. No capture stream is created.
+/// Dropping the handle abandons delivery; framework completion owns its resources.
+/// The wake callback can run on a framework queue and must only schedule owner work.
+pub struct DesktopSnapshot {
+    state: Arc<Mutex<DesktopState>>,
+    _discovery: Arc<Mutex<Discovery>>,
+    _wake: Arc<Wake>,
+}
+#[derive(Default)]
+struct DesktopState {
+    started: bool,
+    finished: bool,
+    image: Option<Retained<objc2_core_graphics::CGImage>>,
+    error: Option<String>,
+}
+// CGImage is immutable. Transfer through this mutex; only the owner installs it in CA.
+unsafe impl Send for DesktopState {}
+impl DesktopSnapshot {
+    pub fn new(
+        display_id: u32,
+        scale: f64,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> PreviewResult<Self> {
+        if !scale.is_finite() || scale <= 0. {
+            return Err(PreviewError::InvalidScene);
+        }
+        let state = Arc::new(Mutex::new(DesktopState::default()));
+        let discovery = Arc::new(Mutex::new(Discovery::default()));
+        let result = Arc::downgrade(&state);
+        let metadata = Arc::downgrade(&discovery);
+        let notify = Arc::new(notify);
+        let deadline_notify = notify.clone();
+        let wake = Wake::new(move || {
+            let (Some(state), Some(discovery)) = (result.upgrade(), metadata.upgrade()) else {
+                return;
+            };
+            let Some(content) = discovery.lock().unwrap().result.take() else {
+                return;
+            };
+            let mut result = state.lock().unwrap();
+            if result.started || result.finished {
+                return;
+            }
+            result.started = true;
+            let content = match content {
+                Ok(c) => c,
+                Err(e) => {
+                    result.finished = true;
+                    result.error = Some(e);
+                    notify();
+                    return;
+                }
+            };
+            let display = unsafe { content.0.displays() }
+                .iter()
+                .find(|d| unsafe { d.displayID() } == display_id);
+            let Some(display) = display else {
+                result.finished = true;
+                result.error = Some("display unavailable".into());
+                notify();
+                return;
+            };
+            let Some(lease) = StreamLease::acquire(false) else {
+                result.finished = true;
+                result.error = Some("capture budget busy".into());
+                notify();
+                return;
+            };
+            let size = unsafe { display.frame() }.size;
+            let width = (size.width * scale).ceil().clamp(1., 16384.) as usize;
+            let height = (size.height * scale).ceil().clamp(1., 16384.) as usize;
+            if !lease.reserve(width * height * 8) {
+                result.finished = true;
+                result.error = Some("desktop snapshot exceeds capture budget".into());
+                notify();
+                return;
+            }
+            drop(result);
+            let desktop = objc2_core_graphics::CGWindowLevelForKey(
+                objc2_core_graphics::CGWindowLevelKey::DesktopWindowLevelKey,
+            ) as isize;
+            let desktop_windows: Vec<_> = unsafe { content.0.windows() }
+                .iter()
+                .filter(|w| unsafe { w.windowLayer() } <= desktop)
+                .collect();
+            let desktop_windows = NSArray::from_retained_slice(&desktop_windows);
+            let filter = unsafe {
+                SCContentFilter::initWithDisplay_includingWindows(
+                    SCContentFilter::alloc(),
+                    &display,
+                    &desktop_windows,
+                )
+            };
+            unsafe {
+                filter.setIncludeMenuBar(false);
+            }
+            let config = unsafe { SCStreamConfiguration::new() };
+            unsafe {
+                config.setWidth(width);
+                config.setHeight(height);
+                config.setShowsCursor(false);
+            }
+            let result = Arc::downgrade(&state);
+            let notify = notify.clone();
+            let callback = RcBlock::new(
+                move |image: *mut objc2_core_graphics::CGImage, error: *mut NSError| {
+                    let _lease = &lease;
+                    if let Some(state) = result.upgrade() {
+                        let mut state = state.lock().unwrap();
+                        if state.finished {
+                            return;
+                        }
+                        state.finished = true;
+                        state.image = unsafe { Retained::retain(image) };
+                        if state.image.is_none() {
+                            state.error = Some(
+                                unsafe { error.as_ref() }
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| "desktop capture returned no image".into()),
+                            );
+                        }
+                        drop(state);
+                        notify();
+                    }
+                },
+            );
+            unsafe {
+                SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
+                    &filter,
+                    &config,
+                    Some(&callback),
+                );
+            }
+        });
+        request_inventory(Some((&discovery, &wake)), &[], false);
+        let pending = Arc::downgrade(&state);
+        let _ = DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
+            dispatch2::DispatchQoS::UserInitiated,
+        ))
+        .after(Duration::from_secs(2).try_into().unwrap(), move || {
+            if let Some(state) = pending.upgrade() {
+                let mut state = state.lock().unwrap();
+                if !state.finished {
+                    state.finished = true;
+                    state.error = Some("desktop capture timed out".into());
+                    drop(state);
+                    deadline_notify();
+                }
+            }
+        });
+        Ok(Self {
+            state,
+            _discovery: discovery,
+            _wake: wake,
+        })
+    }
+
+    pub fn take_image(&self) -> Result<Option<Retained<objc2_core_graphics::CGImage>>, String> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(error) = state.error.take() {
+            return Err(error);
+        }
+        Ok(state.image.take())
     }
 }

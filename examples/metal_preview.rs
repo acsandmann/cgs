@@ -12,14 +12,39 @@ use objc2_foundation::{NSDate, NSRunLoop, NSString};
 use objc2_metal::MTLTexture;
 use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming};
 thread_local! { static COMPOSITOR: RefCell<Option<PreviewCompositor>> = const { RefCell::new(None) }; }
+thread_local! { static CAMERA_MOTION: RefCell<Option<(Instant,f64)>> = const { RefCell::new(None) }; }
+thread_local! { static CAMERA_COST: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) }; }
 thread_local! { static CANVASES: RefCell<Vec<PreviewCompositor>> = const { RefCell::new(Vec::new()) }; }
 fn render() {
     // A shared canvas must drive capture and pacing without rendering the source owner.
     if CANVASES.with(|c| c.borrow().is_empty()) {
         COMPOSITOR.with(|c| {
             if let Some(c) = c.borrow_mut().as_mut() {
+                let moving = CAMERA_MOTION.with(|m| {
+                    m.borrow().as_ref().is_some_and(|(start, duration)| {
+                        let t = start.elapsed().as_secs_f64();
+                        if c.has_display_update() {
+                            let scale = 0.65 + 0.25 * (t * 2.8).sin();
+                            let before = Instant::now();
+                            c.set_camera(cgs::PreviewCamera {
+                                scale: scale as f32,
+                                translation: [
+                                    (80. * (t * 2.).sin()) as f32,
+                                    (40. * (t * 2.).cos()) as f32,
+                                ],
+                            })
+                            .unwrap();
+                            CAMERA_COST
+                                .with(|v| v.borrow_mut().push(before.elapsed().as_nanos() as u64));
+                        }
+                        t < *duration
+                    })
+                });
                 if let Err(e) = c.render(Instant::now()) {
                     eprintln!("render error: {e}");
+                }
+                if moving {
+                    c.request_frame();
                 }
             }
         });
@@ -93,7 +118,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if self_test {
         seconds = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3.);
         let count: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
-        assert!((1..=20).contains(&count));
+        assert!((1..=40).contains(&count));
         for i in 0..count {
             let (w, h) = if i == 0 {
                 (960., 640.)
@@ -227,6 +252,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         c.set_scene(&scene)?;
     }
     c.show()?;
+    if args.iter().any(|a| a == "--camera-motion") {
+        CAMERA_MOTION.with(|m| m.replace(Some((Instant::now(), seconds))));
+        c.request_frame();
+    }
     println!(
         "overlay_window_id={} sources={:?}",
         c.window_id(),
@@ -234,6 +263,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     COMPOSITOR.with(|slot| slot.replace(Some(c)));
     run_for(seconds);
+    CAMERA_MOTION.with(|m| m.replace(None));
+    CAMERA_COST.with(|v| {
+        let mut costs = v.borrow_mut();
+        costs.sort_unstable();
+        if !costs.is_empty() {
+            println!(
+                "camera_update_ns samples={} p50={} p95={} p99={}",
+                costs.len(),
+                costs[costs.len() / 2],
+                costs[costs.len() * 95 / 100],
+                costs[costs.len() * 99 / 100]
+            );
+        }
+    });
     let stats = compositor(|c| c.stats());
     println!(
         "elapsed_ms={} stats={stats:?} diagnostics={:?}",
@@ -247,6 +290,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             compositor(|c| c.source_status(p.window_id))
         );
     }
+    if args.iter().any(|a| a == "--expect-unavailable") {
+        assert_eq!(stats.captured_frames, 0);
+        assert_eq!(stats.submitted_frames, 0);
+        assert!(
+            CAMERA_COST.with(|v| v.borrow().len() > 10),
+            "camera clock stalled without capture"
+        );
+        compositor(|c| c.hide())?;
+        run_for(0.3);
+        assert_eq!(compositor(|c| c.stats().process_capture_jobs), 0);
+        drop(COMPOSITOR.with(|c| c.take()));
+        println!("unavailable_source_camera_clock=ok shutdown_jobs=0");
+        return Ok(());
+    }
     assert!(stats.captured_frames > 0, "no valid capture frames");
     assert!(
         stats.presented_frames > 0,
@@ -256,9 +313,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.iter().any(|a| a == "--measure-only") {
         compositor(|c| c.hide())?;
         run_for(0.3);
-        println!("shutdown_jobs_after_300ms={}", compositor(|c| c.stats().process_capture_jobs));
+        println!(
+            "shutdown_jobs_after_300ms={}",
+            compositor(|c| c.stats().process_capture_jobs)
+        );
         run_for(1.7);
-        println!("shutdown_jobs_after_2s={}", compositor(|c| c.stats().process_capture_jobs));
+        println!(
+            "shutdown_jobs_after_2s={}",
+            compositor(|c| c.stats().process_capture_jobs)
+        );
         assert_eq!(compositor(|c| c.stats().process_capture_jobs), 0);
         drop(COMPOSITOR.with(|c| c.take()));
         drop(sources);
@@ -629,6 +692,30 @@ fn canvas_probe(
     screenshot("reversed.png");
     run_for(0.3);
     screenshot("reversed-rebased.png");
+    {
+        let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+        CANVASES.with(|s| {
+            s.borrow_mut()[0].set_camera(cgs::PreviewCamera {
+                scale: 0.5,
+                translation: [40., 20.],
+            })
+        })?;
+    }
+    let submitted = CANVASES.with(|s| s.borrow()[0].stats().submitted_frames);
+    screenshot("camera-held.png");
+    assert_eq!(
+        submitted,
+        CANVASES.with(|s| s.borrow()[0].stats().submitted_frames)
+    );
+    run_for(0.4);
+    screenshot("camera-rebased.png");
+    {
+        let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+        CANVASES.with(|s| s.borrow_mut()[0].set_camera(cgs::PreviewCamera::default()))?;
+    }
+    screenshot("camera-reversed.png");
+    run_for(0.3);
+    screenshot("camera-reversed-rebased.png");
     CANVASES.with(|s| s.borrow_mut().clear());
     compositor(|c| c.hide())?;
     run_for(0.3);

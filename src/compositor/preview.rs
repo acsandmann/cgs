@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use capture::Captures;
+pub use capture::DesktopSnapshot;
 use gpu::Gpu;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect};
 use objc2_metal::MTLDrawable;
 use objc2_quartz_core::{CALayer, CAMetalLayer};
 
@@ -329,6 +330,7 @@ pub struct PreviewCompositor {
     revision: u64,
     offset: CGPoint,
     presented_offset: CGPoint,
+    presented_camera: PreviewCamera,
     _owner: std::marker::PhantomData<Rc<()>>,
 }
 impl PreviewCompositor {
@@ -406,6 +408,8 @@ impl PreviewCompositor {
         layer.setDisplaySyncEnabled(false);
         let local = CGRect::new(CGPoint::ZERO, bounds.size);
         layer.setFrame(local);
+        layer.setAnchorPoint(CGPoint::ZERO);
+        layer.setPosition(CGPoint::ZERO);
         layer.setContentsScale(scale);
         layer.setDrawableSize(objc2_core_foundation::CGSize::new(
             bounds.size.width * scale,
@@ -456,8 +460,14 @@ impl PreviewCompositor {
             revision: 1,
             offset: CGPoint::ZERO,
             presented_offset: CGPoint::ZERO,
+            presented_camera: PreviewCamera::default(),
             _owner: std::marker::PhantomData,
         })
+    }
+
+    /// The current visual revision has reached hardware presentation, independently of missing sources.
+    pub fn is_presented(&self) -> bool {
+        self.visible && !self._root.isHidden() && self.gpu.visual_is_presented(self.revision)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -501,7 +511,9 @@ impl PreviewCompositor {
         )
     }
 
-    /// Change the shared camera without updating source inventory or per-window transforms.
+    /// Change the shared camera without updating capture or per-window transforms.
+    /// Cached pixels transform immediately in the caller’s CA transaction. A newly
+    /// rendered drawable atomically rebases that transform when presented.
     pub fn set_camera(&mut self, camera: PreviewCamera) -> PreviewResult<()> {
         if !camera.scale.is_finite()
             || camera.scale <= 0.
@@ -511,6 +523,7 @@ impl PreviewCompositor {
         }
         if self.camera != camera {
             self.camera = camera;
+            self.position_layer();
             self.revision += 1;
             self.dirty = true;
             self.wake.notify();
@@ -813,13 +826,21 @@ impl PreviewCompositor {
 
     fn position_layer(&self) {
         let _transaction = LayerTransaction::disabled();
-        self.layer.setFrame(CGRect::new(
-            CGPoint::new(
-                self.offset.x - self.presented_offset.x,
-                self.offset.y - self.presented_offset.y,
-            ),
-            self.bounds.size,
+        let ratio = self.camera.scale as f64 / self.presented_camera.scale as f64;
+        self.layer.setPosition(CGPoint::new(
+            (self.offset.x - self.presented_offset.x) * ratio + self.camera.translation[0] as f64
+                - self.presented_camera.translation[0] as f64 * ratio,
+            (self.offset.y - self.presented_offset.y) * ratio + self.camera.translation[1] as f64
+                - self.presented_camera.translation[1] as f64 * ratio,
         ));
+        self.layer.setAffineTransform(CGAffineTransform {
+            a: ratio,
+            b: 0.,
+            c: 0.,
+            d: ratio,
+            tx: 0.,
+            ty: 0.,
+        });
     }
 
     pub fn resize(&mut self, bounds: CGRect, scale: f64) -> PreviewResult<()> {
@@ -838,7 +859,7 @@ impl PreviewCompositor {
             surface.set_bounds_in(&transaction, local);
         }
         self._root.setFrame(local);
-        self.layer.setFrame(local);
+        self.layer.setBounds(local);
         self.layer.setContentsScale(scale);
         self.layer.setDrawableSize(objc2_core_foundation::CGSize::new(
             bounds.size.width * scale,
@@ -1031,8 +1052,11 @@ impl PreviewCompositor {
         }
         if let Some(presentation) = self.gpu.take_presentation() {
             let _transaction = LayerTransaction::disabled().flush_on_commit();
-            if self.presented_offset != presentation.offset {
+            if self.presented_offset != presentation.offset
+                || self.presented_camera != presentation.camera
+            {
                 self.presented_offset = presentation.offset;
+                self.presented_camera = presentation.camera;
                 self.position_layer();
             }
             self._root.setHidden(false);

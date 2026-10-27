@@ -28,6 +28,11 @@ if '--canvases' in sys.argv:
     assert vertical == [shift(b,0,160) for b in horizontal], geometry
     assert rebased == vertical, geometry
     assert reversed_ == reversed_rebased == before, geometry
+    # Owner-held camera affine must already match the subsequently rendered frame.
+    camera = [boxes(name) for name in ('camera-held.png','camera-rebased.png','camera-reversed.png','camera-reversed-rebased.png')]
+    assert camera[0] == camera[1], camera
+    assert camera[2] == camera[3] == boxes('before.png'), camera
+    assert camera[0] != boxes('before.png'), 'camera waited for GPU work'
     print('independent horizontal scrolling, shared vertical movement and reversal match:',geometry)
     raise SystemExit(0)
 images = [Image.open(root/name).convert('RGBA') for name in ('before.png','translated.png','rebased.png')]

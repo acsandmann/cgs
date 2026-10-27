@@ -31,6 +31,7 @@ struct Params {
 pub(super) struct Presentation {
     pub drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     pub offset: CGPoint,
+    pub camera: PreviewCamera,
     callback_time: f64,
     sequence: u64,
 }
@@ -52,6 +53,7 @@ pub(super) struct Gpu {
     presented_sequence: u64,
     created: f64,
     presented_revision: Arc<AtomicU64>,
+    visual_revision: Arc<AtomicU64>,
 }
 // All compositors are owner/main-thread confined. Share immutable expensive
 // Metal state across displays and reopenings without cross-thread ObjC transfers.
@@ -145,6 +147,7 @@ impl Gpu {
             presented_sequence: 0,
             created,
             presented_revision: Arc::default(),
+            visual_revision: Arc::default(),
         })
     }
 
@@ -160,6 +163,10 @@ impl Gpu {
     }
 
     pub fn has_submitted(&self) -> bool { self.session_submitted }
+
+    pub fn visual_is_presented(&self, revision: u64) -> bool {
+        self.visual_revision.load(Ordering::Acquire) == revision
+    }
 
     pub fn is_presented(&self, revision: u64) -> bool {
         self.presented_revision.load(Ordering::Acquire) == revision
@@ -360,6 +367,7 @@ impl Gpu {
         let session = presentation_metrics.lock().unwrap().session;
         let presentation_state = Arc::downgrade(&self.scheduled);
         let presented_revision = self.presented_revision.clone();
+        let visual_revision = self.visual_revision.clone();
         let presentation_wake = self.wake.clone();
         let created = self.created;
         let presented = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
@@ -369,6 +377,7 @@ impl Gpu {
             {
                 return;
             }
+            visual_revision.fetch_max(revision, Ordering::AcqRel);
             if scene_complete {
                 presented_revision.fetch_max(revision, Ordering::AcqRel);
             }
@@ -441,6 +450,7 @@ impl Gpu {
         let packet = Mutex::new(Some(Presentation {
             drawable: unsafe { Retained::retain(drawable as *const _ as *mut _) }.unwrap(),
             offset,
+            camera,
             callback_time: 0.,
             sequence: self.sequence,
         }));

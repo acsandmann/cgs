@@ -13,11 +13,13 @@ p.add_argument('--out', type=pathlib.Path, required=True)
 p.add_argument('--seconds', type=float, default=5)
 p.add_argument('--attached', action='store_true')
 p.add_argument('--adaptive', action='store_true')
+p.add_argument('--camera-motion', action='store_true')
+p.add_argument('--measure-only', action='store_true')
 a = p.parse_args()
 a.out.mkdir(parents=True, exist_ok=True)
 results = []
-for count in (1, 5, 10, 20):
-    run = subprocess.run(['/usr/bin/time','-l',str(a.binary.resolve()),'--self-test',str(a.seconds),str(count)] + (['--attached'] if a.attached else []) + (['--adaptive'] if a.adaptive else []), capture_output=True, text=True)
+for count in (1, 5, 10, 20, 40):
+    run = subprocess.run(['/usr/bin/time','-l',str(a.binary.resolve()),'--self-test',str(a.seconds),str(count)] + (['--attached'] if a.attached else []) + (['--adaptive'] if a.adaptive else []) + (['--camera-motion'] if a.camera_motion else []) + (['--measure-only'] if a.measure_only else []), capture_output=True, text=True)
     output = run.stdout + run.stderr
     (a.out / f'{count}-windows.log').write_text(output)
     if run.returncode: raise SystemExit(f'{count}-window workload failed; see {a.out}')
@@ -28,6 +30,8 @@ for count in (1, 5, 10, 20):
     for key in ('cpu_render','gpu_render','capture_to_present','presentation_interval','submission_to_present','callback_to_owner','presentation_lateness'):
         match = re.search(key+r': FrameTimes \{ samples: (\d+), p50_us: (\d+), p95_us: (\d+), p99_us: (\d+) \}',output)
         if match: record[key] = dict(zip(('samples','p50_us','p95_us','p99_us'),map(int,match.groups())))
+    match = re.search(r'camera_update_ns samples=(\d+) p50=(\d+) p95=(\d+) p99=(\d+)',output)
+    if match: record['camera_update_ns'] = dict(zip(('samples','p50','p95','p99'),map(int,match.groups())))
     match = re.search(r'(\d+)\s+maximum resident set size',output)
     if match: record['process_peak_rss_bytes'] = int(match[1])
     match = re.search(r'([\d.]+) real\s+([\d.]+) user\s+([\d.]+) sys',output)

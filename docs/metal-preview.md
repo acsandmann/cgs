@@ -177,3 +177,26 @@ canvases trade additional layer/drawable pools for synchronous geometry; they do
 not add capture streams. No render graphs, atlases, compute passes or indirect
 command buffers were added. A future spatial overview can use one canvas/camera
 when movement is shared, and multiple canvases only for independently moving content.
+
+## Spatial camera integration (2026-10-27)
+
+`set_camera` now transforms the last presented drawable in the caller's CA
+transaction. The next drawable atomically rebases to the camera used to encode
+it; capture readiness does not gate motion. `is_presented` reports the visual
+revision independently from whether every source has pixels. Source identities
+and imported texture dimensions are cached at their acquisition boundaries,
+avoiding repeated Objective-C metadata calls during capture reconciliation.
+`DesktopSnapshot` provides an asynchronous, permission-respecting SCK screenshot
+of desktop-layer windows for hosts whose wallpaper asset is unavailable. It uses
+the shared inventory and budget, creates no continuous desktop stream, and weakly
+owns its delivery callback.
+
+The native camera probe now covers translation, scaling, rebase and reversal with
+zero intervening GPU submissions. The shipped Metal shader's readback test and
+all-target compilation pass. `--camera-motion` records setter CPU time;
+`--expect-unavailable` checks that the native camera clock continues without source
+frames. The benchmark accepts 40 sources. These metrics are not input-to-photon
+measurements. One matched one-window trial put setter CPU p50 at 0.082 ms versus
+0.001 ms before this change: the additional CA work moves cached pixels immediately,
+whereas the previous setter only requested a later GPU frame. One pair is not
+sufficient to establish a throughput or latency distribution improvement.
