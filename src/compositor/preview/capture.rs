@@ -1953,7 +1953,12 @@ impl DesktopSnapshot {
                 );
             }
         });
-        request_inventory(Some((&discovery, &wake)), &[], false);
+        // Unlock/display changes can leave a recent inventory without this
+        // display. An empty source list must not make that cache look usable.
+        let missing_display = INVENTORY.lock().unwrap().content.as_ref().is_none_or(|(_, c)| {
+            !unsafe { c.0.displays() }.iter().any(|d| unsafe { d.displayID() } == display_id)
+        });
+        request_inventory(Some((&discovery, &wake)), &[], missing_display);
         let pending = Arc::downgrade(&state);
         let _ = DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
             dispatch2::DispatchQoS::UserInitiated,
