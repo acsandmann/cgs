@@ -46,5 +46,11 @@ pub(super) struct Metrics {
     pub first_present_us: u64,
     pub cpu: Timings,
     pub gpu: Timings,
+    pub last_gpu_us: u64,
+    pub last_presented_time: f64,
+    pub presentation_interval: Timings,
+    pub submission_to_present: Timings,
+    pub callback_to_owner: Timings,
+    pub presentation_lateness: Timings,
     pub capture_to_present: Timings,
 }

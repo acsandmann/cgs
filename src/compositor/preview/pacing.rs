@@ -58,6 +58,8 @@ impl Pacing {
         Self { link, target }
     }
 
+    pub fn has_update(&self) -> bool { self.target.ivars().update.borrow().is_some() }
+
     pub fn take(&self) -> Option<Retained<CAMetalDisplayLinkUpdate>> {
         self.target.ivars().update.borrow_mut().take()
     }

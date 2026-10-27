@@ -2,6 +2,7 @@
 using namespace metal;
 struct Params {
     float4x4 transform;
+    float4 camera; // scale, translation x/y, reserved
     float4 rect;
     float4 clip;
     float4 viewport; // width, height, opacity, corner radius
@@ -14,6 +15,7 @@ vertex Vertex preview_vertex(uint id [[vertex_id]], constant Params &p [[buffer(
     const float2 corners[] = {float2(0,0), float2(1,0), float2(0,1), float2(1,1)};
     float2 uv = corners[id];
     float4 pos = p.transform * float4(p.rect.xy + uv * p.rect.zw, 0, 1);
+    pos.xy = pos.xy * p.camera.x + p.camera.yz * pos.w;
     Vertex v;
     v.position = float4(2 * pos.x / p.viewport.x - pos.w,
                        pos.w - 2 * pos.y / p.viewport.y, pos.z, pos.w);

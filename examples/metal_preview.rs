@@ -9,17 +9,28 @@ use cgs::{
 };
 use objc2_core_graphics::{CGColor, CGDisplayBounds, CGMainDisplayID};
 use objc2_foundation::{NSDate, NSRunLoop, NSString};
+use objc2_metal::MTLTexture;
 use objc2_quartz_core::{CABasicAnimation, CALayer, CAMediaTiming};
 thread_local! { static COMPOSITOR: RefCell<Option<PreviewCompositor>> = const { RefCell::new(None) }; }
+thread_local! { static CANVASES: RefCell<Vec<PreviewCompositor>> = const { RefCell::new(Vec::new()) }; }
 fn render() {
-    COMPOSITOR.with(|c| {
-        if let Some(c) = c.borrow_mut().as_mut() {
-            if let Err(e) = c.render(Instant::now()) {
-                eprintln!("render error: {e}");
+    // A shared canvas must drive capture and pacing without rendering the source owner.
+    if CANVASES.with(|c| c.borrow().is_empty()) {
+        COMPOSITOR.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                if let Err(e) = c.render(Instant::now()) {
+                    eprintln!("render error: {e}");
+                }
             }
+        });
+    }
+    CANVASES.with(|canvases| {
+        for canvas in &mut *canvases.borrow_mut() {
+            canvas.render(Instant::now()).expect("canvas render");
         }
     });
 }
+
 fn run_for(seconds: f64) {
     let deadline = NSDate::dateWithTimeIntervalSinceNow(seconds);
     while deadline.timeIntervalSinceNow() > 0. {
@@ -168,12 +179,53 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             frame(100., 100., 960., 640.),
         ));
     }
+    if let Some(i) = args.iter().position(|a| a == "--canvas-probe") {
+        canvas_probe(bounds, &scene, std::path::Path::new(&args[i + 1]))?;
+        drop(sources);
+        return Ok(());
+    }
     let start = Instant::now();
-    let mut c = PreviewCompositor::new(bounds, 2., || {
+    // Exercise the same renderer in a caller-owned CAContext, including its
+    // existing native scroll probe and lifecycle/transition assertions.
+    let host = if args.iter().any(|a| a == "--attached") {
+        let window = cgs::CgsWindow::new_compositor(bounds, 0.)?;
+        window.set_resolution(2.)?;
+        window.set_level(25)?;
+        let root = CALayer::layer();
+        root.setFrame(frame(0., 0., bounds.size.width, bounds.size.height));
+        root.setGeometryFlipped(true);
+        let surface = cgs::WindowSurface::new_scaled(window.id(), root.bounds(), &root, 2.)?;
+        window.order_above(None)?;
+        Some((surface, window, root))
+    } else {
+        None
+    };
+    let wake = || {
         dispatch2::DispatchQueue::main().exec_async(render);
-    })?;
-    c.set_level(25)?;
-    c.set_scene(&scene)?;
+    };
+    let mut c = if let Some((_, window, root)) = &host {
+        PreviewCompositor::new_attached(window.id(), root, bounds, 2., wake)?
+    } else {
+        let c = PreviewCompositor::new(bounds, 2., wake)?;
+        c.set_level(25)?;
+        c
+    };
+    if args.iter().any(|a| a == "--adaptive") {
+        let policies: Vec<_> = scene
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut source = cgs::PreviewSource::from(p);
+                source.frame_interval =
+                    std::time::Duration::from_secs_f64(1. / if i == 0 { 60. } else { 30. });
+                source
+            })
+            .collect();
+        c.set_sources(&policies)?;
+        c.set_visual_scene(&scene)?;
+    } else {
+        c.set_scene(&scene)?;
+    }
     c.show()?;
     println!(
         "overlay_window_id={} sources={:?}",
@@ -183,7 +235,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     COMPOSITOR.with(|slot| slot.replace(Some(c)));
     run_for(seconds);
     let stats = compositor(|c| c.stats());
-    println!("elapsed_ms={} stats={stats:?}", start.elapsed().as_millis());
+    println!(
+        "elapsed_ms={} stats={stats:?} diagnostics={:?}",
+        start.elapsed().as_millis(),
+        compositor(|c| c.diagnostics())
+    );
     for p in &scene {
         println!(
             "source={} status={:?}",
@@ -197,6 +253,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "no actual Metal presentations: unlock the graphical session before running native presentation tests"
     );
     assert!(stats.streams <= 8, "capture pool exceeded bound");
+    if args.iter().any(|a| a == "--measure-only") {
+        compositor(|c| c.hide())?;
+        run_for(0.3);
+        assert_eq!(compositor(|c| c.stats().process_capture_jobs), 0);
+        drop(COMPOSITOR.with(|c| c.take()));
+        drop(sources);
+        return Ok(());
+    }
     if self_test {
         if let Some(i) = args.iter().position(|a| a == "--scroll-probe") {
             let dir = std::path::Path::new(&args[i + 1]);
@@ -248,6 +312,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "source never became usable"
             );
         }
+        let retained =
+            compositor(|c| c.captured_frame(scene[0].window_id)).expect("retained source frame");
+        let mut consumer = PreviewCompositor::new(bounds, 2., || {})?;
+        consumer.set_scene(&scene[..1])?;
+        consumer.reuse_frame(&retained);
+        assert!(
+            consumer.has_frame(scene[0].window_id),
+            "frame transfer lost last-valid pixels"
+        );
+        assert_eq!(
+            consumer.captured_frame(scene[0].window_id).unwrap().texture_coordinates(),
+            retained.texture_coordinates()
+        );
+        drop(consumer);
+        drop(retained);
+        // The shared camera must not restart paused source capture.
         let mut destination = scene.clone();
         for p in &mut destination {
             p.frame.origin.x += 70.;
@@ -271,6 +351,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             compositor(|c| c.set_progress(progress))?;
             run_for(0.05);
         }
+        for (_, _, root) in &sources {
+            if let Some(children) = unsafe { root.sublayers() } {
+                for child in children {
+                    child.removeAllAnimations();
+                }
+            }
+        }
+        run_for(0.5);
+        let static_submissions = compositor(|c| c.stats().submitted_frames);
+        run_for(0.2);
+        println!(
+            "static_live_submissions={}",
+            compositor(|c| c.stats().submitted_frames) - static_submissions
+        );
         let mut snapshot = scene.clone();
         for p in &mut snapshot {
             p.mode = CaptureMode::Snapshot;
@@ -282,6 +376,64 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             0,
             "snapshot streams failed to stop"
         );
+        let idle_submissions = compositor(|c| c.stats().submitted_frames);
+        run_for(0.2);
+        assert_eq!(
+            compositor(|c| c.stats().submitted_frames),
+            idle_submissions,
+            "unchanged snapshot scene kept rendering"
+        );
+        // Visual-only updates preserve a paused capture and last-valid pixels.
+        let policies: Vec<_> = snapshot.iter().map(cgs::PreviewSource::from).collect();
+        compositor(|c| c.set_sources(&policies))?;
+        let before_policy = compositor(|c| c.stats().submitted_frames);
+        let mut priority = policies[0];
+        priority.priority += 1;
+        compositor(|c| c.update_sources(&[priority]))?;
+        run_for(0.1);
+        assert_eq!(
+            compositor(|c| c.stats().submitted_frames),
+            before_policy,
+            "capture priority alone submitted a GPU frame"
+        );
+        if policies.len() > 1 {
+            let mut quality = policies[1];
+            quality.resolution = CaptureResolution::Thumbnail { width: 800, height: 600 };
+            compositor(|c| c.update_sources(&[quality]))?;
+            assert!(
+                compositor(|c| c.has_frame(quality.window_id)),
+                "quality upgrade lost last-valid pixels"
+            );
+            run_for(0.5);
+            assert_eq!(
+                compositor(|c| c.captured_frame(quality.window_id).unwrap().texture().width()),
+                800,
+                "paused snapshot failed to upgrade resolution"
+            );
+            assert_eq!(compositor(|c| c.stats().streams), 0);
+        }
+        snapshot[0].border_width = 4.;
+        compositor(|c| c.set_visual_scene(&snapshot))?;
+        run_for(0.2);
+        assert!(compositor(|c| c.has_frame(snapshot[0].window_id)));
+        assert_eq!(
+            compositor(|c| c.stats().streams),
+            0,
+            "visual edit resumed capture"
+        );
+        compositor(|c| {
+            c.set_camera(cgs::PreviewCamera {
+                scale: 0.9,
+                translation: [4., 8.],
+            })
+        })?;
+        run_for(0.1);
+        assert_eq!(
+            compositor(|c| c.stats().streams),
+            0,
+            "camera edit resumed capture"
+        );
+        compositor(|c| c.set_camera(cgs::PreviewCamera::default()))?;
         compositor(|c| c.set_scene(&scene))?;
         run_for(0.5);
         assert!(
@@ -328,6 +480,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             "hide retained captured samples"
         );
         assert_eq!(compositor(|c| c.stats().streams), 0);
+        assert_eq!(
+            compositor(|c| c.stats().process_capture_jobs),
+            0,
+            "capture jobs survived close"
+        );
+        assert_eq!(
+            compositor(|c| c.diagnostics().process_reserved_capture_bytes),
+            0,
+            "reservations survived close"
+        );
+        if let Some((_, window, root)) = &host {
+            compositor(|c| c.attach_to(window.id(), root))?;
+            compositor(|c| c.set_scene(if scene.len() > 1 { &scene[1..2] } else { &[] }))?;
+            compositor(|c| c.show())?;
+            run_for(0.4);
+            if scene.len() > 1 {
+                assert!(compositor(|c| c.is_ready()), "attached reopen did not present");
+            }
+            compositor(|c| c.hide())?;
+            run_for(0.2);
+        }
         let hidden = compositor(|c| c.stats().submitted_frames);
         run_for(0.2);
         assert_eq!(
@@ -355,5 +528,115 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(sources);
     run_for(0.1);
+    Ok(())
+}
+
+// A caller-owned nested CA hierarchy and two independent canvases share one
+// source inventory. Screenshots are taken without yielding the owner between
+// input, sibling movement and cached-pixel movement.
+fn canvas_probe(
+    bounds: CGRect,
+    scene: &[Preview],
+    out: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(out)?;
+    let window = cgs::CgsWindow::new_compositor(bounds, 0.)?;
+    window.set_resolution(2.)?;
+    window.set_level(25)?;
+    let root = CALayer::layer();
+    root.setFrame(frame(0., 0., bounds.size.width, bounds.size.height));
+    root.setGeometryFlipped(true);
+    let surface = cgs::WindowSurface::new_scaled(window.id(), root.bounds(), &root, 2.)?;
+    let row = CALayer::layer();
+    row.setFrame(frame(0., 60., bounds.size.width, 400.));
+    row.setMasksToBounds(true);
+    root.addSublayer(&row);
+    let mut owner = PreviewCompositor::new_attached(window.id(), &root, bounds, 2., || {
+        dispatch2::DispatchQueue::main().exec_async(render);
+    })?;
+    owner.set_sources(&scene.iter().map(cgs::PreviewSource::from).collect::<Vec<_>>())?;
+    owner.set_visual_scene(&[])?;
+    owner.show()?;
+    let mut canvas =
+        owner.new_canvas(window.id(), &row, frame(0., 0., bounds.size.width, 400.), 2.)?;
+    let mut local = scene[0].clone();
+    local.frame = frame(100., 100., 240., 160.);
+    canvas.set_visual_scene(&[local.clone()])?;
+    canvas.show()?;
+    // A second canvas proves shared capture has no extra streams or factories.
+    let mut sibling =
+        owner.new_canvas(window.id(), &row, frame(0., 0., bounds.size.width, 400.), 2.)?;
+    let mut second = local.clone();
+    second.frame.origin.x += 400.;
+    sibling.set_visual_scene(&[second])?;
+    sibling.show()?;
+    COMPOSITOR.with(|slot| slot.replace(Some(owner)));
+    CANVASES.with(|slot| slot.replace(vec![canvas, sibling]));
+    window.order_above(None)?;
+    surface.flush();
+    run_for(2.);
+    assert!(
+        CANVASES.with(|s| s.borrow().iter().all(|c| c.is_ready())),
+        "shared canvases never presented"
+    );
+    let before = compositor(|c| c.stats());
+    assert!(
+        before.streams <= 8 && before.process_capture_jobs <= 8,
+        "canvases duplicated capture"
+    );
+    let screenshot = |name: &str| {
+        assert!(
+            std::process::Command::new("screencapture")
+                .args(["-x", "-l", &window.id().to_string()])
+                .arg(out.join(name))
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    screenshot("before.png");
+    let submitted =
+        CANVASES.with(|s| s.borrow().iter().map(|c| c.stats().submitted_frames).sum::<u64>());
+    {
+        let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+        CANVASES.with(|s| s.borrow_mut()[0].translate(CGPoint::new(80., 0.)))?;
+    }
+    screenshot("horizontal.png");
+    assert_eq!(
+        submitted,
+        CANVASES.with(|s| s.borrow().iter().map(|c| c.stats().submitted_frames).sum::<u64>())
+    );
+    {
+        let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+        row.setFrame(frame(0., 140., bounds.size.width, 400.));
+    }
+    screenshot("vertical.png");
+    assert_eq!(
+        submitted,
+        CANVASES.with(|s| s.borrow().iter().map(|c| c.stats().submitted_frames).sum::<u64>())
+    );
+    run_for(0.4);
+    screenshot("rebased.png");
+    // Immediate direction reversal while an earlier replacement may be queued.
+    {
+        let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+        CANVASES.with(|s| s.borrow_mut()[0].translate(CGPoint::new(-80., 0.)))?;
+        row.setFrame(frame(0., 60., bounds.size.width, 400.));
+    }
+    screenshot("reversed.png");
+    run_for(0.3);
+    screenshot("reversed-rebased.png");
+    CANVASES.with(|s| s.borrow_mut().clear());
+    compositor(|c| c.hide())?;
+    run_for(0.3);
+    let after = compositor(|c| c.stats());
+    assert_eq!(after.process_capture_jobs, 0);
+    assert_eq!(compositor(|c| c.diagnostics().process_reserved_capture_bytes), 0);
+    drop(COMPOSITOR.with(|s| s.take()));
+    std::fs::write(
+        out.join("presented.txt"),
+        format!("shared_canvas_before={before:?} after={after:?}\n"),
+    )?;
+    println!("shared_canvas_before={before:?} after={after:?}");
     Ok(())
 }

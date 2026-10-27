@@ -11,19 +11,21 @@ p = argparse.ArgumentParser()
 p.add_argument('--binary', type=pathlib.Path, required=True)
 p.add_argument('--out', type=pathlib.Path, required=True)
 p.add_argument('--seconds', type=float, default=5)
+p.add_argument('--attached', action='store_true')
+p.add_argument('--adaptive', action='store_true')
 a = p.parse_args()
 a.out.mkdir(parents=True, exist_ok=True)
 results = []
 for count in (1, 5, 10, 20):
-    run = subprocess.run(['/usr/bin/time','-l',str(a.binary.resolve()),'--self-test',str(a.seconds),str(count)], capture_output=True, text=True)
+    run = subprocess.run(['/usr/bin/time','-l',str(a.binary.resolve()),'--self-test',str(a.seconds),str(count)] + (['--attached'] if a.attached else []) + (['--adaptive'] if a.adaptive else []), capture_output=True, text=True)
     output = run.stdout + run.stderr
     (a.out / f'{count}-windows.log').write_text(output)
     if run.returncode: raise SystemExit(f'{count}-window workload failed; see {a.out}')
     record = {'windows':count}
-    for key in ('captured_frames','replaced_frames','submitted_frames','presented_frames','streams','process_streams','latest_frame_bytes','reserved_capture_bytes','first_frame_us','last_callback_us','last_capture_to_gpu_us'):
+    for key in ('captured_frames','replaced_frames','submitted_frames','presented_frames','streams','process_streams','latest_frame_bytes','reserved_capture_bytes','first_frame_us','first_present_us','process_reserved_capture_bytes','last_callback_us','last_capture_to_gpu_us'):
         match = re.search(r'\b'+key+r': (\d+)', output)
         if match: record[key] = int(match[1])
-    for key in ('cpu_render','gpu_render','capture_to_present'):
+    for key in ('cpu_render','gpu_render','capture_to_present','presentation_interval','submission_to_present','callback_to_owner','presentation_lateness'):
         match = re.search(key+r': FrameTimes \{ samples: (\d+), p50_us: (\d+), p95_us: (\d+), p99_us: (\d+) \}',output)
         if match: record[key] = dict(zip(('samples','p50_us','p95_us','p99_us'),map(int,match.groups())))
     match = re.search(r'(\d+)\s+maximum resident set size',output)

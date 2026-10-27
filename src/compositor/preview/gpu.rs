@@ -12,11 +12,12 @@ use objc2_metal::*;
 use objc2_quartz_core::CAMetalDrawable;
 
 use super::capture::Captures;
-use super::{Preview, PreviewError, PreviewResult, PreviewStats, Wake};
+use super::{Preview, PreviewCamera, PreviewError, PreviewResult, PreviewStats, Wake};
 
 #[repr(C)]
 struct Params {
     transform: [f32; 16],
+    camera: [f32; 4],
     rect: [f32; 4],
     clip: [f32; 4],
     viewport: [f32; 4],
@@ -30,6 +31,7 @@ struct Params {
 pub(super) struct Presentation {
     pub drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
     pub offset: CGPoint,
+    callback_time: f64,
     sequence: u64,
 }
 unsafe impl Send for Presentation {}
@@ -39,14 +41,14 @@ pub(super) struct Gpu {
     pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
     in_flight: Arc<AtomicUsize>,
-    commands: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     wake: Arc<Wake>,
     stats: PreviewStats,
     metrics: Arc<Mutex<super::timing::Metrics>>,
     last_sources: Vec<(u32, u64)>,
-    failure: Option<String>,
+    failure: Arc<Mutex<Option<String>>>,
     scheduled: Arc<Mutex<(u64, Option<Presentation>)>>,
     sequence: u64,
+    session_submitted: bool,
     presented_sequence: u64,
     created: f64,
     presented_revision: Arc<AtomicU64>,
@@ -132,14 +134,14 @@ impl Gpu {
             pipeline,
             sampler,
             in_flight: Arc::new(AtomicUsize::new(0)),
-            commands: Vec::with_capacity(2),
             wake,
             stats: PreviewStats::default(),
             metrics: Arc::default(),
             last_sources: Vec::with_capacity(8),
-            failure: None,
+            failure: Arc::default(),
             scheduled: Arc::default(),
             sequence: 0,
+            session_submitted: false,
             presented_sequence: 0,
             created,
             presented_revision: Arc::default(),
@@ -148,14 +150,16 @@ impl Gpu {
 
     pub fn begin_session(&mut self) {
         self.discard_presentation();
+        self.session_submitted = false;
         self.created = objc2_quartz_core::CACurrentMediaTime();
         let mut metrics = self.metrics.lock().unwrap();
         metrics.session += 1;
         metrics.presented_frames = 0;
         metrics.first_present_us = 0;
+        metrics.last_presented_time = 0.;
     }
 
-    pub fn has_submitted(&self) -> bool { self.sequence != 0 }
+    pub fn has_submitted(&self) -> bool { self.session_submitted }
 
     pub fn is_presented(&self, revision: u64) -> bool {
         self.presented_revision.load(Ordering::Acquire) == revision
@@ -171,6 +175,10 @@ impl Gpu {
             return None;
         }
         self.presented_sequence = presentation.sequence;
+        self.metrics.lock().unwrap().callback_to_owner.push(
+            ((objc2_quartz_core::CACurrentMediaTime() - presentation.callback_time).max(0.) * 1e6)
+                as u64,
+        );
         Some(presentation)
     }
 
@@ -178,6 +186,17 @@ impl Gpu {
         let mut s = self.scheduled.lock().unwrap();
         s.0 += 1;
         s.1 = None;
+    }
+
+    pub fn diagnostics(&self) -> super::PreviewDiagnostics {
+        let m = self.metrics.lock().unwrap();
+        super::PreviewDiagnostics {
+            presentation_interval: m.presentation_interval.summary(),
+            submission_to_present: m.submission_to_present.summary(),
+            callback_to_owner: m.callback_to_owner.summary(),
+            presentation_lateness: m.presentation_lateness.summary(),
+            ..Default::default()
+        }
     }
 
     pub fn stats(&self) -> PreviewStats {
@@ -188,26 +207,12 @@ impl Gpu {
         s.cpu_render = m.cpu.summary();
         s.gpu_render = m.gpu.summary();
         s.capture_to_present = m.capture_to_present.summary();
+        s.last_gpu_us = m.last_gpu_us;
         s
     }
 
     pub fn reap(&mut self) -> PreviewResult<()> {
-        self.commands.retain(|c| {
-            if c.status() == MTLCommandBufferStatus::Completed {
-                self.stats.last_gpu_us = ((c.GPUEndTime() - c.GPUStartTime()) * 1e6).max(0.) as u64;
-                false
-            } else if c.status() == MTLCommandBufferStatus::Error {
-                self.failure = Some(
-                    c.error()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "Metal command failed".into()),
-                );
-                false
-            } else {
-                true
-            }
-        });
-        if let Some(error) = self.failure.take() {
+        if let Some(error) = self.failure.lock().unwrap().take() {
             Err(PreviewError::Metal(error))
         } else {
             Ok(())
@@ -218,6 +223,7 @@ impl Gpu {
         &self,
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         p: &Preview,
+        camera: PreviewCamera,
         source: &ProtocolObject<dyn MTLTexture>,
         uv: [f32; 4],
         size: CGSize,
@@ -235,6 +241,12 @@ impl Gpu {
             .unwrap_or([0., 0., size.width as f32, size.height as f32]);
         let params = Params {
             transform: p.transform,
+            camera: [
+                camera.scale,
+                camera.translation[0],
+                camera.translation[1],
+                0.,
+            ],
             rect: [
                 p.frame.origin.x as f32,
                 p.frame.origin.y as f32,
@@ -263,14 +275,24 @@ impl Gpu {
         }
     }
 
+    pub fn sources_changed(&self, scene: &[Preview], captures: &Captures) -> bool {
+        scene.iter().filter(|p| p.opacity > 0.).any(|p| {
+            let previous =
+                self.last_sources.iter().find(|(id, _)| *id == p.window_id).map(|(_, seq)| *seq);
+            previous != captures.frame(p).map(|f| f.sequence)
+        })
+    }
+
     pub fn render(
         &mut self,
         drawable: &ProtocolObject<dyn CAMetalDrawable>,
         size: CGSize,
         scene: &[Preview],
+        camera: PreviewCamera,
         captures: &Captures,
         offset: CGPoint,
         revision: u64,
+        target: f64,
     ) -> PreviewResult<bool> {
         if self.in_flight.load(Ordering::Acquire) >= 2 {
             self.stats.dropped_presentations += 1;
@@ -309,7 +331,7 @@ impl Gpu {
             let Some(frame) = captures.frame(p) else {
                 continue;
             };
-            self.encode_preview(&encoder, p, &frame.texture, frame.uv, size);
+            self.encode_preview(&encoder, p, camera, &frame.texture, frame.uv, size);
             if !self
                 .last_sources
                 .iter()
@@ -332,6 +354,7 @@ impl Gpu {
             .iter()
             .filter(|p| p.mode != super::CaptureMode::Inactive && p.opacity > 0.)
             .all(|p| captures.frame(p).is_some());
+        let submitted_time = objc2_quartz_core::CACurrentMediaTime();
         let presentation_metrics = self.metrics.clone();
         let epoch = self.scheduled.lock().unwrap().0;
         let session = presentation_metrics.lock().unwrap().session;
@@ -358,7 +381,15 @@ impl Gpu {
                 if m.presented_frames == 0 {
                     m.first_present_us = ((presented - created).max(0.) * 1e6) as u64;
                 }
+                m.submission_to_present
+                    .push(((presented - submitted_time).max(0.) * 1e6) as u64);
+                m.presentation_lateness.push(((presented - target).max(0.) * 1e6) as u64);
                 m.presented_frames += 1;
+                if m.last_presented_time > 0. {
+                    let interval = ((presented - m.last_presented_time).max(0.) * 1e6) as u64;
+                    m.presentation_interval.push(interval);
+                }
+                m.last_presented_time = presented;
             }
             if capture_time.is_finite() && presented >= capture_time {
                 presentation_metrics
@@ -376,19 +407,32 @@ impl Gpu {
         let wake = self.wake.clone();
         self.in_flight.fetch_add(1, Ordering::AcqRel);
         let metrics = self.metrics.clone();
+        let failure = self.failure.clone();
         let samples = Mutex::new(Some(samples));
         let completed = RcBlock::new(move |c: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             let c = unsafe { c.as_ref() };
-            metrics
-                .lock()
-                .unwrap()
-                .gpu
-                .push(((c.GPUEndTime() - c.GPUStartTime()).max(0.) * 1e6) as u64);
+            let gpu_us = ((c.GPUEndTime() - c.GPUStartTime()).max(0.) * 1e6) as u64;
+            {
+                let mut m = metrics.lock().unwrap();
+                m.gpu.push(gpu_us);
+                m.last_gpu_us = gpu_us;
+            }
+            let failed = c.status() == MTLCommandBufferStatus::Error;
+            if failed {
+                *failure.lock().unwrap() = Some(
+                    c.error()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Metal command failed".into()),
+                );
+            }
             // Captured samples pin capture-pool entries even if compositor/scene
             // is destroyed while this command is still executing.
             samples.lock().unwrap().take();
-            count.fetch_sub(1, Ordering::AcqRel);
-            wake.notify();
+            // Completion only needs an owner wake for backpressure or errors.
+            // Metal retains committed commands; no owner-side command list/reap is needed.
+            if count.fetch_sub(1, Ordering::AcqRel) >= 2 || failed {
+                wake.notify();
+            }
         });
         unsafe {
             command.addCompletedHandler(RcBlock::as_ptr(&completed));
@@ -397,18 +441,20 @@ impl Gpu {
         let packet = Mutex::new(Some(Presentation {
             drawable: unsafe { Retained::retain(drawable as *const _ as *mut _) }.unwrap(),
             offset,
+            callback_time: 0.,
             sequence: self.sequence,
         }));
         let scheduled = Arc::downgrade(&self.scheduled);
         let wake = self.wake.clone();
         let scheduled_handler =
             RcBlock::new(move |c: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                if unsafe { c.as_ref() }.status() != MTLCommandBufferStatus::Completed {
+                if unsafe { c.as_ref() }.status() == MTLCommandBufferStatus::Error {
                     return;
                 }
-                let Some(packet) = packet.lock().unwrap().take() else {
+                let Some(mut packet) = packet.lock().unwrap().take() else {
                     return;
                 };
+                packet.callback_time = objc2_quartz_core::CACurrentMediaTime();
                 let Some(scheduled) = scheduled.upgrade() else {
                     return;
                 };
@@ -422,13 +468,13 @@ impl Gpu {
                 wake.notify();
             });
         unsafe {
-            command.addCompletedHandler(RcBlock::as_ptr(&scheduled_handler));
+            command.addScheduledHandler(RcBlock::as_ptr(&scheduled_handler));
         }
-        // Transactional presentation occurs on the owner after GPU completion, in its current CA
-        // transaction. This is Apple's presentsWithTransaction contract without
+        // Transactional presentation occurs on the owner after scheduling, in its current CA
+        // transaction. GPU completion only releases captured samples. This is Apple's presentsWithTransaction contract without
         // blocking the owner in waitUntilScheduled ; neither drawable acquisition nor GPU work blocks the owner.
         command.commit();
-        self.commands.push(command);
+        self.session_submitted = true;
         self.stats.submitted_frames += 1;
         self.stats.last_cpu_render_us = start.elapsed().as_micros() as u64;
         self.metrics.lock().unwrap().cpu.push(self.stats.last_cpu_render_us);
@@ -509,13 +555,39 @@ mod tests {
                 encoder.setFragmentSamplerState_atIndex(Some(&gpu.sampler), 0);
             }
             let mut p = Preview::window(1, 1, CGRect::new(CGPoint::ZERO, CGSize::new(20., 32.)));
-            gpu.encode_preview(&encoder, &p, &blue, [0., 0., 1., 1.], CGSize::new(32., 32.));
+            gpu.encode_preview(
+                &encoder,
+                &p,
+                PreviewCamera::default(),
+                &blue,
+                [0., 0., 1., 1.],
+                CGSize::new(32., 32.),
+            );
             p.frame = CGRect::new(CGPoint::new(8., 8.), CGSize::new(16., 16.));
             p.transform[12] = 4.;
             p.opacity = 0.5;
             p.corner_radius = 4.;
             p.clip = Some(CGRect::new(CGPoint::ZERO, CGSize::new(20., 32.)));
-            gpu.encode_preview(&encoder, &p, &red, [0., 0., 1., 1.], CGSize::new(32., 32.));
+            gpu.encode_preview(
+                &encoder,
+                &p,
+                PreviewCamera::default(),
+                &red,
+                [0., 0., 1., 1.],
+                CGSize::new(32., 32.),
+            );
+            let p = Preview::window(1, 1, CGRect::new(CGPoint::ZERO, CGSize::new(16., 16.)));
+            gpu.encode_preview(
+                &encoder,
+                &p,
+                PreviewCamera {
+                    scale: 0.5,
+                    translation: [22., 24.],
+                },
+                &blue,
+                [0., 0., 1., 1.],
+                CGSize::new(32., 32.),
+            );
             encoder.endEncoding();
             command.commit();
             command.waitUntilCompleted();
@@ -547,6 +619,8 @@ mod tests {
             near(pixel(16, 16), [96, 0, 64, 160]); // red over blue, premultiplied alpha
             near(pixel(12, 8), [128, 0, 0, 128]); // transformed rounded corner exposes blue
             near(pixel(21, 16), [0, 0, 0, 0]); // scissor-equivalent screen-space clipping
+            near(pixel(26, 28), [128, 0, 0, 128]); // shared camera zoom and translation
+            near(pixel(30, 28), [0, 0, 0, 0]); // camera scales quad width
             near(pixel(31, 31), [0, 0, 0, 0]); // transparent target outside all quads
         });
     }

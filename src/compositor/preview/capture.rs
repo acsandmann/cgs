@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -21,8 +21,8 @@ use objc2_screen_capture_kit::*;
 
 use super::gpu::Gpu;
 use super::{
-    CaptureMode, CaptureResolution, Preview, PreviewError, PreviewResult, PreviewStats,
-    SourceStatus, Wake,
+    CaptureMode, CaptureResolution, Preview, PreviewError, PreviewResult, PreviewSource,
+    PreviewStats, SourceStatus, Wake,
 };
 
 // A retained SCK sample is immutable here. No attachment mutation, base-address
@@ -49,6 +49,7 @@ struct Mailbox {
     lifecycle: Lifecycle,
     control_pending: bool,
     dimensions: (usize, usize),
+    interval: Duration,
     latest: Option<Sample>,
     status: SourceStatus,
     last: Option<Instant>,
@@ -91,6 +92,7 @@ impl Default for Mailbox {
             lifecycle: Lifecycle::Starting,
             control_pending: false,
             dimensions: (0, 0),
+            interval: Duration::ZERO,
             latest: None,
             status: SourceStatus::Starting,
             last: None,
@@ -207,7 +209,7 @@ static INVENTORY: std::sync::LazyLock<Mutex<Inventory>> = std::sync::LazyLock::n
 pub(super) fn prepare() { request_inventory(None, &[], false); }
 fn request_inventory(
     waiter: Option<(&Arc<Mutex<Discovery>>, &Arc<Wake>)>,
-    requested: &[Preview],
+    requested: &[PreviewSource],
     fresh: bool,
 ) {
     let mut inventory = INVENTORY.lock().unwrap();
@@ -282,21 +284,49 @@ pub(super) struct Frame {
     pub bytes: usize,
     received: Instant,
 }
+static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static WAITERS: Mutex<Vec<std::sync::Weak<Wake>>> = Mutex::new(Vec::new());
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_STREAMS: AtomicUsize = AtomicUsize::new(0);
+static CAPTURE_BYTES: AtomicUsize = AtomicUsize::new(0);
+const PROCESS_CAPTURE_BYTES: usize = 512 * 1024 * 1024;
+pub(super) fn reserved_bytes() -> usize { CAPTURE_BYTES.load(Ordering::Acquire) }
 struct StreamLease {
+    bytes: AtomicUsize,
     stream: std::sync::atomic::AtomicBool,
 }
 impl StreamLease {
-    fn acquire() -> Option<Arc<Self>> {
+    // Reservations survive asynchronous stop and close, just like stream admission.
+    // Keep the high-water reservation until retirement so an old configuration's
+    // surfaces and GPU readers cannot be undercounted during an upgrade.
+    fn reserve(&self, bytes: usize) -> bool {
+        let previous = self.bytes.load(Ordering::Acquire);
+        if bytes <= previous {
+            return true;
+        }
+        let extra = bytes - previous;
+        if CAPTURE_BYTES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                n.checked_add(extra).filter(|n| *n <= PROCESS_CAPTURE_BYTES)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.bytes.store(bytes, Ordering::Release);
+        true
+    }
+
+    fn acquire(speculative: bool) -> Option<Arc<Self>> {
         STREAMS
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < 16).then_some(n + 1)
+                // Leave two process-wide jobs for newly visible/selected sources.
+                (n < if speculative { 14 } else { 16 }).then_some(n + 1)
             })
             .ok()
             .map(|_| {
                 Arc::new(Self {
+                    bytes: AtomicUsize::new(0),
                     stream: std::sync::atomic::AtomicBool::new(false),
                 })
             })
@@ -304,6 +334,7 @@ impl StreamLease {
 }
 impl Drop for StreamLease {
     fn drop(&mut self) {
+        CAPTURE_BYTES.fetch_sub(self.bytes.load(Ordering::Acquire), Ordering::AcqRel);
         STREAMS.fetch_sub(1, Ordering::AcqRel);
         if self.stream.load(Ordering::Acquire) {
             LIVE_STREAMS.fetch_sub(1, Ordering::AcqRel);
@@ -334,7 +365,7 @@ impl StreamControl {
         self: &Arc<Self>,
         action: Lifecycle,
         success: Lifecycle,
-        dimensions: Option<(usize, usize)>,
+        dimensions: Option<((usize, usize), Duration)>,
     ) {
         let control = self.clone();
         self.queue.exec_async(move || {
@@ -357,7 +388,7 @@ impl StreamControl {
         self: Arc<Self>,
         action: Lifecycle,
         success: Lifecycle,
-        dimensions: Option<(usize, usize)>,
+        dimensions: Option<((usize, usize), Duration)>,
     ) {
         {
             let mut m = self.mailbox.lock().unwrap();
@@ -380,8 +411,9 @@ impl StreamControl {
                 m.status = SourceStatus::Failed(error.to_string());
             } else if m.lifecycle != Lifecycle::Failed {
                 m.lifecycle = success;
-                if let Some(size) = dimensions {
+                if let Some((size, interval)) = dimensions {
                     m.dimensions = size;
+                    m.interval = interval;
                 }
             }
             let closed = m.closed;
@@ -401,7 +433,7 @@ impl StreamControl {
                     self.stream.stopCaptureWithCompletionHandler(Some(&callback))
                 }
                 Lifecycle::Updating => self.stream.updateConfiguration_completionHandler(
-                    &configuration(dimensions.unwrap()),
+                    &configuration(dimensions.unwrap().0, dimensions.unwrap().1),
                     Some(&callback),
                 ),
                 _ => unreachable!(),
@@ -412,7 +444,7 @@ impl StreamControl {
 
 struct Slot {
     _lease: Arc<StreamLease>,
-    request: Preview,
+    request: PreviewSource,
     native_dimensions: (usize, usize),
     control: Option<Arc<StreamControl>>,
     bootstrap: Option<Bootstrap>,
@@ -458,7 +490,7 @@ impl Slot {
         }
         let previous = m.lifecycle;
         let action = if matches!(previous, Lifecycle::Running | Lifecycle::Stopped)
-            && m.dimensions != self.desired
+            && (m.dimensions != self.desired || m.interval != self.request.frame_interval)
         {
             Some(Lifecycle::Updating)
         } else if previous == Lifecycle::Stopped
@@ -480,7 +512,7 @@ impl Slot {
         m.control_pending = true;
         drop(m);
         let (success, dimensions) = match action {
-            Lifecycle::Updating => (previous, Some(self.desired)),
+            Lifecycle::Updating => (previous, Some((self.desired, self.request.frame_interval))),
             Lifecycle::Starting => (Lifecycle::Running, None),
             Lifecycle::Stopping => (Lifecycle::Stopped, None),
             _ => unreachable!(),
@@ -698,7 +730,7 @@ struct Opening {
 }
 fn open_source(
     window: WindowDescription,
-    request: Preview,
+    request: PreviewSource,
     lease: Arc<StreamLease>,
     queue: DispatchRetained<DispatchQueue>,
     controls: DispatchRetained<DispatchQueue>,
@@ -725,12 +757,16 @@ fn open_source(
     if dimensions.0 == 0 || dimensions.1 == 0 || capture_bytes(dimensions) > 256 * 1024 * 1024 {
         return Err("capture memory limit".into());
     }
+    if !lease.reserve(capture_bytes(dimensions)) {
+        return Err("process capture memory limit".into());
+    }
     let mailbox = Arc::new(Mutex::new(Mailbox {
         lifecycle: Lifecycle::Stopped,
         dimensions,
+        interval: request.frame_interval,
         ..Mailbox::default()
     }));
-    let config = configuration(dimensions);
+    let config = configuration(dimensions, request.frame_interval);
     let initial = bootstrap.then(|| Bootstrap {
         mailbox: mailbox.clone(),
         wake: wake.clone(),
@@ -802,14 +838,16 @@ struct CachedFrame {
     frame: Frame,
     refresh: bool,
     reusable: bool,
+    priority: i32,
 }
 // Owner-thread texture/sample reuse only: never transfer Metal objects across
 // threads. No streams or clocks survive close. Bound the shared closed-session
-// cache independently of the unbounded-by-count open-session cache.
+// cache independently of the bounded 128 MiB open-session cache.
 thread_local! {
     static REUSABLE: std::cell::RefCell<Vec<CachedFrame>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 const REUSABLE_BYTES: usize = 32 * 1024 * 1024;
+const SESSION_FRAME_BYTES: usize = 128 * 1024 * 1024;
 fn retain_reusable(frame: &CachedFrame) {
     // Native/oversized buffers are deliberately excluded from this small cache.
     if !frame.reusable || frame.frame.bytes > 4 * 1024 * 1024 {
@@ -825,7 +863,11 @@ fn retain_reusable(frame: &CachedFrame) {
         }
     });
 }
-fn cache_frame(cache: &mut Vec<CachedFrame>, slot: &mut Slot) {
+fn cache_frame(
+    cache: &mut Vec<CachedFrame>,
+    slot: &mut Slot,
+    unavailable: &mut std::collections::HashMap<u32, String>,
+) {
     let Some(frame) = slot.frame.take() else { return };
     cache.retain(|f| f.window_id != slot.request.window_id);
     cache.push(CachedFrame {
@@ -834,14 +876,28 @@ fn cache_frame(cache: &mut Vec<CachedFrame>, slot: &mut Slot) {
         frame,
         refresh: false,
         reusable: slot.request.resolution != CaptureResolution::Native,
+        priority: slot.request.priority,
     });
+    trim_frames(cache, unavailable);
+}
+fn trim_frames(
+    cache: &mut Vec<CachedFrame>,
+    unavailable: &mut std::collections::HashMap<u32, String>,
+) {
+    let mut bytes: usize = cache.iter().map(|f| f.frame.bytes).sum();
+    while bytes > SESSION_FRAME_BYTES {
+        let index = cache.iter().enumerate().min_by_key(|(_, f)| f.priority).unwrap().0;
+        let evicted = cache.remove(index);
+        bytes -= evicted.frame.bytes;
+        unavailable.insert(evicted.window_id, "retained frame memory limit".into());
+    }
 }
 
 pub(super) struct Captures {
     cached: Vec<CachedFrame>,
     slots: Vec<Slot>,
     opening: Vec<Opening>,
-    requested: Vec<Preview>,
+    requested: Vec<PreviewSource>,
     windows: Option<Vec<Retained<SCWindow>>>,
     discovery: Arc<Mutex<Discovery>>,
     direct: Arc<Mutex<DirectDiscovery>>,
@@ -859,7 +915,8 @@ pub(super) struct Captures {
     native_sizes: std::collections::HashMap<u32, (usize, usize)>,
 }
 impl Captures {
-    pub fn new(wake: Arc<Wake>) -> Self {
+    pub fn new(owner_wake: Arc<Wake>) -> Self {
+        let wake = Wake::new(move || owner_wake.notify());
         let captures = Self {
             cached: Default::default(),
             slots: Vec::with_capacity(8),
@@ -887,7 +944,7 @@ impl Captures {
 
     pub fn clear(&mut self) {
         for slot in &mut self.slots {
-            cache_frame(&mut self.cached, slot);
+            cache_frame(&mut self.cached, slot, &mut self.unavailable);
         }
         for frame in &self.cached {
             retain_reusable(frame);
@@ -917,34 +974,38 @@ impl Captures {
     pub fn refresh(&mut self) {
         self.native_sizes.clear();
         self.unavailable.clear();
+        for frame in &mut self.cached {
+            frame.refresh = true;
+        }
         self.discover_fresh(true);
     }
 
     pub fn set_scene(&mut self, scene: &[Preview]) -> PreviewResult<()> {
-        let identities_changed = scene.iter().any(|p| {
+        self.set_sources(scene.iter().map(PreviewSource::from))
+    }
+
+    pub fn set_sources(
+        &mut self,
+        sources: impl Iterator<Item = PreviewSource> + Clone,
+    ) -> PreviewResult<()> {
+        let active = sources.filter(|p| p.mode != CaptureMode::Inactive);
+        // Visual edits never copy/sort the inventory, discover metadata, or pump streams.
+        if active.clone().count() == self.requested.len()
+            && active.clone().all(|p| self.requested.contains(&p))
+        {
+            return Ok(());
+        }
+        let identities_changed = active.clone().any(|p| {
             !self
                 .requested
                 .iter()
                 .any(|q| p.window_id == q.window_id && p.process_id == q.process_id)
         });
-        self.reconcile |= scene.iter().filter(|p| p.mode != CaptureMode::Inactive).count()
-            != self.requested.len()
-            || scene.iter().filter(|p| p.mode != CaptureMode::Inactive).any(|p| {
-                !self.requested.iter().any(|q| {
-                    p.window_id == q.window_id
-                        && p.process_id == q.process_id
-                        && p.mode == q.mode
-                        && p.resolution == q.resolution
-                        && p.priority == q.priority
-                })
-            });
-        if self.reconcile {
-            self.unavailable.clear();
-        }
-        self.native_sizes.retain(|id, _| scene.iter().any(|p| p.window_id == *id));
+        self.reconcile = true;
+        self.unavailable.clear();
+        self.native_sizes.retain(|id, _| active.clone().any(|p| p.window_id == *id));
         self.requested.clear();
-        self.requested
-            .extend(scene.iter().filter(|p| p.mode != CaptureMode::Inactive).cloned());
+        self.requested.extend(active);
         self.requested.sort_by_key(|p| std::cmp::Reverse(p.priority));
         // Caller-supplied WindowServer ID + owning PID also key pixel reuse.
         // Do not put an asynchronous metadata refresh on the first-pixel path.
@@ -963,14 +1024,19 @@ impl Captures {
                 {
                     let mut frame = frame.clone();
                     frame.refresh = true;
-                    self.reused_dirty |= self
-                        .requested
-                        .iter()
-                        .any(|p| p.window_id == frame.window_id && p.opacity > 0.);
+                    self.reused_dirty = true;
                     self.cached.push(frame);
                 }
             }
         });
+        for frame in &mut self.cached {
+            frame.priority = self
+                .requested
+                .iter()
+                .find(|p| p.window_id == frame.window_id && p.process_id == frame.process_id)
+                .map_or(i32::MIN, |p| p.priority);
+        }
+        trim_frames(&mut self.cached, &mut self.unavailable);
         self.slots.retain_mut(|s| {
             let keep = self.requested.iter().any(|p| {
                 p.window_id == s.request.window_id && p.process_id == s.request.process_id
@@ -980,7 +1046,7 @@ impl Captures {
                 self.retired.0 += m.sequence;
                 self.retired.1 += m.replaced;
                 drop(m);
-                cache_frame(&mut self.cached, s);
+                cache_frame(&mut self.cached, s, &mut self.unavailable);
             }
             keep
         });
@@ -996,6 +1062,28 @@ impl Captures {
             self.discover();
         }
         self.pump()
+    }
+
+    pub fn update_sources(&mut self, updates: &[PreviewSource]) {
+        for update in updates {
+            if let Some(source) =
+                self.requested.iter_mut().find(|p| p.window_id == update.window_id)
+            {
+                if source != update {
+                    *source = *update;
+                    if let Some(frame) =
+                        self.cached.iter_mut().find(|f| f.window_id == update.window_id)
+                    {
+                        frame.priority = update.priority;
+                    }
+                    self.unavailable.remove(&update.window_id);
+                    self.reconcile = true;
+                }
+            }
+        }
+        if self.reconcile {
+            self.requested.sort_by_key(|p| std::cmp::Reverse(p.priority));
+        }
     }
 
     fn discover(&self) { self.discover_fresh(false); }
@@ -1161,7 +1249,7 @@ impl Captures {
             .iter()
             .filter(|p| p.mode == CaptureMode::Live)
             .take(live_limit)
-            .all(|p| self.frame(p).is_some() || self.unavailable.contains_key(&p.window_id));
+            .all(|p| !self.needs_sample(p) || self.unavailable.contains_key(&p.window_id));
         let mut live_index = 0;
         for requested in &self.requested {
             if self.unavailable.contains_key(&requested.window_id) {
@@ -1186,7 +1274,7 @@ impl Captures {
             // Get initial pixels without waiting for SCStream construction. Once
             // imported, this one-shot slot is upgraded to Live using its cached
             // frame, so stream startup cannot delay the first presentation.
-            if request.mode == CaptureMode::Live && self.frame(&request).is_none() {
+            if request.mode == CaptureMode::Live && self.source_frame(&request).is_none() {
                 request.mode = CaptureMode::Snapshot;
             }
             let request = &request;
@@ -1219,7 +1307,8 @@ impl Captures {
                     self.waiting_for_capacity = true;
                     continue;
                 }
-                let Some(lease) = StreamLease::acquire() else {
+                let speculative = requested.mode == CaptureMode::Snapshot && requested.priority < 0;
+                let Some(lease) = StreamLease::acquire(speculative) else {
                     self.waiting_for_capacity = true;
                     continue;
                 };
@@ -1281,6 +1370,26 @@ impl Captures {
                 .find(|s| s.request.window_id == request.window_id)
                 .unwrap()
                 .dimensions;
+            let dimensions = if request.resolution != CaptureResolution::Native
+                && dimensions.0 as f64 <= previous.0 as f64 * 1.125
+                && dimensions.1 as f64 <= previous.1 as f64 * 1.125
+                && self
+                    .slots
+                    .iter()
+                    .find(|s| s.request.window_id == request.window_id)
+                    .is_some_and(|s| request.priority <= s.request.priority)
+                && dimensions.0 as f64 >= previous.0 as f64 * 0.6
+                && dimensions.1 as f64 >= previous.1 as f64 * 0.6
+                && ((dimensions.0 as f64 / dimensions.1 as f64)
+                    / (previous.0 as f64 / previous.1 as f64)
+                    - 1.)
+                    .abs()
+                    < 0.02
+            {
+                previous
+            } else {
+                dimensions
+            };
             let bytes = capture_bytes(dimensions).max(capture_bytes(previous));
             if dimensions.0 == 0 || dimensions.1 == 0 || bytes > 256 * 1024 * 1024 {
                 self.unavailable.insert(request.window_id, "capture memory limit".into());
@@ -1320,7 +1429,7 @@ impl Captures {
                         && w.owningApplication()
                             .is_some_and(|a| a.processID() == s.request.process_id)
                 }) {
-                    cache_frame(&mut self.cached, s);
+                    cache_frame(&mut self.cached, s, &mut self.unavailable);
                 }
             }
             keep
@@ -1329,21 +1438,33 @@ impl Captures {
             if let Some(slot) =
                 self.slots.iter_mut().find(|s| s.request.window_id == request.window_id)
             {
-                slot.request = request;
-                slot.desired = dimensions;
+                if slot._lease.reserve(capture_bytes(dimensions)) {
+                    slot.request = request;
+                    slot.desired = dimensions;
+                } else {
+                    self.unavailable
+                        .insert(request.window_id, "process capture memory limit".into());
+                }
                 continue;
             }
         }
         Ok(())
     }
 
-    pub fn import(&mut self, gpu: &mut Gpu) -> PreviewResult<bool> {
+    /// All canvases share this mailbox drain. Display/geometry wakes alone do
+    /// not revisit stream control or acquire every source's mailbox mutex.
+    pub fn update(&mut self, gpu: &mut Gpu, scene: &[Preview]) -> PreviewResult<bool> {
+        if !self.wake.pending.swap(false, Ordering::AcqRel) && !self.reconcile {
+            return Ok(false);
+        }
+        self.pump()?;
+        self.import(gpu, scene)
+    }
+
+    fn import(&mut self, gpu: &mut Gpu, scene: &[Preview]) -> PreviewResult<bool> {
         let mut changed = std::mem::take(&mut self.reused_dirty);
         for slot in &mut self.slots {
-            let (sample, sequence) = {
-                let mut m = slot.mailbox.lock().unwrap();
-                (m.latest.take(), m.sequence)
-            };
+            let sample = slot.mailbox.lock().unwrap().latest.take();
             let Some(sample) = sample else {
                 continue;
             };
@@ -1406,11 +1527,11 @@ impl Captures {
                 sample: Arc::new(sample),
                 bytes,
                 uv,
-                sequence,
+                sequence: FRAME_SEQUENCE.fetch_add(1, Ordering::Relaxed),
                 display_time,
                 received: Instant::now(),
             });
-            changed |= self.requested.iter().any(|p| {
+            changed |= scene.iter().any(|p| {
                 p.window_id == slot.request.window_id
                     && p.process_id == slot.request.process_id
                     && p.opacity > 0.
@@ -1426,15 +1547,78 @@ impl Captures {
         Ok(changed)
     }
 
-    fn needs_sample(&self, p: &Preview) -> bool {
-        self.frame(p).is_none()
-            || self
-                .cached
+    fn needs_sample(&self, p: &PreviewSource) -> bool {
+        self.source_frame(p).is_none_or(|frame| match p.resolution {
+            CaptureResolution::Native => false,
+            CaptureResolution::Thumbnail { width, height } => {
+                width as f64 > frame.texture.width() as f64 * 1.125
+                    || height as f64 > frame.texture.height() as f64 * 1.125
+            }
+        }) || self
+            .cached
+            .iter()
+            .any(|f| f.window_id == p.window_id && f.process_id == p.process_id && f.refresh)
+    }
+
+    pub fn captured_frame(&self, window_id: u32) -> Option<(i32, Frame)> {
+        let source = self.requested.iter().find(|p| p.window_id == window_id)?;
+        Some((source.process_id, self.source_frame(source)?.clone()))
+    }
+
+    pub fn reuse_frame(&mut self, window_id: u32, process_id: i32, frame: &Frame) -> bool {
+        let newer = |old: &Frame| {
+            if frame.display_time > 0. && old.display_time > 0. {
+                frame.display_time > old.display_time
+            } else {
+                frame.received > old.received
+            }
+        };
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|s| s.request.window_id == window_id && s.request.process_id == process_id)
+        {
+            if let Some(current) = &slot.frame {
+                if !newer(current) {
+                    return false;
+                }
+                slot.frame = Some(frame.clone());
+                self.reconcile = true;
+                self.reused_dirty = true;
+                return true;
+            }
+        }
+        if self
+            .cached
+            .iter()
+            .any(|f| f.window_id == window_id && f.process_id == process_id && !newer(&f.frame))
+        {
+            return false;
+        }
+        self.cached.retain(|f| f.window_id != window_id);
+        self.cached.push(CachedFrame {
+            window_id,
+            process_id,
+            frame: frame.clone(),
+            refresh: true,
+            reusable: false,
+            priority: self
+                .requested
                 .iter()
-                .any(|f| f.window_id == p.window_id && f.process_id == p.process_id && f.refresh)
+                .find(|p| p.window_id == window_id && p.process_id == process_id)
+                .map_or(i32::MAX, |p| p.priority),
+        });
+        trim_frames(&mut self.cached, &mut self.unavailable);
+        self.reconcile = true;
+        self.reused_dirty = true;
+        true
     }
 
     pub fn frame(&self, p: &Preview) -> Option<&Frame> {
+        self.source_frame(&PreviewSource::from(p))
+    }
+
+    fn source_frame(&self, p: &PreviewSource) -> Option<&Frame> {
         if p.mode == CaptureMode::Inactive {
             return None;
         }
@@ -1521,7 +1705,10 @@ fn capture_bytes((width, height): (usize, usize)) -> usize {
         .and_then(|n| n.checked_mul(8))
         .unwrap_or(usize::MAX)
 }
-fn configuration((width, height): (usize, usize)) -> Retained<SCStreamConfiguration> {
+fn configuration(
+    (width, height): (usize, usize),
+    interval: Duration,
+) -> Retained<SCStreamConfiguration> {
     let config = unsafe { SCStreamConfiguration::new() };
     unsafe {
         config.setWidth(width);
@@ -1529,8 +1716,8 @@ fn configuration((width, height): (usize, usize)) -> Retained<SCStreamConfigurat
         config.setPixelFormat(kCVPixelFormatType_32BGRA);
         config.setQueueDepth(3);
         config.setMinimumFrameInterval(CMTime {
-            value: 1,
-            timescale: 120,
+            value: interval.as_nanos().min(i64::MAX as u128) as i64,
+            timescale: 1_000_000_000,
             flags: objc2_core_media::CMTimeFlags::Valid,
             epoch: 0,
         });
