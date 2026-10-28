@@ -1019,6 +1019,8 @@ pub struct TabBar {
     panel: Option<Retained<TabPanel>>,
     content: Retained<TabContent>,
     surface: Box<dyn NativeView>,
+    visibility_epoch: Rc<Cell<u64>>,
+    showing: Cell<bool>,
 }
 impl TabBar {
     /// Default thickness; any thickness from about 20 points works.
@@ -1161,6 +1163,7 @@ impl TabBar {
             }
             Box::new(fallback)
         };
+        surface.ns_view().setWantsLayer(true);
         let panel = (!embedded).then(|| {
             let panel: Retained<TabPanel> = unsafe {
                 msg_send![super(TabPanel::alloc(ui.mtm()).set_ivars(())), initWithContentRect: rect(0.0,0.0,400.0,28.0), styleMask: NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel, backing: NSBackingStoreType::Buffered, defer: false]
@@ -1184,7 +1187,13 @@ impl TabBar {
             panel
         });
         content.update_material();
-        Self { panel, content, surface }
+        Self {
+            panel,
+            content,
+            surface,
+            visibility_epoch: Rc::new(Cell::new(0)),
+            showing: Cell::new(false),
+        }
     }
 
     pub fn on_action(self, f: impl FnMut(TabBarAction) + 'static) -> Self {
@@ -1463,14 +1472,83 @@ impl TabBar {
 
     /// Reassert relative order: the anchor may have been raised since the previous call.
     pub fn show_above(&self, number: isize) {
-        if number > 0
-            && let Some(panel) = &self.panel
-        {
-            panel.orderWindow_relativeTo(NSWindowOrderingMode::Above, number);
+        if number <= 0 {
+            return;
         }
+        let Some(panel) = &self.panel else {
+            return;
+        };
+        if !self.showing.replace(true) {
+            self.visibility_epoch.set(self.visibility_epoch.get().wrapping_add(1));
+            panel.setIgnoresMouseEvents(false);
+            if let Some(layer) = self.surface.ns_view().layer() {
+                let from = if panel.isVisible() {
+                    layer_value(
+                        &unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain()),
+                        "opacity",
+                    )
+                } else {
+                    without_actions(|| layer.setOpacity(0.0));
+                    layer_value(&layer, "opacity")
+                };
+                without_actions(|| layer.setOpacity(1.0));
+                if !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
+                    animate_value(&layer, "opacity", from.as_deref(), 0.2);
+                } else {
+                    layer.removeAllAnimations();
+                }
+            }
+        }
+        panel.orderWindow_relativeTo(NSWindowOrderingMode::Above, number);
+    }
+
+    /// Fade out a strip that has become unnecessary, keeping it non-interactive while fading.
+    pub fn hide_animated(&self) {
+        let Some(panel) = &self.panel else {
+            self.hide();
+            return;
+        };
+        if !self.showing.replace(false) {
+            return;
+        }
+        self.content.stop_motion();
+        panel.setIgnoresMouseEvents(true);
+        let epoch = self.visibility_epoch.get().wrapping_add(1);
+        self.visibility_epoch.set(epoch);
+        let Some(layer) = self.surface.ns_view().layer() else {
+            panel.orderOut(None);
+            return;
+        };
+        if NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
+            layer.removeAllAnimations();
+            without_actions(|| layer.setOpacity(0.0));
+            panel.orderOut(None);
+            return;
+        }
+        let from = layer_value(
+            &unsafe { layer.presentationLayer() }.unwrap_or_else(|| layer.retain()),
+            "opacity",
+        );
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        layer.setOpacity(0.0);
+        let panel = panel.retain();
+        let current = self.visibility_epoch.clone();
+        let done = block2::RcBlock::new(move || {
+            if current.get() == epoch {
+                panel.orderOut(None);
+            }
+        });
+        unsafe {
+            CATransaction::setCompletionBlock(Some(&done));
+        }
+        animate_value(&layer, "opacity", from.as_deref(), 0.16);
+        CATransaction::commit();
     }
 
     pub fn hide(&self) {
+        self.visibility_epoch.set(self.visibility_epoch.get().wrapping_add(1));
+        self.showing.set(false);
         self.content.stop_motion();
         if let Some(panel) = &self.panel {
             if panel.isVisible() {
@@ -1487,7 +1565,7 @@ impl TabBar {
                 !self.surface.ns_view().isHiddenOrHasHiddenAncestor()
                     && self.surface.ns_view().window().is_some_and(|window| window.isVisible())
             },
-            |panel| panel.isVisible(),
+            |panel| self.showing.get() && panel.isVisible(),
         )
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "cgs"
-version = "0.3.17"
+version = "0.3.18"
 description = "a ui library for macos built on appkit"
 license = "GPL-3.0"
 edition = "2024"
