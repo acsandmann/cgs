@@ -1152,11 +1152,11 @@ impl Captures {
             match result {
                 Ok(opened)
                     if self.requested.iter().any(|p| {
-                        p.window_id == opening.window_id
-                            && p.process_id == opening.process_id
-                            && p.resolution == opened.slot.request.resolution
+                        p.window_id == opening.window_id && p.process_id == opening.process_id
                     }) =>
                 {
+                    // Accept identity-valid initial pixels even if zoom changed
+                    // their requested quality. Reconciliation upgrades the slot.
                     for (value, sample) in self.setup_us.iter_mut().zip(opened.setup_us) {
                         *value = (*value).max(sample);
                     }
@@ -1506,6 +1506,7 @@ impl Captures {
                 &sample.0,
                 CVPixelBufferGetWidth(&image),
                 CVPixelBufferGetHeight(&image),
+                slot.native_dimensions,
             );
             if slot.request.resolution == CaptureResolution::Native {
                 if let Some(size) = native_size {
@@ -1741,13 +1742,31 @@ fn content_geometry(
     sample: &CMSampleBuffer,
     width: usize,
     height: usize,
+    native: (usize, usize),
 ) -> ([f32; 4], Option<(usize, usize)>) {
+    // Screenshot samples can omit stream attachments. With aspect preservation
+    // enabled, SCK fits content at the buffer's top-left and leaves transparent
+    // padding; the filter already supplied its validated native dimensions.
+    let fallback = if native.0 > 0 && native.1 > 0 {
+        let fit = (width as f64 / native.0 as f64).min(height as f64 / native.1 as f64);
+        (
+            [
+                0.,
+                0.,
+                (native.0 as f64 * fit / width as f64) as f32,
+                (native.1 as f64 * fit / height as f64) as f32,
+            ],
+            None,
+        )
+    } else {
+        ([0., 0., 1., 1.], None)
+    };
     unsafe {
         let Some(a) = sample.sample_attachments_array(false) else {
-            return ([0., 0., 1., 1.], None);
+            return fallback;
         };
         if a.count() == 0 {
-            return ([0., 0., 1., 1.], None);
+            return fallback;
         }
         let dict = &*a.value_at_index(0).cast::<CFDictionary>();
         let raw =
@@ -1759,7 +1778,7 @@ fn content_geometry(
                 &mut rect,
             )
         {
-            return ([0., 0., 1., 1.], None);
+            return fallback;
         }
         let raw_scale =
             dict.value((SCStreamFrameInfoScaleFactor as *const objc2_foundation::NSString).cast());
@@ -1769,7 +1788,7 @@ fn content_geometry(
             (&*raw_scale.cast::<NSNumber>()).doubleValue()
         };
         if !scale.is_finite() || scale <= 0. {
-            return ([0., 0., 1., 1.], None);
+            return fallback;
         }
         let x = (rect.origin.x * scale / width as f64).clamp(0., 1.) as f32;
         let y = (rect.origin.y * scale / height as f64).clamp(0., 1.) as f32;

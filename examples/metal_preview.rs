@@ -15,6 +15,7 @@ thread_local! { static COMPOSITOR: RefCell<Option<PreviewCompositor>> = const { 
 thread_local! { static CAMERA_MOTION: RefCell<Option<(Instant,f64)>> = const { RefCell::new(None) }; }
 thread_local! { static CAMERA_COST: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) }; }
 thread_local! { static CANVASES: RefCell<Vec<PreviewCompositor>> = const { RefCell::new(Vec::new()) }; }
+thread_local! { static LAYERS: RefCell<Vec<(u32, cgs::PreviewLayer)>> = const { RefCell::new(Vec::new()) }; }
 fn render() {
     // A shared canvas must drive capture and pacing without rendering the source owner.
     if CANVASES.with(|c| c.borrow().is_empty()) {
@@ -52,6 +53,13 @@ fn render() {
     CANVASES.with(|canvases| {
         for canvas in &mut *canvases.borrow_mut() {
             canvas.render(Instant::now()).expect("canvas render");
+        }
+    });
+    LAYERS.with(|layers| {
+        for (id, layer) in layers.borrow_mut().iter_mut() {
+            if let Some(frame) = compositor(|c| c.captured_frame(*id)) {
+                layer.set_frame(&frame);
+            }
         }
     });
 }
@@ -204,7 +212,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             frame(100., 100., 960., 640.),
         ));
     }
-    if let Some(i) = args.iter().position(|a| a == "--canvas-probe") {
+    if let Some(i) = args.iter().position(|a| a == "--canvas-probe" || a == "--surface-probe") {
         canvas_probe(bounds, &scene, std::path::Path::new(&args[i + 1]))?;
         drop(sources);
         return Ok(());
@@ -620,9 +628,24 @@ fn canvas_probe(
     let mut owner = PreviewCompositor::new_attached(window.id(), &root, bounds, 2., || {
         dispatch2::DispatchQueue::main().exec_async(render);
     })?;
-    owner.set_sources(&scene.iter().map(cgs::PreviewSource::from).collect::<Vec<_>>())?;
+    let direct = std::env::args().any(|a| a == "--surface-probe");
+    let policies: Vec<_> = scene
+        .iter()
+        .map(|p| {
+            let mut source = cgs::PreviewSource::from(p);
+            if direct {
+                source.mode = CaptureMode::Snapshot;
+                source.frame_interval = std::time::Duration::from_millis(200);
+            }
+            source
+        })
+        .collect();
+    owner.set_sources(&policies)?;
     owner.set_visual_scene(&[])?;
     owner.show()?;
+    if direct {
+        return surface_probe(owner, &window, &surface, &row, scene, out);
+    }
     let mut canvas =
         owner.new_canvas(window.id(), &row, frame(0., 0., bounds.size.width, 400.), 2.)?;
     let mut local = scene[0].clone();
@@ -728,5 +751,101 @@ fn canvas_probe(
         format!("shared_canvas_before={before:?} after={after:?}\n"),
     )?;
     println!("shared_canvas_before={before:?} after={after:?}");
+    Ok(())
+}
+
+// The same hidden-window fixture and source owner, consumed directly by CA.
+fn surface_probe(
+    owner: PreviewCompositor,
+    window: &cgs::CgsWindow,
+    surface: &cgs::WindowSurface,
+    row: &CALayer,
+    scene: &[Preview],
+    out: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    window.disable_shadow();
+    LAYERS.with(|layers| {
+        let mut layers = layers.borrow_mut();
+        for (i, p) in scene.iter().enumerate() {
+            let layer = cgs::PreviewLayer::new();
+            layer.layer().setFrame(frame(60. + i as f64 * 260., 100., 240., 160.));
+            layer.layer().setCornerRadius(12.);
+            layer.layer().setMasksToBounds(true);
+            row.addSublayer(layer.layer());
+            layers.push((p.window_id, layer));
+        }
+    });
+    COMPOSITOR.with(|slot| slot.replace(Some(owner)));
+    window.order_above(None)?;
+    surface.flush();
+    run_for(3.);
+    assert!(
+        LAYERS.with(|s| s.borrow().iter().all(|(_, l)| l.has_frame())),
+        "hidden source missing"
+    );
+    assert_eq!(compositor(|c| c.stats().submitted_frames), 0);
+    let screenshot = |name: &str| {
+        assert!(
+            std::process::Command::new("screencapture")
+                .args(["-x", "-o", "-l", &window.id().to_string()])
+                .arg(out.join(name))
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    screenshot("before.png");
+    assert!(
+        std::process::Command::new("screencapture")
+            .args(["-x", "-o", "-l", &scene[0].window_id.to_string()])
+            .arg(out.join("source.png"))
+            .status()?
+            .success()
+    );
+    // Stop capture entirely. Moving, scaling and reversing last-valid pixels must
+    // still work, including while the owner isn't servicing a display/GPU callback.
+    compositor(|c| c.hide())?;
+    let full_bounds = row.bounds();
+    for (name, x, y, scale) in [
+        ("translated.png", 80., 60., 1.),
+        ("scaled.png", 80., 60., 0.5),
+        ("clipped.png", 80., 60., 0.5),
+        ("reversed.png", 0., 60., 1.),
+    ] {
+        {
+            let _tx = cgs::LayerTransaction::disabled().flush_on_commit();
+            row.setBounds(if name == "clipped.png" {
+                frame(0., 0., 720., 400.)
+            } else {
+                full_bounds
+            });
+            row.setAnchorPoint(CGPoint::ZERO);
+            row.setPosition(CGPoint::new(x, y));
+            row.setAffineTransform(objc2_core_foundation::CGAffineTransform {
+                a: scale,
+                b: 0.,
+                c: 0.,
+                d: scale,
+                tx: 0.,
+                ty: 0.,
+            });
+        }
+        surface.flush();
+        run_for(0.1);
+        screenshot(name);
+    }
+    run_for(0.3);
+    assert_eq!(compositor(|c| c.stats().process_capture_jobs), 0);
+    assert_eq!(compositor(|c| c.stats().submitted_frames), 0);
+    assert_eq!(compositor(|c| c.diagnostics().process_reserved_capture_bytes), 0);
+    LAYERS.with(|s| s.borrow_mut().clear());
+    surface.flush();
+    run_for(0.3);
+    screenshot("cleared.png");
+    drop(COMPOSITOR.with(|s| s.take()));
+    std::fs::write(
+        out.join("presented.txt"),
+        "direct IOSurface layers: zero GPU submissions; capture stopped before transforms\n",
+    )?;
     Ok(())
 }

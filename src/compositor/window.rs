@@ -1,7 +1,9 @@
 use std::fmt;
 use std::ptr::{self, NonNull};
 
-use objc2_core_foundation::{CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type};
+use objc2_core_foundation::{
+    CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize, Type,
+};
 use objc2_core_graphics::{CGContext, CGError};
 
 use super::cg_ok;
@@ -123,6 +125,19 @@ pub struct CgsWindow {
 }
 
 impl CgsWindow {
+    /// Suppress the native window shadow when the hosted layer tree draws its own.
+    pub fn disable_shadow(&self) {
+        let key = CFString::from_str("com.apple.WindowShadowDensity");
+        let density = CFNumber::new_i32(0);
+        let properties = CFDictionary::from_slices(&[&*key], &[&*density]);
+        unsafe {
+            super::private::SLSWindowSetShadowProperties(
+                self.id,
+                (&*properties as *const CFDictionary<CFString, CFNumber>).cast(),
+            );
+        }
+    }
+
     pub fn new(frame: CGRect) -> Result<Self, CgsWindowError> {
         unsafe {
             let connection = *G_CONNECTION;

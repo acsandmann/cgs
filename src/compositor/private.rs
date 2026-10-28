@@ -8,6 +8,10 @@ pub type cid_t = i32;
 pub static G_CONNECTION: LazyLock<cid_t> = LazyLock::new(|| unsafe { SLSMainConnectionID() });
 #[link(name = "SkyLight", kind = "framework")]
 unsafe extern "C" {
+    pub fn SLSWindowSetShadowProperties(
+        wid: u32,
+        properties: *const objc2_core_foundation::CFDictionary,
+    ) -> CGError;
     pub(super) fn SLSMainConnectionID() -> cid_t;
     pub fn SLSNewWindowWithOpaqueShapeAndContext(
         cid: cid_t,

@@ -2,6 +2,7 @@
 //! Capture callbacks only replace a single retained, immutable sample; they never render.
 mod capture;
 mod gpu;
+mod layer;
 mod pacing;
 mod timing;
 
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 use capture::Captures;
 pub use capture::DesktopSnapshot;
 use gpu::Gpu;
+pub use layer::PreviewLayer;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect};
@@ -303,7 +305,9 @@ impl Wake {
 /// Display-local preview canvas, optionally hosted in its own CGS window. Not Send or Sync.
 ///
 /// Call `render` after the coalesced wake callback. A dirty-driven CAMetalDisplayLink
-/// supplies drawables and animation timing; do not add another clock. The callback may run
+/// supplies drawables and animation timing for Metal scenes; do not add another
+/// Metal clock. With an empty visual scene it only pumps capture: `PreviewLayer`
+/// consumers use their host's CA transaction and display cadence. The callback may run
 /// on any framework queue and must
 /// only schedule work on this object's owner. It must not call back into the compositor.
 /// hide stops this canvas clock; hiding the source owner also retires shared capture.
