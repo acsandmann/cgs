@@ -697,3 +697,48 @@ impl NativeView for NavigationHost {
 
     fn view_controller(&self) -> Option<&NSViewController> { self.host.view_controller() }
 }
+
+/// Groups descendant native glass surfaces for AppKit's shared compositing and
+/// proximity-based merging. Falls back to the content on systems before macOS 26.
+pub struct GlassEffectContainerView {
+    native: Option<Retained<objc2_app_kit::NSGlassEffectContainerView>>,
+    _content: Box<dyn NativeView>,
+}
+impl GlassEffectContainerView {
+    pub fn new(ui: &Ui, content: impl NativeView) -> Self {
+        let native = objc2::runtime::AnyClass::get(c"NSGlassEffectContainerView").map(|_| {
+            let view = objc2_app_kit::NSGlassEffectContainerView::new(ui.mtm());
+            view.setContentView(Some(content.ns_view()));
+            pin(&view, content.ns_view(), Insets {
+                top: 0.0,
+                left: 0.0,
+                bottom: 0.0,
+                right: 0.0,
+            });
+            view
+        });
+        Self {
+            native,
+            _content: Box::new(content),
+        }
+    }
+
+    /// Distance at which compatible glass surfaces start to merge.
+    pub fn spacing(self, spacing: f64) -> Self {
+        if let Some(view) = &self.native {
+            view.setSpacing(spacing.max(0.0));
+        }
+        self
+    }
+
+    pub fn ns_glass_effect_container_view(
+        &self,
+    ) -> Option<&objc2_app_kit::NSGlassEffectContainerView> {
+        self.native.as_deref()
+    }
+}
+impl NativeView for GlassEffectContainerView {
+    fn ns_view(&self) -> &NSView {
+        self.native.as_deref().map_or(self._content.ns_view(), |view| view)
+    }
+}

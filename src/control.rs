@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{AllocAnyThread, MainThreadOnly, Message, define_class, msg_send};
+use objc2::{AllocAnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{
     NSArray, NSNumber, NSNumberFormatter, NSNumberFormatterStyle, NSObjectProtocol, NSString,
@@ -377,6 +377,45 @@ pub(crate) fn header_menu_style(button: &NSPopUpButton) {
     }
 }
 
+define_class!(
+    #[unsafe(super(NSPopUpButton))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsPopup"]
+    #[ivars = std::cell::Cell<bool>]
+    pub(crate) struct SettingsPopup;
+    impl SettingsPopup {
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_size(&self) -> crate::CGSize {
+            let mut size: crate::CGSize = unsafe { msg_send![super(self), intrinsicContentSize] };
+            if self.ivars().get() { size.width += 12.0; }
+            size
+        }
+        #[unsafe(method(drawRect:))]
+        fn draw(&self, dirty: crate::CGRect) {
+            if self.ivars().get() {
+                let bounds = self.bounds();
+                let size = 20.0;
+                let circle = crate::CGRect::new(
+                    crate::CGPoint::new(bounds.size.width - size, (bounds.size.height - size) / 2.0),
+                    crate::CGSize::new(size, size),
+                );
+                NSColor::labelColor().colorWithAlphaComponent(0.09).setFill();
+                NSBezierPath::bezierPathWithOvalInRect(circle).fill();
+            }
+            unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
+        }
+    }
+);
+impl SettingsPopup {
+    pub(crate) fn settings_style(&self) {
+        self.ivars().set(true);
+        self.setBordered(false);
+        self.setControlSize(NSControlSize::Regular);
+        self.invalidateIntrinsicContentSize();
+        NSView::setNeedsDisplay(self, true);
+    }
+}
+
 pub struct Popup {
     native: Retained<NSPopUpButton>,
     target: Retained<ActionTarget>,
@@ -386,7 +425,13 @@ pub struct Popup {
 }
 impl Popup {
     pub fn new(ui: &Ui) -> Self {
-        let native = NSPopUpButton::new(ui.mtm());
+        let native: Retained<SettingsPopup> = unsafe {
+            msg_send![
+                super(SettingsPopup::alloc(ui.mtm()).set_ivars(std::cell::Cell::new(false))),
+                init
+            ]
+        };
+        let native = native.into_super();
         let target = ActionTarget::new(ui);
         target.attach(&native);
         Self {
@@ -586,6 +631,30 @@ impl SegmentedControl {
         target.attach(&native);
         Self { native, target }
     }
+
+    /// Text choices with optional SF Symbols alongside their labels.
+    pub fn choices(ui: &Ui, segments: &[(&str, Option<&str>)]) -> Self {
+        let labels: Vec<_> = segments.iter().map(|(label, _)| *label).collect();
+        let control = Self::new(ui, &labels);
+        control.native.setTrackingMode(NSSegmentSwitchTracking::SelectOne);
+        // Capsule uses AppKit's rounded, neutral selection treatment.
+        control.native.setSegmentStyle(NSSegmentStyle::Rounded);
+        control.native.setControlSize(NSControlSize::Large);
+        for (index, (label, symbol)) in segments.iter().enumerate() {
+            if let Some(symbol) = symbol {
+                let description = NSString::from_str(label);
+                if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                    &NSString::from_str(symbol),
+                    Some(&description),
+                ) {
+                    control.native.setImage_forSegment(Some(&image), index as isize);
+                }
+            }
+        }
+        control
+    }
+
+    pub fn selected(&self) -> Option<usize> { usize::try_from(self.native.selectedSegment()).ok() }
 
     /// Segments drawn as SF Symbols, each named by `label` for VoiceOver and help tags.
     /// A symbol missing on this system falls back to its label.

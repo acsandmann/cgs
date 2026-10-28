@@ -235,7 +235,9 @@ impl SettingsWindow {
         } else {
             window
         };
-        window.native.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::Automatic);
+        window.native.setBackgroundColor(Some(&crate::Color::settings_background()));
+        window.native.setTitlebarAppearsTransparent(true);
+        window.native.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
         window.native.setToolbarStyle(NSWindowToolbarStyle::Automatic);
         window.native.setTitleVisibility(NSWindowTitleVisibility::Visible);
         if !window.native.styleMask().contains(NSWindowStyleMask::FullSizeContentView) {

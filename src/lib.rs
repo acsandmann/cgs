@@ -59,3 +59,5 @@ impl Ui {
 
     pub fn mtm(&self) -> MainThreadMarker { self.mtm }
 }
+mod tab_selector;
+pub use tab_selector::TabSelector;

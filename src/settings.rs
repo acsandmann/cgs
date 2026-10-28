@@ -95,6 +95,20 @@ impl SettingsRow {
         control: impl NativeView,
         validation: Rc<ValidationMessage>,
     ) -> Self {
+        // Settings cards use compact native controls, including when wrapped
+        // in a composite control.
+        fn compact_controls(view: &NSView) {
+            if let Some(switch) = view.downcast_ref::<objc2_app_kit::NSSwitch>() {
+                switch.setControlSize(objc2_app_kit::NSControlSize::Mini);
+            }
+            if let Some(popup) = view.downcast_ref::<crate::control::SettingsPopup>() {
+                popup.settings_style();
+            }
+            for child in view.subviews().iter() {
+                compact_controls(&child);
+            }
+        }
+        compact_controls(control.ns_view());
         let label = Rc::new(WrappingLabel::new(ui, title));
         control.accessibility_label(title);
         let value = VStack::new(ui)
@@ -335,8 +349,13 @@ pub struct SettingsGroup {
 }
 impl SettingsGroup {
     pub fn new(ui: &Ui) -> Self {
-        let grid = Rc::new(Grid::new(ui).spacing(10.0, 24.0));
-        let surface = GroupBox::new(ui, grid.clone());
+        let grid = Rc::new(Grid::new(ui).spacing(11.0, 24.0));
+        let surface = GroupBox::with_insets(ui, grid.clone(), Insets {
+            top: 11.5,
+            left: 10.0,
+            bottom: 9.0,
+            right: 10.0,
+        });
         Self {
             surface: Some(surface),
             grid,
@@ -437,19 +456,35 @@ impl NativeView for SettingsGroup {
 pub struct Section {
     ui: Ui,
     stack: VStack,
+    header: Rc<VStack>,
+    header_container: Rc<HStack>,
     group: Option<SettingsGroup>,
     plain: bool,
     trailing_controls: bool,
 }
 impl Section {
     pub fn new(ui: &Ui, title: &str) -> Self {
-        let mut stack = VStack::new(ui).spacing(8.0);
+        let header = Rc::new(VStack::new(ui).spacing(2.0));
         if !title.is_empty() {
-            stack = stack.push(SectionTitle::new(ui, title));
+            header.add(SectionTitle::new(ui, title));
         }
+        let header_container = Rc::new(
+            HStack::new(ui)
+                .insets(Insets {
+                    top: 0.0,
+                    left: 10.0,
+                    bottom: 0.0,
+                    right: 0.0,
+                })
+                .push(header.clone()),
+        );
+        header_container.set_hidden(title.is_empty());
+        let stack = VStack::new(ui).spacing(8.0).push(header_container.clone());
         Self {
             ui: *ui,
             stack,
+            header,
+            header_container,
             group: None,
             plain: false,
             trailing_controls: true,
@@ -483,7 +518,8 @@ impl Section {
     }
 
     pub fn description(self, text: &str) -> Self {
-        self.stack.add(Caption::new(&self.ui, text));
+        self.header_container.set_hidden(false);
+        self.header.add(Caption::new(&self.ui, text));
         self
     }
 
@@ -576,9 +612,16 @@ impl SettingsPage {
         fill.setActive(true);
         let scroll = ScrollView::new(ui, outer);
         scroll.ns_scroll_view().setDrawsBackground(true);
-        scroll.ns_scroll_view().setBackgroundColor(&Color::window_background());
+        // Give the detail pane a subtle tint so its boundary with the white
+        // navigation sidebar remains visible even without a prominent divider.
+        let background = Color::settings_background();
+        scroll.ns_scroll_view().setBackgroundColor(&background);
         scroll.fit_width();
         let root = View::new(ui);
+        root.ns_view().setWantsLayer(true);
+        if let Some(layer) = root.ns_view().layer() {
+            layer.setBackgroundColor(Some(&background.CGColor()));
+        }
         root.ns_view().addSubview(scroll.ns_view());
         crate::view::prepare(scroll.ns_view());
         let parent = root.ns_view();

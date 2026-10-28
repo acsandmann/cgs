@@ -62,6 +62,13 @@ impl Color {
 
     pub fn window_background() -> Retained<NSColor> { NSColor::windowBackgroundColor() }
 
+    /// Subtle detail-pane background for settings windows.
+    pub fn settings_background() -> Retained<NSColor> {
+        Self::window_background()
+            .blendedColorWithFraction_ofColor(0.035, &Self::label())
+            .unwrap_or_else(Self::window_background)
+    }
+
     pub fn under_page_background() -> Retained<NSColor> { NSColor::underPageBackgroundColor() }
 
     pub fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
