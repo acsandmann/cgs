@@ -1,6 +1,6 @@
 [package]
 name = "cgs"
-version = "0.3.16"
+version = "0.3.17"
 description = "a ui library for macos built on appkit"
 license = "GPL-3.0"
 edition = "2024"
@@ -40,7 +40,3 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 
 [[example]]
 name = "metal_preview"
-
-[[test]]
-name = "metal_preview"
-harness = false
