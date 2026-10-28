@@ -45,8 +45,18 @@ impl CAFilter {
 /// Core Animation filter is unavailable on the running macOS version.
 pub fn backdrop_blur(radius: f64) -> Option<Retained<CALayer>> {
     let backdrop = CABackdropLayer::layer();
-    let filter = CAFilter::with_type(&NSString::from_str("gaussianBlur"))?;
+    let filters = blur_filters(radius)?;
+    unsafe { backdrop.setFilters(Some(&filters)) };
+    backdrop.set_scale(0.25);
+    backdrop.set_bleed_amount(5.0);
+    backdrop.set_window_server_aware(true);
 
+    Some(unsafe { Retained::cast_unchecked(backdrop) })
+}
+
+/// The render server's gaussian blur, for a layer's own `filters`.
+pub(crate) fn blur_filters(radius: f64) -> Option<Retained<NSArray<AnyObject>>> {
+    let filter = CAFilter::with_type(&NSString::from_str("gaussianBlur"))?;
     unsafe {
         filter.setValue_forKey(
             Some(&NSNumber::new_f64(radius)),
@@ -57,13 +67,6 @@ pub fn backdrop_blur(radius: f64) -> Option<Retained<CALayer>> {
             &NSString::from_str("inputNormalizeEdges"),
         );
     }
-
     let filter: Retained<AnyObject> = unsafe { Retained::cast_unchecked(filter) };
-    let filters = NSArray::from_slice(&[&*filter]);
-    unsafe { backdrop.setFilters(Some(&filters)) };
-    backdrop.set_scale(0.25);
-    backdrop.set_bleed_amount(5.0);
-    backdrop.set_window_server_aware(true);
-
-    Some(unsafe { Retained::cast_unchecked(backdrop) })
+    Some(NSArray::from_retained_slice(&[filter]))
 }

@@ -2,10 +2,12 @@ use std::ptr::NonNull;
 
 use objc2_core_foundation::{CFRetained, CFType, CGPoint, CGRect};
 use objc2_core_graphics::CGError;
+use objc2_quartz_core::CATransform3D;
 
 use super::private::{
     G_CONNECTION, SLSTransactionCommit, SLSTransactionCreate, SLSTransactionMoveWindowWithGroup,
-    SLSTransactionSetSurfaceBounds, SLSTransactionSetWindowShape,
+    SLSTransactionOrderWindow, SLSTransactionSetSurfaceBounds, SLSTransactionSetWindowAlpha,
+    SLSTransactionSetWindowShape, SLSTransactionSetWindowTransform3D,
 };
 use super::window::{CFRegion, CgsWindow, CgsWindowError};
 
@@ -49,6 +51,22 @@ impl WindowTransaction {
 
     pub fn move_window(&self, window: &CgsWindow, origin: CGPoint) {
         unsafe { SLSTransactionMoveWindowWithGroup(self.as_ptr(), window.id(), origin) };
+    }
+
+    /// Place the window's content through `transform`, a forward map from window points to
+    /// screen points, both relative to the window origin. WindowServer applies perspective.
+    pub fn set_transform(&self, window: &CgsWindow, transform: CATransform3D) {
+        let inverse = transform.invert();
+        unsafe { SLSTransactionSetWindowTransform3D(self.as_ptr(), window.id(), &inverse) };
+    }
+
+    pub fn set_alpha(&self, window: &CgsWindow, alpha: f32) {
+        unsafe { SLSTransactionSetWindowAlpha(self.as_ptr(), window.id(), alpha) };
+    }
+
+    /// Order `window` directly above `relative` (both ordered in by the commit).
+    pub fn order_above(&self, window: &CgsWindow, relative: &CgsWindow) {
+        unsafe { SLSTransactionOrderWindow(self.as_ptr(), window.id(), 1, relative.id()) };
     }
 
     pub(crate) fn set_surface_bounds(&self, window_id: u32, surface_id: u32, bounds: CGRect) {

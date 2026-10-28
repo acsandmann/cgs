@@ -100,6 +100,20 @@ unsafe extern "C" {
         bounds: CGRect,
     );
     pub fn SLSTransactionCommit(transaction: *mut CFType, asynchronous: u32);
+    /// Maps screen points to window points (the inverse of the on-screen placement),
+    /// relative to the window origin; perspective is honoured.
+    pub fn SLSTransactionSetWindowTransform3D(
+        transaction: *mut CFType,
+        wid: u32,
+        transform: *const objc2_quartz_core::CATransform3D,
+    );
+    pub fn SLSTransactionSetWindowAlpha(transaction: *mut CFType, wid: u32, alpha: f32);
+    pub fn SLSTransactionOrderWindow(
+        transaction: *mut CFType,
+        wid: u32,
+        order: c_int,
+        relative_to: u32,
+    );
     pub fn SLSSetWindowProperty(
         cid: cid_t,
         wid: u32,

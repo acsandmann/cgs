@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "cgs"
-version = "0.3.16"
+version = "0.3.17"
 dependencies = [
  "block2",
  "dispatch2",
