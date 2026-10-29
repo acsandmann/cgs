@@ -1,5 +1,11 @@
 //! Interactive reference for the settings tab selector.
-use cgs::*;
+use cgs::app::Application;
+use cgs::layout::{HStack, Spacer, VStack};
+use cgs::tabs::TabSelector;
+use cgs::text::Label;
+use cgs::view::NativeView;
+use cgs::window::Window;
+use cgs::{CGSize, Insets, MainThreadMarker, Ui};
 use objc2::Message;
 use objc2_app_kit::NSApplicationActivationPolicy;
 fn main() {

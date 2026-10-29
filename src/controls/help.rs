@@ -5,7 +5,11 @@ use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{NSRectEdge, NSString};
 
-use crate::{Insets, NativeView, Popover, Symbol, Ui, View, WrappingLabel};
+use crate::image::Symbol;
+use crate::text::WrappingLabel;
+use crate::view::{NativeView, View};
+use crate::window::Popover;
+use crate::{Insets, Ui};
 
 struct HelpState {
     text: String,

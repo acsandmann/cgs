@@ -12,10 +12,13 @@ use objc2_app_kit::{
 };
 use objc2_foundation::NSString;
 
-use crate::{
-    Application, Button, CGPoint, CGRect, CGSize, HStack, NativeView, NumberField, Popover, Slider,
-    Spacer, Symbol, Ui, VStack, View,
-};
+use crate::app::Application;
+use crate::controls::{Button, NumberField, Slider};
+use crate::image::Symbol;
+use crate::layout::{HStack, Spacer, VStack};
+use crate::view::{NativeView, View};
+use crate::window::Popover;
+use crate::{CGPoint, CGRect, CGSize, Ui};
 
 /// A change the user made to a [`ValueChips`] list, in display units.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -375,7 +378,7 @@ impl Inner {
             native.setBezelStyle(NSBezelStyle::Push);
             if self.compact.get() {
                 native.setControlSize(objc2_app_kit::NSControlSize::Small);
-                native.setFont(Some(&crate::Font::caption()));
+                native.setFont(Some(&crate::style::Font::caption()));
             }
             let owner = Rc::downgrade(self);
             let button =
@@ -627,7 +630,7 @@ impl Inner {
         }
         let popover = Popover::new(
             &self.ui,
-            View::new(&self.ui).content(content.keep(field), crate::uniform_insets(14.0)),
+            View::new(&self.ui).content(content.keep(field), crate::layout::uniform_insets(14.0)),
         );
         popover.show(&anchor);
         if let Some(old) = self.popover.borrow_mut().replace(popover) {

@@ -23,9 +23,11 @@ use objc2_quartz_core::{
     CATransform3D,
 };
 
+use super::preview::{
+    CaptureMode, CaptureResolution, PreviewCompositor, PreviewFrame, PreviewLayer, PreviewSource,
+};
 use super::{
-    CaptureMode, CaptureResolution, CgsWindow, LayerTransaction, PreviewCompositor, PreviewFrame,
-    PreviewLayer, PreviewSource, WindowSurface, WindowTransaction, backdrop_blur, blur_filters,
+    CgsWindow, LayerTransaction, WindowSurface, WindowTransaction, backdrop_blur, blur_filters,
     release_layer_tree,
 };
 

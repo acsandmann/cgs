@@ -1,14 +1,13 @@
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSApplication, NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuItem, NSWorkspace,
+    NSApplication, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
+    NSPasteboardTypeString, NSWorkspace,
 };
 use objc2_foundation::{NSArray, NSString, NSURL};
 
 use crate::Ui;
-
-/// A native image, such as an application icon or SF Symbol.
-pub type Image = Retained<NSImage>;
+use crate::image::Image;
 
 pub struct Application(Retained<NSApplication>);
 impl Application {
@@ -106,5 +105,22 @@ impl Application {
             });
         file.addItem(&command);
         self.0.setMainMenu(Some(&main));
+    }
+}
+
+pub struct Clipboard;
+impl Clipboard {
+    pub fn set_text(ui: &Ui, text: &str) -> bool {
+        let _ = ui;
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        pasteboard.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
+    }
+
+    pub fn text(ui: &Ui) -> Option<String> {
+        let _ = ui;
+        NSPasteboard::generalPasteboard()
+            .stringForType(unsafe { NSPasteboardTypeString })
+            .map(|s| s.to_string())
     }
 }

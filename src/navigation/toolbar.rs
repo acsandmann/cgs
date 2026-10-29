@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use objc2::rc::{Retained, Weak};
@@ -7,227 +6,14 @@ use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString};
 
-use crate::*;
-
-pub struct SplitView {
-    native: Retained<NSSplitViewController>,
-    view: Retained<NSView>,
-    children: Vec<ViewController>,
-}
-impl SplitView {
-    pub fn new(ui: &Ui) -> Self {
-        let native = NSSplitViewController::new(ui.mtm());
-        let view = native.view();
-        Self {
-            native,
-            view,
-            children: Vec::new(),
-        }
-    }
-
-    pub fn pane(mut self, ui: &Ui, content: impl NativeView, sidebar: bool) -> Self {
-        let controller = ViewController::new(ui, content);
-        let item = if sidebar {
-            NSSplitViewItem::sidebarWithViewController(controller.ns_view_controller())
-        } else {
-            NSSplitViewItem::splitViewItemWithViewController(controller.ns_view_controller())
-        };
-        if sidebar {
-            item.setAllowsFullHeightLayout(true);
-            item.setHoldingPriority(750.0);
-        }
-        self.native.addSplitViewItem(&item);
-        self.children.push(controller);
-        self
-    }
-
-    pub fn ns_split_view_controller(&self) -> &NSSplitViewController { &self.native }
-}
-impl NativeView for SplitView {
-    fn ns_view(&self) -> &NSView { &self.view }
-
-    fn view_controller(&self) -> Option<&NSViewController> { Some(&self.native) }
-}
-#[derive(Clone)]
-pub struct SidebarItem<T> {
-    pub id: T,
-    pub title: String,
-    pub symbol: String,
-}
-struct SidebarCell {
-    native: Retained<NSTableCellView>,
-}
-impl NativeView for SidebarCell {
-    fn ns_view(&self) -> &NSView { &self.native }
-}
-
-pub struct Sidebar<T: 'static> {
-    outline: Outline<SidebarItem<T>>,
-}
-impl<T: Clone + 'static> Sidebar<T> {
-    pub fn new(ui: &Ui, items: Vec<SidebarItem<T>>) -> Self {
-        Self::with_children(ui, items, |_| Vec::new())
-    }
-
-    pub fn with_children(
-        ui: &Ui,
-        items: Vec<SidebarItem<T>>,
-        children: impl Fn(&T) -> Vec<SidebarItem<T>>,
-    ) -> Self {
-        let ui_copy = *ui;
-        let measure = Label::new(ui, "");
-        let content_width = items
-            .iter()
-            .map(|item| {
-                measure.set_text(&item.title);
-                measure.ns_view().fittingSize().width + Metrics::CONTROL_SPACING * 6.0
-            })
-            .fold(0.0, f64::max);
-        let items = items
-            .into_iter()
-            .map(|item| OutlineItem {
-                children: children(&item.id)
-                    .into_iter()
-                    .map(|child| OutlineItem {
-                        title: child.title.clone(),
-                        id: child,
-                        children: Vec::new(),
-                    })
-                    .collect(),
-                title: item.title.clone(),
-                id: item,
-            })
-            .collect();
-        let outline = Outline::new(ui).items(items).cells(move |item, title| {
-            let native = NSTableCellView::new(ui_copy.mtm());
-            let label = Label::new(&ui_copy, title);
-            unsafe {
-                native.setTextField(Some(label.ns_text_field()));
-            }
-            native.addSubview(label.ns_view());
-            crate::view::prepare(label.ns_view());
-            let leading = if let Some(image) = ImageView::symbol(&ui_copy, &item.symbol) {
-                image.width(16.0);
-                image.height(16.0);
-                unsafe {
-                    native.setImageView(Some(image.ns_image_view()));
-                }
-                native.addSubview(image.ns_view());
-                crate::view::prepare(image.ns_view());
-                image
-                    .ns_view()
-                    .leadingAnchor()
-                    .constraintEqualToAnchor(&native.leadingAnchor())
-                    .setActive(true);
-                image
-                    .ns_view()
-                    .centerYAnchor()
-                    .constraintEqualToAnchor(&native.centerYAnchor())
-                    .setActive(true);
-                label
-                    .ns_view()
-                    .leadingAnchor()
-                    .constraintEqualToAnchor_constant(&image.ns_view().trailingAnchor(), 8.0)
-            } else {
-                label.ns_view().leadingAnchor().constraintEqualToAnchor(&native.leadingAnchor())
-            };
-            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-                leading,
-                label
-                    .ns_view()
-                    .trailingAnchor()
-                    .constraintEqualToAnchor(&native.trailingAnchor()),
-                label.ns_view().centerYAnchor().constraintEqualToAnchor(&native.centerYAnchor()),
-            ]));
-            Box::new(SidebarCell { native })
-        });
-        let native = outline.ns_outline_view();
-        native.setUsesAutomaticRowHeights(false);
-        native.setRowSizeStyle(NSTableViewRowSizeStyle::Default);
-        native.setBackgroundColor(&NSColor::clearColor());
-        outline.min_width(content_width);
-        outline.max_width(content_width + Metrics::PAGE_INSET * 2.0);
-        Self { outline }
-    }
-
-    pub fn on_select(mut self, mut f: impl FnMut(T) + 'static) -> Self {
-        let native = objc2::rc::Weak::new(self.outline.ns_outline_view());
-        self.outline = self.outline.on_select(move |item| {
-            if let Some(item) = item {
-                unsafe {
-                    if let Some(native) = native.load() {
-                        if let Some(selected) = native.itemAtRow(native.selectedRow()) {
-                            native.expandItem(Some(&selected));
-                        }
-                    }
-                }
-                f(item.id);
-            }
-        });
-        self
-    }
-
-    pub fn set_items(&self, items: Vec<SidebarItem<T>>) {
-        self.outline.set_items(
-            items
-                .into_iter()
-                .map(|item| OutlineItem {
-                    title: item.title.clone(),
-                    id: item,
-                    children: Vec::new(),
-                })
-                .collect(),
-        );
-    }
-
-    pub fn group_parents(&self) { self.outline.group_parents(); }
-
-    pub fn set_selected(&self, index: usize) { self.outline.set_selected(index); }
-
-    pub fn ns_table_view(&self) -> &NSTableView { self.outline.ns_outline_view() }
-}
-impl<T: 'static> NativeView for Sidebar<T> {
-    fn ns_view(&self) -> &NSView { self.outline.ns_view() }
-}
-pub struct NavigationSplitView(SplitView);
-impl NavigationSplitView {
-    pub fn new(ui: &Ui, sidebar: impl NativeView, detail: impl NativeView) -> Self {
-        let split = SplitView::new(ui).pane(ui, sidebar, true).pane(ui, detail, false);
-        let items = split.native.splitViewItems();
-        items.objectAtIndex(0).setMinimumThickness(Metrics::SIDEBAR_MIN_WIDTH);
-        Self(split)
-    }
-
-    pub fn ns_split_view_controller(&self) -> &NSSplitViewController {
-        self.0.ns_split_view_controller()
-    }
-}
-impl NativeView for NavigationSplitView {
-    fn ns_view(&self) -> &NSView { self.0.ns_view() }
-
-    fn view_controller(&self) -> Option<&NSViewController> { self.0.view_controller() }
-}
-pub struct MasterDetail(SplitView);
-impl MasterDetail {
-    pub fn new(ui: &Ui, master: impl NativeView, detail: impl NativeView) -> Self {
-        let split = SplitView::new(ui).pane(ui, master, false).pane(ui, detail, false);
-        let items = split.native.splitViewItems();
-        let list = items.objectAtIndex(0);
-        list.setMinimumThickness(140.0);
-        list.setMaximumThickness(190.0);
-        list.setPreferredThicknessFraction(0.28);
-        Self(split)
-    }
-
-    pub fn ns_split_view_controller(&self) -> &NSSplitViewController {
-        self.0.ns_split_view_controller()
-    }
-}
-impl NativeView for MasterDetail {
-    fn ns_view(&self) -> &NSView { self.0.ns_view() }
-
-    fn view_controller(&self) -> Option<&NSViewController> { self.0.view_controller() }
-}
+use crate::controls::Popup;
+use crate::image::Symbol;
+use crate::input::SearchField;
+use crate::layout::HStack;
+use crate::menu::{Menu, MenuItem};
+use crate::text::Label;
+use crate::view::{GlassEffectView, NativeView};
+use crate::{CGRect, Insets, Ui};
 
 /// Page-owned native header controls. Toolbar presentation and glass remain in CGS.
 pub struct HeaderControls {
@@ -267,7 +53,7 @@ impl HeaderControls {
 
     /// A native selection popup beside the same toolbar search field.
     pub fn selector(label: &str, menu: Rc<Popup>, search: SearchField) -> Self {
-        crate::control::header_menu_style(menu.ns_popup_button());
+        crate::controls::header_menu_style(menu.ns_popup_button());
         menu.accessibility_label(label);
         menu.ns_popup_button().setImageHugsTitle(false);
         menu.min_width(100.0);
@@ -393,8 +179,12 @@ pub struct Toolbar {
     delegate: Option<Retained<NavigationToolbarDelegate>>,
     back_target: Retained<crate::bridge::ActionTarget>,
     forward_target: Retained<crate::bridge::ActionTarget>,
-    menu:
-        std::cell::RefCell<Option<(Rc<crate::Menu>, std::cell::OnceCell<Retained<NSPopUpButton>>)>>,
+    menu: std::cell::RefCell<
+        Option<(
+            Rc<crate::menu::Menu>,
+            std::cell::OnceCell<Retained<NSPopUpButton>>,
+        )>,
+    >,
     page_controls: std::cell::RefCell<[Option<Weak<NSView>>; 3]>,
 }
 impl Toolbar {
@@ -423,7 +213,7 @@ impl Toolbar {
         back.setLabel(&NSString::from_str("Back"));
         back.setPaletteLabel(&NSString::from_str("Back"));
         back.setNavigational(true);
-        back.setImage(crate::Symbol::named("chevron.backward").as_deref());
+        back.setImage(crate::image::Symbol::named("chevron.backward").as_deref());
         back.setEnabled(false);
         back.setAutovalidates(false);
         unsafe {
@@ -509,7 +299,7 @@ impl Toolbar {
         ui: &Ui,
         mut back: impl FnMut() + 'static,
         mut forward: impl FnMut() + 'static,
-        menu: Rc<crate::Menu>,
+        menu: Rc<crate::menu::Menu>,
     ) {
         let Some(delegate) = &self.delegate else {
             return;
@@ -605,7 +395,7 @@ impl Toolbar {
                     CGRect::ZERO,
                     false,
                 );
-                crate::control::header_menu_style(&popup);
+                crate::controls::header_menu_style(&popup);
                 popup.setImagePosition(NSCellImagePosition::ImageLeading);
                 popup.setImageHugsTitle(false);
                 popup.setMenu(Some(menu.ns_menu()));
@@ -844,286 +634,4 @@ impl Drop for Toolbar {
             }
         }
     }
-}
-
-/// A muted badge color for a destination in a settings sidebar.
-#[derive(Clone, Copy)]
-pub enum SettingsBadge {
-    Gray,
-    Blue,
-    Violet,
-    Brown,
-    Slate,
-    Teal,
-}
-
-impl SettingsBadge {
-    fn color(self) -> Retained<NSColor> {
-        let (r, g, b) = match self {
-            Self::Gray => (0.38, 0.40, 0.43),
-            Self::Blue => (0.32, 0.42, 0.52),
-            Self::Violet => (0.40, 0.41, 0.51),
-            Self::Brown => (0.49, 0.43, 0.35),
-            Self::Slate => (0.40, 0.41, 0.46),
-            Self::Teal => (0.34, 0.44, 0.46),
-        };
-        NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
-    }
-}
-
-/// One destination, with an optional visual separation before its group.
-#[derive(Clone)]
-pub struct SettingsDestination<T> {
-    pub id: T,
-    pub title: &'static str,
-    pub symbol: &'static str,
-    pub badge: SettingsBadge,
-    pub starts_group: bool,
-}
-
-#[derive(Clone)]
-enum SettingsRow<T> {
-    Spacer,
-    Destination(SettingsDestination<T>),
-}
-
-/// A compact settings navigation list with a neutral, rounded selection.
-pub struct SettingsNavigation<T: Clone + PartialEq + 'static> {
-    table: crate::Table<SettingsRow<T>>,
-}
-
-impl<T: Clone + PartialEq + 'static> SettingsNavigation<T> {
-    pub fn new(
-        ui: &Ui,
-        destinations: Vec<SettingsDestination<T>>,
-        mut select: impl FnMut(T) + 'static,
-    ) -> Self {
-        let mut rows = Vec::new();
-        for destination in destinations {
-            if destination.starts_group && !rows.is_empty() {
-                rows.push(SettingsRow::Spacer);
-            }
-            rows.push(SettingsRow::Destination(destination));
-        }
-        let ui_copy = *ui;
-        let table_ref = Rc::new(RefCell::new(None::<Weak<NSTableView>>));
-        let cell_table = table_ref.clone();
-        let table = crate::Table::new(ui)
-            .source_list()
-            .column("destination", "", 0.0)
-            .cells_with_index(move |row, _, index| match row {
-                SettingsRow::Spacer => Box::new(crate::View::new(&ui_copy)),
-                SettingsRow::Destination(item) => {
-                    let cell =
-                        settings_destination_cell(&ui_copy, item.title, item.symbol, item.badge);
-                    let selected = cell_table
-                        .borrow()
-                        .as_ref()
-                        .and_then(Weak::load)
-                        .is_some_and(|table| table.selectedRow() == index as isize);
-                    style_settings_cell(&cell.0, selected);
-                    Box::new(cell)
-                }
-            })
-            .selectable(|row| matches!(row, SettingsRow::Destination(_)))
-            .row_heights(|row| {
-                if matches!(row, SettingsRow::Spacer) {
-                    12.0
-                } else {
-                    32.0
-                }
-            })
-            .rows(rows);
-        *table_ref.borrow_mut() = Some(Weak::new(table.ns_table_view()));
-        let native = Weak::new(table.ns_table_view());
-        let table = table.on_select_item(move |row| {
-            if let Some(table) = native.load() {
-                update_settings_selection(&table);
-            }
-            if let Some(SettingsRow::Destination(item)) = row {
-                select(item.id);
-            }
-        });
-        let native = table.ns_table_view();
-        // Plain tables do not add the source-list indentation around our own inset.
-        native.setStyle(NSTableViewStyle::Plain);
-        native.setSelectionHighlightStyle(NSTableViewSelectionHighlightStyle::None);
-        native.setIntercellSpacing(CGSize::new(0.0, 0.0));
-        native.setBackgroundColor(&NSColor::clearColor());
-        table.min_width(210.0);
-        let width = table.ns_view().widthAnchor().constraintEqualToConstant(215.0);
-        width.setPriority(499.0);
-        width.setActive(true);
-        table.max_width(280.0);
-        Self { table }
-    }
-
-    pub fn set_selected(&self, id: &T) {
-        let index = (0..self.table.ns_table_view().numberOfRows() as usize).find(|&index| {
-            matches!(self.table.row(index), Some(SettingsRow::Destination(item)) if &item.id == id)
-        });
-        self.table.set_selected(index);
-        update_settings_selection(self.table.ns_table_view());
-    }
-
-    pub fn accessibility_label(&self, label: &str) {
-        self.table
-            .ns_table_view()
-            .setAccessibilityLabel(Some(&NSString::from_str(label)));
-    }
-
-    pub fn ns_table_view(&self) -> &NSTableView { self.table.ns_table_view() }
-}
-
-impl<T: Clone + PartialEq + 'static> NativeView for SettingsNavigation<T> {
-    fn ns_view(&self) -> &NSView { self.table.ns_view() }
-}
-
-fn style_settings_cell(cell: &NSTableCellView, selected: bool) {
-    if let Some(highlight) = cell.subviews().firstObject() {
-        if let Some(layer) = highlight.layer() {
-            let color =
-                NSColor::labelColor().colorWithAlphaComponent(if selected { 0.05 } else { 0.0 });
-            layer.setBackgroundColor(Some(&color.CGColor()));
-        }
-    }
-    if let Some(field) = unsafe { cell.textField() } {
-        field.setTextColor(Some(&NSColor::labelColor()));
-        field.setFont(Some(&*if selected {
-            crate::Font::body_emphasized()
-        } else {
-            crate::Font::body()
-        }));
-    }
-}
-
-fn update_settings_selection(table: &NSTableView) {
-    let selected = table.selectedRow();
-    for row in 0..table.numberOfRows() {
-        if let Some(outer) = table.viewAtColumn_row_makeIfNecessary(0, row, row == selected)
-            && let Some(cell) = outer
-                .subviews()
-                .firstObject()
-                .and_then(|view| view.downcast::<NSTableCellView>().ok())
-        {
-            style_settings_cell(&cell, row == selected);
-        }
-    }
-}
-
-struct SettingsDestinationCell(Retained<NSTableCellView>);
-impl NativeView for SettingsDestinationCell {
-    fn ns_view(&self) -> &NSView { &self.0 }
-}
-
-fn settings_destination_cell(
-    ui: &Ui,
-    title: &str,
-    symbol: &str,
-    badge_color: SettingsBadge,
-) -> SettingsDestinationCell {
-    let native = NSTableCellView::new(ui.mtm());
-    let highlight = crate::View::new(ui);
-    highlight.ns_view().setWantsLayer(true);
-    if let Some(layer) = highlight.ns_view().layer() {
-        layer.setCornerRadius(9.0);
-    }
-    native.addSubview(highlight.ns_view());
-    highlight.ns_view().setTranslatesAutoresizingMaskIntoConstraints(false);
-    let label = crate::Label::new(ui, title);
-    label.ns_view().setTranslatesAutoresizingMaskIntoConstraints(false);
-    native.addSubview(label.ns_view());
-    unsafe {
-        native.setTextField(Some(label.ns_text_field()));
-    }
-    let badge = crate::View::new(ui);
-    badge.width(20.0);
-    badge.height(20.0);
-    badge.ns_view().setWantsLayer(true);
-    if let Some(layer) = badge.ns_view().layer() {
-        layer.setBackgroundColor(Some(&badge_color.color().CGColor()));
-        layer.setCornerRadius(5.0);
-        layer.setBorderWidth(0.5);
-        layer.setBorderColor(Some(&NSColor::colorWithWhite_alpha(1.0, 0.10).CGColor()));
-    }
-    if let Some(image) = crate::ImageView::symbol(ui, symbol) {
-        image
-            .ns_image_view()
-            .setContentTintColor(Some(&NSColor::colorWithWhite_alpha(0.94, 1.0)));
-        image.width(14.0);
-        image.height(14.0);
-        badge.ns_view().addSubview(image.ns_view());
-        image.ns_view().setTranslatesAutoresizingMaskIntoConstraints(false);
-        image
-            .ns_view()
-            .centerXAnchor()
-            .constraintEqualToAnchor(&badge.ns_view().centerXAnchor())
-            .setActive(true);
-        image
-            .ns_view()
-            .centerYAnchor()
-            .constraintEqualToAnchor(&badge.ns_view().centerYAnchor())
-            .setActive(true);
-    }
-    badge.ns_view().setTranslatesAutoresizingMaskIntoConstraints(false);
-    native.addSubview(badge.ns_view());
-    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-        highlight
-            .ns_view()
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&native.leadingAnchor(), 10.0),
-        highlight
-            .ns_view()
-            .trailingAnchor()
-            .constraintEqualToAnchor_constant(&native.trailingAnchor(), -10.0),
-        highlight.ns_view().topAnchor().constraintEqualToAnchor(&native.topAnchor()),
-        highlight
-            .ns_view()
-            .bottomAnchor()
-            .constraintEqualToAnchor(&native.bottomAnchor()),
-        badge
-            .ns_view()
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&native.leadingAnchor(), 16.0),
-        badge.ns_view().centerYAnchor().constraintEqualToAnchor(&native.centerYAnchor()),
-        label
-            .ns_view()
-            .leadingAnchor()
-            .constraintEqualToAnchor_constant(&badge.ns_view().trailingAnchor(), 8.0),
-        label
-            .ns_view()
-            .trailingAnchor()
-            .constraintLessThanOrEqualToAnchor_constant(&native.trailingAnchor(), -15.0),
-        label.ns_view().centerYAnchor().constraintEqualToAnchor(&native.centerYAnchor()),
-    ]));
-    SettingsDestinationCell(native)
-}
-
-/// Standard settings sidebar chrome, including the search field and background.
-pub fn settings_sidebar_pane(
-    ui: &Ui,
-    search: crate::SearchField,
-    content: impl NativeView,
-) -> crate::View {
-    search.control_size(NSControlSize::Large);
-    search.height(28.0);
-    let pane = crate::VStack::new(ui)
-        .spacing(4.0)
-        .push(
-            crate::HStack::new(ui)
-                .insets(crate::Insets {
-                    top: 6.0,
-                    left: 10.0,
-                    bottom: 0.0,
-                    right: 10.0,
-                })
-                .push(search),
-        )
-        .push(content);
-    let background = crate::View::new(ui).safe_area_content(pane);
-    background.ns_view().setWantsLayer(true);
-    if let Some(layer) = background.ns_view().layer() {
-        layer.setBackgroundColor(Some(&NSColor::controlBackgroundColor().CGColor()));
-    }
-    background
 }

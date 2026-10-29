@@ -7,7 +7,7 @@ use objc2_quartz_core::{CALayer, CATransaction};
 
 use super::PreviewFrame;
 use super::capture::Sample;
-use crate::LayerTransaction;
+use crate::compositor::LayerTransaction;
 
 // Keep the capture pool entry and its surface in use through CA consumption.
 // The completion block can release this immutable sample on another thread.

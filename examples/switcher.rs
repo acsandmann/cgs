@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cgs::{SwitcherCommand, SwitcherItem, SwitcherLayout, WindowSwitcher};
+use cgs::compositor::switcher::{SwitcherCommand, SwitcherItem, SwitcherLayout, WindowSwitcher};
 use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
 use objc2_foundation::{NSDate, NSRunLoop};
 use objc2_screen_capture_kit::SCShareableContent;

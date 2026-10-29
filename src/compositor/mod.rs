@@ -1,3 +1,6 @@
+//! SkyLight windows, layer surfaces and transactions, plus the Metal-backed `preview`
+//! compositor and the `switcher` built on it.
+
 mod backdrop;
 mod layer;
 mod private;
@@ -23,7 +26,5 @@ fn cg_ok(error: objc2_core_graphics::CGError) -> Result<(), objc2_core_graphics:
 
 pub fn main_connection() -> i32 { unsafe { private::SLSMainConnectionID() } }
 
-mod preview;
-mod switcher;
-pub use preview::*;
-pub use switcher::*;
+pub mod preview;
+pub mod switcher;

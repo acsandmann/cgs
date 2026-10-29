@@ -8,7 +8,8 @@ use objc2_app_kit::*;
 use objc2_foundation::NSString;
 
 use crate::bridge::{ActionTarget, DelegateBridge, Event};
-use crate::{CGPoint, NativeView, Ui};
+use crate::view::NativeView;
+use crate::{CGPoint, Ui};
 
 pub struct MenuItem {
     native: Retained<NSMenuItem>,
@@ -118,7 +119,7 @@ impl Menu {
         let native = NSMenu::new(ui.mtm());
         native.setAutoenablesItems(false);
         unsafe {
-            native.setFont(Some(&crate::Font::body()));
+            native.setFont(Some(&crate::style::Font::body()));
         }
         Self {
             native,

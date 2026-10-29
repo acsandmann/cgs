@@ -1,54 +1,38 @@
-mod app;
+//! A native macOS UI library built on AppKit, plus a window-server compositor.
+//!
+//! Widgets live in topical modules:
+//!
+//! - [`view`], [`layout`], [`style`], [`text`], [`image`]: the `NativeView` abstraction, containers and content
+//! - [`controls`], [`input`], [`collection`]: interactive controls, text and shortcut entry, tables and outlines
+//! - [`window`], [`menu`], [`app`]: windows, sheets and popovers, menus and status items, the application
+//! - [`navigation`], [`tabs`], [`settings`]: split views and toolbars, tab strips, settings-window building blocks
+//! - [`drawing`], [`feedback`]: custom drawing surfaces, progress and empty states
+//! - [`compositor`]: SkyLight windows, layer surfaces, live window previews and the window switcher
+
 mod bridge;
-mod chips;
-mod collection;
+
+pub mod app;
+pub mod collection;
 pub mod compositor;
-mod control;
-mod drawing;
-mod help;
-mod input;
-mod layout;
-mod menu;
-mod navigation;
-mod picker;
-mod preview;
-mod settings;
-mod tab_bar;
-mod text;
-mod view;
-mod window;
-pub use app::*;
-pub use chips::*;
-pub use collection::*;
-pub use compositor::*;
-pub use control::*;
-pub use drawing::*;
-pub use help::*;
-pub use input::*;
-pub use layout::*;
-pub use menu::*;
-pub use navigation::*;
+pub mod controls;
+pub mod drawing;
+pub mod feedback;
+pub mod image;
+pub mod input;
+pub mod layout;
+pub mod menu;
+pub mod navigation;
+pub mod settings;
+pub mod style;
+pub mod tabs;
+pub mod text;
+pub mod view;
+pub mod window;
+
 pub use objc2::MainThreadMarker;
 pub use objc2::rc::Weak;
 pub use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 pub use objc2_foundation::NSEdgeInsets as Insets;
-pub use picker::*;
-pub use preview::*;
-pub use settings::*;
-pub use tab_bar::*;
-pub use text::*;
-pub use view::*;
-pub use window::*;
-
-/// Equal insets on every edge.
-pub const fn uniform_insets(value: f64) -> Insets {
-    Insets {
-        top: value,
-        left: value,
-        bottom: value,
-        right: value,
-    }
-}
 
 #[derive(Clone, Copy)]
 pub struct Ui {
@@ -59,5 +43,3 @@ impl Ui {
 
     pub fn mtm(&self) -> MainThreadMarker { self.mtm }
 }
-mod tab_selector;
-pub use tab_selector::TabSelector;

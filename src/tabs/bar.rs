@@ -15,9 +15,11 @@ use objc2_quartz_core::{
     CATransaction,
 };
 
-use crate::{
-    Button, CGPoint, CGRect, CGSize, GlassEffectView, Image, NativeView, Ui, View, VisualEffect,
-};
+use crate::controls::Button;
+use crate::drawing::VisualEffect;
+use crate::image::Image;
+use crate::view::{GlassEffectView, NativeView, View};
+use crate::{CGPoint, CGRect, CGSize, Ui};
 
 pub struct TabBarItem {
     pub title: String,
@@ -1098,7 +1100,7 @@ impl TabBar {
                         ]
                     },
                     text_colors: [NSColor::secondaryLabelColor(), NSColor::labelColor()],
-                    close_symbol: crate::Symbol::named("xmark").and_then(|image| {
+                    close_symbol: crate::image::Symbol::named("xmark").and_then(|image| {
                         image.imageWithSymbolConfiguration(
                             &NSImageSymbolConfiguration::configurationWithPointSize_weight(
                                 8.0,
@@ -1139,7 +1141,8 @@ impl TabBar {
             layer.setMasksToBounds(true);
             layer.insertSublayer_atIndex(&content.ivars().highlight, 0);
         }
-        let host = View::new(ui).content(content.retain().into_super(), crate::uniform_insets(0.0));
+        let host = View::new(ui)
+            .content(content.retain().into_super(), crate::layout::uniform_insets(0.0));
         // The appearance hook must belong to AppKit itself, not just our subclass.
         // If Apple removes it, use public active vibrancy rather than subdued glass.
         let active_glass = objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
@@ -1147,7 +1150,7 @@ impl TabBar {
         let surface: Box<dyn NativeView> = if active_glass {
             let glass = GlassEffectView::new(ui, host)
                 .corner_radius(14.0)
-                .style(crate::GlassStyle::Regular);
+                .style(crate::view::GlassStyle::Regular);
             Box::new(glass)
         } else {
             // Public-API fallback: active vibrancy, not Liquid Glass. Keep one material.

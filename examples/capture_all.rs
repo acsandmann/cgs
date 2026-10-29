@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cgs::{CaptureMode, CaptureResolution, Preview, PreviewCompositor, SourceStatus};
+use cgs::compositor::preview::{
+    CaptureMode, CaptureResolution, Preview, PreviewCompositor, SourceStatus,
+};
 use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
 use objc2_foundation::{NSDate, NSRunLoop};
 use objc2_screen_capture_kit::{SCShareableContent, SCWindow};

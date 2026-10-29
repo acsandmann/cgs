@@ -6,8 +6,18 @@ use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::NSArray;
 
-use crate::view::prepare;
-use crate::{Insets, Metrics, NativeView, Ui, View};
+use crate::view::{Metrics, NativeView, View, prepare};
+use crate::{Insets, Ui};
+
+/// Equal insets on every edge.
+pub const fn uniform_insets(value: f64) -> Insets {
+    Insets {
+        top: value,
+        left: value,
+        bottom: value,
+        right: value,
+    }
+}
 
 pub struct Stack {
     native: Retained<NSStackView>,
@@ -229,7 +239,7 @@ impl Form {
 
     pub fn row(mut self, title: &str, control: impl NativeView) -> Self {
         self.grid = self.grid.row(vec![
-            Box::new(crate::Label::new(&self.ui, title)),
+            Box::new(crate::text::Label::new(&self.ui, title)),
             Box::new(control),
         ]);
         self
@@ -237,8 +247,8 @@ impl Form {
 
     pub fn help(mut self, text: &str) -> Self {
         self.grid = self.grid.row(vec![
-            Box::new(crate::Label::new(&self.ui, "")),
-            Box::new(crate::SecondaryLabel::new(&self.ui, text)),
+            Box::new(crate::text::Label::new(&self.ui, "")),
+            Box::new(crate::text::SecondaryLabel::new(&self.ui, text)),
         ]);
         self
     }
@@ -394,13 +404,13 @@ define_class!(
 
 pub struct Disclosure {
     stack: VStack,
-    button: crate::Button,
+    button: crate::controls::Button,
     body: Box<dyn NativeView>,
     header: Rc<VStack>,
     heading: Rc<HStack>,
-    arrow: crate::Button,
-    symbol: Option<crate::ImageView>,
-    summary: Option<crate::SecondaryLabel>,
+    arrow: crate::controls::Button,
+    symbol: Option<crate::image::ImageView>,
+    summary: Option<crate::text::SecondaryLabel>,
     toggle: Rc<RefCell<Box<dyn FnMut(bool) -> bool>>>,
 }
 impl Disclosure {
@@ -409,10 +419,10 @@ impl Disclosure {
         let body = Box::new(content);
         body.set_hidden(true);
         let weak = Weak::new(body.ns_view());
-        let arrow = crate::Button::new(ui, "").disclosure();
+        let arrow = crate::controls::Button::new(ui, "").disclosure();
         arrow.ns_view().setAccessibilityElement(false);
         let header =
-            Rc::new(VStack::new(ui).spacing(3.0).push(crate::SectionTitle::new(ui, title)));
+            Rc::new(VStack::new(ui).spacing(3.0).push(crate::text::SectionTitle::new(ui, title)));
         let heading = Rc::new(HStack::new(ui).push(arrow.ns_view().retain()).push(header.clone()));
         heading.ns_view().setAccessibilityElement(false);
         let native: Retained<DisclosureHeader> = unsafe {
@@ -428,8 +438,8 @@ impl Disclosure {
         native.setBordered(false);
         native.setTitle(&objc2_foundation::NSString::from_str(""));
         native.addSubview(heading.ns_view());
-        crate::view::pin(&native, heading.ns_view(), crate::uniform_insets(0.0));
-        let button = crate::Button::from_native(ui, native.into_super());
+        crate::view::pin(&native, heading.ns_view(), crate::layout::uniform_insets(0.0));
+        let button = crate::controls::Button::from_native(ui, native.into_super());
         let weak_button = Weak::new(button.ns_button());
         let weak_arrow = Weak::new(arrow.ns_button());
         let toggle: Rc<RefCell<Box<dyn FnMut(bool) -> bool>>> =
@@ -497,7 +507,7 @@ impl Disclosure {
     }
 
     pub fn description(self, ui: &Ui, text: &str) -> Self {
-        self.header.add(crate::Caption::new(ui, text));
+        self.header.add(crate::text::Caption::new(ui, text));
         self
     }
 
@@ -506,7 +516,7 @@ impl Disclosure {
     pub fn trailing_indicator(self, ui: &Ui) -> Self {
         let stack = self.heading.ns_stack_view();
         stack.removeArrangedSubview(self.arrow.ns_view());
-        stack.addArrangedSubview(crate::Spacer::new(ui).ns_view());
+        stack.addArrangedSubview(crate::layout::Spacer::new(ui).ns_view());
         stack.addArrangedSubview(self.arrow.ns_view());
         self
     }
@@ -514,7 +524,7 @@ impl Disclosure {
     /// A one-line summary of the hidden settings at the header’s trailing edge, such as
     /// the values they currently hold, so collapsed content stays informative.
     pub fn summary(mut self, ui: &Ui) -> Self {
-        let label = crate::SecondaryLabel::single_line(ui, "");
+        let label = crate::text::SecondaryLabel::single_line(ui, "");
         let stack = self.heading.ns_stack_view();
         let arrow = self.arrow.ns_view();
         let trailing = stack.arrangedSubviews().lastObject().is_some_and(|last| &*last == arrow);
@@ -524,7 +534,7 @@ impl Disclosure {
                 stack.arrangedSubviews().len() as isize - 1,
             );
         } else {
-            stack.addArrangedSubview(crate::Spacer::new(ui).ns_view());
+            stack.addArrangedSubview(crate::layout::Spacer::new(ui).ns_view());
             stack.addArrangedSubview(label.ns_view());
         }
         label.ns_view().setAccessibilityElement(false);
@@ -546,13 +556,13 @@ impl Disclosure {
         if let Some(title) = self.header.ns_stack_view().arrangedSubviews().firstObject()
             && let Some(title) = title.downcast_ref::<objc2_app_kit::NSTextField>()
         {
-            title.setFont(Some(&crate::Font::body()));
+            title.setFont(Some(&crate::style::Font::body()));
         }
         self
     }
 
     pub fn symbol(mut self, ui: &Ui, name: &str) -> Self {
-        if let Some(image) = crate::ImageView::symbol(ui, name) {
+        if let Some(image) = crate::image::ImageView::symbol(ui, name) {
             image.width(22.0);
             image.height(22.0);
             image.ns_image_view().setContentTintColor(Some(&NSColor::labelColor()));

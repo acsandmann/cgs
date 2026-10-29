@@ -13,7 +13,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use cgs::*;
+use cgs::app::Application;
+use cgs::controls::Button;
+use cgs::layout::{HStack, VStack};
+use cgs::tabs::{TabBar, TabBarAction, TabBarEdge, TabBarItem};
+use cgs::text::Label;
+use cgs::view::NativeView;
+use cgs::window::Window;
+use cgs::{CGPoint, CGRect, CGSize, MainThreadMarker, Ui};
 use objc2::{AnyThread, Message};
 use objc2_app_kit::{NSAppearanceCustomization, NSApplicationActivationPolicy};
 fn main() {

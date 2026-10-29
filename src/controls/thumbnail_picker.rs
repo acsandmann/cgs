@@ -13,7 +13,12 @@ use objc2_app_kit::{
 use objc2_foundation::NSNumber;
 
 use crate::bridge::callback;
-use crate::{CGPoint, CGRect, Caption, Font, HStack, Label, Menu, NativeView, Ui, VStack};
+use crate::layout::{HStack, VStack};
+use crate::menu::Menu;
+use crate::style::Font;
+use crate::text::{Caption, Label};
+use crate::view::NativeView;
+use crate::{CGPoint, CGRect, Ui};
 
 /// Width of the selection ring, and the gap between it and the thumbnail.
 const RING: f64 = 3.0;
@@ -282,7 +287,7 @@ impl ThumbnailPicker {
                 })
                 .collect();
             view.addSubview(row.ns_view());
-            crate::view::pin(&view, row.ns_view(), crate::uniform_insets(0.0));
+            crate::view::pin(&view, row.ns_view(), crate::layout::uniform_insets(0.0));
             let menus = RefCell::new(tiles.iter().map(|_| None).collect());
             Inner {
                 view,
@@ -370,7 +375,11 @@ impl Tile {
         }
         thumbnail.ns_view().setAccessibilityElement(false);
         ring.addSubview(thumbnail.ns_view());
-        crate::view::pin(&ring, thumbnail.ns_view(), crate::uniform_insets(RING_INSET));
+        crate::view::pin(
+            &ring,
+            thumbnail.ns_view(),
+            crate::layout::uniform_insets(RING_INSET),
+        );
         let title = Label::new(ui, &name).font(&Font::caption()).truncating();
         let marker = Caption::single_line(ui, " ");
         for label in [title.ns_text_field(), marker.ns_text_field()] {
@@ -391,7 +400,7 @@ impl Tile {
         content.ns_stack_view().insertArrangedSubview_atIndex(&ring, 0);
         content.ns_stack_view().setCustomSpacing_afterView(6.0, &ring);
         view.addSubview(content.ns_view());
-        crate::view::pin(&view, content.ns_view(), crate::uniform_insets(0.0));
+        crate::view::pin(&view, content.ns_view(), crate::layout::uniform_insets(0.0));
         Self {
             view,
             ring,

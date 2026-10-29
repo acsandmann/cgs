@@ -9,7 +9,9 @@ use objc2_app_kit::{
 };
 use objc2_quartz_core::{CAAutoresizingMask, CALayer, CATransaction};
 
-use crate::{CGPoint, CGRect, CGSize, LayerHost, NativeView, Ui};
+use crate::drawing::LayerHost;
+use crate::view::NativeView;
+use crate::{CGPoint, CGRect, CGSize, Ui};
 
 define_class!(
     #[unsafe(super(NSView))]

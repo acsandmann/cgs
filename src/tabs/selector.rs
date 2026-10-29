@@ -5,7 +5,10 @@ use objc2_app_kit::*;
 use objc2_foundation::NSString;
 
 use crate::bridge::ActionTarget;
-use crate::*;
+use crate::image::Symbol;
+use crate::style::Font;
+use crate::view::{NativeControl, NativeView};
+use crate::{CGSize, Ui};
 
 /// Native glass tabs with labels, optional SF Symbols, drag tracking, keyboard
 /// navigation and accessibility supplied by NSTabView.
