@@ -202,6 +202,28 @@ define_class!(
     }
 );
 
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsSettingsColorView"]
+    #[ivars = u8]
+    struct SettingsColorView;
+    impl SettingsColorView {
+        #[unsafe(method(wantsUpdateLayer))]
+        fn wants_update_layer(&self) -> bool { true }
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            use objc2::DefinedClass;
+            let color = match *self.ivars() {
+                0 => crate::style::Color::settings_background(),
+                1 => objc2_app_kit::NSColor::controlBackgroundColor(),
+                _ => objc2_app_kit::NSColor::labelColor().colorWithAlphaComponent(0.05),
+            };
+            if let Some(layer) = self.layer() { layer.setBackgroundColor(Some(&color.CGColor())); }
+        }
+    }
+);
+
 pub struct View {
     native: Retained<NSView>,
     children: RefCell<Vec<Box<dyn NativeView>>>,
@@ -212,6 +234,13 @@ impl View {
             native: NSView::new(ui.mtm()),
             children: RefCell::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn settings_color(ui: &Ui, kind: u8) -> Self {
+        let native: Retained<SettingsColorView> =
+            unsafe { msg_send![super(SettingsColorView::alloc(ui.mtm()).set_ivars(kind)), init] };
+        native.setWantsLayer(true);
+        Self { native: native.into_super(), children: RefCell::new(Vec::new()) }
     }
 
     pub fn flipped(ui: &Ui) -> Self {

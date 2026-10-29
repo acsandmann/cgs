@@ -144,9 +144,7 @@ impl<T: Clone + PartialEq + 'static> NativeView for SettingsNavigation<T> {
 fn style_settings_cell(cell: &NSTableCellView, selected: bool) {
     if let Some(highlight) = cell.subviews().firstObject() {
         if let Some(layer) = highlight.layer() {
-            let color =
-                NSColor::labelColor().colorWithAlphaComponent(if selected { 0.05 } else { 0.0 });
-            layer.setBackgroundColor(Some(&color.CGColor()));
+            layer.setOpacity(if selected { 1.0 } else { 0.0 });
         }
     }
     if let Some(field) = unsafe { cell.textField() } {
@@ -185,7 +183,7 @@ fn settings_destination_cell(
     badge_color: SettingsBadge,
 ) -> SettingsDestinationCell {
     let native = NSTableCellView::new(ui.mtm());
-    let highlight = crate::view::View::new(ui);
+    let highlight = crate::view::View::settings_color(ui, 2);
     highlight.ns_view().setWantsLayer(true);
     if let Some(layer) = highlight.ns_view().layer() {
         layer.setCornerRadius(9.0);
@@ -282,10 +280,6 @@ pub fn settings_sidebar_pane(
                 .push(search),
         )
         .push(content);
-    let background = crate::view::View::new(ui).safe_area_content(pane);
-    background.ns_view().setWantsLayer(true);
-    if let Some(layer) = background.ns_view().layer() {
-        layer.setBackgroundColor(Some(&NSColor::controlBackgroundColor().CGColor()));
-    }
+    let background = crate::view::View::settings_color(ui, 1).safe_area_content(pane);
     background
 }

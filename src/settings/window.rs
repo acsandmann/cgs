@@ -31,7 +31,7 @@ impl SettingsWindow {
         };
         window
             .native
-            .setBackgroundColor(Some(&crate::style::Color::settings_background()));
+            .setBackgroundColor(Some(&crate::style::Color::window_background()));
         window.native.setTitlebarAppearsTransparent(true);
         window.native.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
         window.native.setToolbarStyle(NSWindowToolbarStyle::Automatic);
