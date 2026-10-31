@@ -10,6 +10,7 @@ mod transaction;
 mod window;
 pub use backdrop::backdrop_blur;
 use backdrop::blur_filters;
+pub(crate) use backdrop::{progressive_backdrop, backdrop_scale};
 pub use layer::{
     LayerTransaction, release_layer_tree, render_layer_to_cgs_window, with_disabled_actions,
 };

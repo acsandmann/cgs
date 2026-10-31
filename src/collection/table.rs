@@ -73,6 +73,47 @@ impl<T: 'static> Table<T> {
         }
     }
 
+    /// Replace only the differing span, preserving unrelated mounted editors.
+    pub fn reconcile_rows(&self, rows: Vec<T>)
+    where T: PartialEq {
+        let (prefix, old_end, new_end) = {
+            let old = self.rows.borrow();
+            let prefix = old.iter().zip(&rows).take_while(|(a, b)| a == b).count();
+            let suffix = old[prefix..]
+                .iter()
+                .rev()
+                .zip(rows[prefix..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (prefix, old.len() - suffix, rows.len() - suffix)
+        };
+        if prefix == old_end && prefix == new_end {
+            return;
+        }
+        let _ = self.native.numberOfRows();
+        self.native.beginUpdates();
+        *self.rows.borrow_mut() = rows;
+        if old_end > prefix {
+            self.native.removeRowsAtIndexes_withAnimation(
+                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(
+                    prefix,
+                    old_end - prefix,
+                )),
+                NSTableViewAnimationOptions::EffectNone,
+            );
+        }
+        if new_end > prefix {
+            self.native.insertRowsAtIndexes_withAnimation(
+                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(
+                    prefix,
+                    new_end - prefix,
+                )),
+                NSTableViewAnimationOptions::EffectNone,
+            );
+        }
+        self.native.endUpdates();
+    }
+
     pub fn column(self, id: &str, title: &str, width: f64) -> Self {
         let column = NSTableColumn::initWithIdentifier(
             NSTableColumn::alloc(self.native.mtm()),

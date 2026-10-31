@@ -20,3 +20,20 @@ sources and stopped-capture transforms without GPU submissions. Validate its
 screenshots with `uv run --with pillow python benchmarks/check_scroll.py OUT --surfaces`.
 
 License: GPL-3.0.
+
+## Choosing tabs and segments
+
+Use `tabs::TabSelector` for glass pill tabs and settings choices (including icon
+choices such as Top/Bottom). It uses AppKit’s tab-strip component, including its
+rounded selection, tracking, and accessibility. `controls::SegmentedControl` is
+for conventional segmented controls; wrapping it in `GlassEffectView` does not
+turn its rectangular selection into native glass tabs. Do not stack glass behind
+a `TabSelector` or override its segment style.
+
+## Numeric inputs
+
+`NumberField` includes native up/down stepping in its input bezel. Units belong
+outside the bezel: use `NumberField::unit_field` or `SettingsRow::suffix`.
+`NumberSlider` hides the redundant stepper automatically. When composing a slider
+and field manually, call `field.hide_stepper()`. Size the numeric field itself,
+not the combined field-and-unit wrapper, so units retain their natural width.

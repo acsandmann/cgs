@@ -1,10 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2::{MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSAccessibility, NSControl, NSControlSize, NSLayoutAttribute, NSLayoutConstraint,
-    NSLayoutRelation, NSUserInterfaceItemIdentification, NSView, NSViewController,
+    NSAccessibility, NSBezierPath, NSColor, NSControl, NSControlSize, NSGraphicsContext,
+    NSLayoutAttribute, NSLayoutConstraint, NSLayoutRelation, NSUserInterfaceItemIdentification,
+    NSView, NSViewController,
 };
 use objc2_foundation::NSString;
 
@@ -136,15 +137,21 @@ impl<T: NativeView + ?Sized> NativeView for Box<T> {
     fn ns_view(&self) -> &NSView { (**self).ns_view() }
 
     fn view_controller(&self) -> Option<&NSViewController> { (**self).view_controller() }
+
+    fn accessibility_label(&self, label: &str) { (**self).accessibility_label(label); }
 }
 
 impl<T: NativeView + ?Sized> NativeView for std::rc::Rc<T> {
     fn ns_view(&self) -> &NSView { (**self).ns_view() }
 
     fn view_controller(&self) -> Option<&NSViewController> { (**self).view_controller() }
+
+    fn accessibility_label(&self, label: &str) { (**self).accessibility_label(label); }
 }
 impl<T: NativeControl> NativeControl for std::rc::Rc<T> {
     fn ns_control(&self) -> &NSControl { (**self).ns_control() }
+
+    fn set_enabled(&self, value: bool) { (**self).set_enabled(value); }
 }
 
 pub(crate) fn dimension(
@@ -205,6 +212,39 @@ define_class!(
 define_class!(
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
+    #[name = "CgsSettingsCardView"]
+    #[ivars = Cell<u8>]
+    struct SettingsCardView;
+    impl SettingsCardView {
+        #[unsafe(method(drawRect:))]
+        fn draw(&self, _: crate::CGRect) {
+            use objc2::DefinedClass;
+            let bounds = self.bounds();
+            let mut shape = bounds;
+            if self.ivars().get() & 1 == 0 { shape.size.height += 10.0; }
+            if self.ivars().get() & 2 == 0 { shape.origin.y -= 10.0; shape.size.height += 10.0; }
+            NSGraphicsContext::saveGraphicsState_class();
+            NSBezierPath::bezierPathWithRect(bounds).addClip();
+            NSColor::quaternarySystemFillColor().setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(shape, 10.0, 10.0).fill();
+            NSGraphicsContext::restoreGraphicsState_class();
+        }
+        #[unsafe(method(setFrameSize:))]
+        fn resize(&self, size: crate::CGSize) {
+            unsafe { let _: () = msg_send![super(self), setFrameSize: size]; }
+            self.setNeedsDisplay(true);
+        }
+        #[unsafe(method(viewDidChangeEffectiveAppearance))]
+        fn appearance(&self) {
+            unsafe { let _: () = msg_send![super(self), viewDidChangeEffectiveAppearance]; }
+            self.setNeedsDisplay(true);
+        }
+    }
+);
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
     #[name = "CgsSettingsColorView"]
     #[ivars = u8]
     struct SettingsColorView;
@@ -236,11 +276,45 @@ impl View {
         }
     }
 
+    /// The adaptive detail-pane surface for custom settings layouts.
+    pub fn settings_background(ui: &Ui) -> Self { Self::settings_color(ui, 0) }
+
+    /// Adaptive card fill for view-based collection cells.
+    pub fn settings_card(ui: &Ui) -> Self {
+        let native: Retained<SettingsCardView> = unsafe {
+            msg_send![
+                super(SettingsCardView::alloc(ui.mtm()).set_ivars(Cell::new(0))),
+                init
+            ]
+        };
+        Self {
+            native: native.into_super(),
+            children: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub fn set_card_edges(&self, first: bool, last: bool) {
+        use objc2::DefinedClass;
+        if let Some(view) = self.native.downcast_ref::<SettingsCardView>() {
+            let edges = u8::from(first) | (u8::from(last) << 1);
+            if view.ivars().replace(edges) != edges {
+                view.setNeedsDisplay(true);
+            }
+        }
+    }
+
     pub(crate) fn settings_color(ui: &Ui, kind: u8) -> Self {
-        let native: Retained<SettingsColorView> =
-            unsafe { msg_send![super(SettingsColorView::alloc(ui.mtm()).set_ivars(kind)), init] };
+        let native: Retained<SettingsColorView> = unsafe {
+            msg_send![
+                super(SettingsColorView::alloc(ui.mtm()).set_ivars(kind)),
+                init
+            ]
+        };
         native.setWantsLayer(true);
-        Self { native: native.into_super(), children: RefCell::new(Vec::new()) }
+        Self {
+            native: native.into_super(),
+            children: RefCell::new(Vec::new()),
+        }
     }
 
     pub fn flipped(ui: &Ui) -> Self {
@@ -253,6 +327,10 @@ impl View {
     }
 
     pub fn ns_view(&self) -> &NSView { &self.native }
+
+    pub(crate) fn retain_child(&self, child: impl NativeView) {
+        self.children.borrow_mut().push(Box::new(child));
+    }
 
     /// Keep controls below full-size window chrome using AppKit's safe area.
     pub fn safe_area_content(self, child: impl NativeView) -> Self {

@@ -17,11 +17,12 @@ use crate::{CGRect, Insets, Ui};
 
 /// Page-owned native header controls. Toolbar presentation and glass remain in CGS.
 pub struct HeaderControls {
-    menu: Rc<Popup>,
+    menu: Option<Rc<Popup>>,
     search: SearchField,
     icon_only: bool,
     actions: Option<Popup>,
     label: String,
+    content: Option<Box<dyn NativeView>>,
 }
 impl HeaderControls {
     pub fn new(ui: &Ui, label: &str, symbol: &str, menu: Menu, search: SearchField) -> Self {
@@ -43,11 +44,33 @@ impl HeaderControls {
         menu.height(36.0);
         search.width(216.0);
         Self {
-            menu: Rc::new(menu),
+            menu: Some(Rc::new(menu)),
             search,
             icon_only: true,
             actions: None,
             label: label.into(),
+            content: None,
+        }
+    }
+
+    /// Page-owned controls in the native toolbar, without a toolbar search field.
+    pub fn content(ui: &Ui, label: &str, content: impl NativeView) -> Self {
+        let mut controls = Self::search(SearchField::new(ui));
+        controls.label = label.into();
+        controls.content = Some(Box::new(content));
+        controls
+    }
+
+    /// A native toolbar search field without an adjacent filter button.
+    pub fn search(search: SearchField) -> Self {
+        search.width(216.0);
+        Self {
+            menu: None,
+            search,
+            icon_only: false,
+            actions: None,
+            label: String::new(),
+            content: None,
         }
     }
 
@@ -59,11 +82,12 @@ impl HeaderControls {
         menu.min_width(100.0);
         search.width(216.0);
         Self {
-            menu,
+            menu: Some(menu),
             search,
             icon_only: false,
             actions: None,
             label: label.into(),
+            content: None,
         }
     }
 
@@ -79,9 +103,10 @@ impl HeaderControls {
     /// Use the semantic blue tint while a filter is active.
     pub fn set_filtered(&self, active: bool) {
         let blue = NSColor::systemBlueColor();
-        self.menu
-            .ns_popup_button()
-            .setContentTintColor(if active { Some(&blue) } else { None });
+        if let Some(menu) = &self.menu {
+            menu.ns_popup_button()
+                .setContentTintColor(if active { Some(&blue) } else { None });
+        }
     }
 }
 
@@ -460,8 +485,13 @@ impl Toolbar {
         };
         let views = controls.map_or([None, None, None], |controls| {
             [
-                Some(controls.menu.ns_view()),
-                Some(controls.search.ns_view()),
+                controls.menu.as_ref().map(|menu| menu.ns_view()),
+                Some(
+                    controls
+                        .content
+                        .as_ref()
+                        .map_or(controls.search.ns_view(), |content| content.ns_view()),
+                ),
                 controls.actions.as_ref().map(|actions| actions.ns_view()),
             ]
         });
@@ -506,41 +536,58 @@ impl Toolbar {
                 .retain(|item| item.itemIdentifier() != id);
         }
         if let Some(controls) = controls {
-            let filter = controls.menu.ns_popup_button();
+            if let Some(content) = &controls.content {
+                let id = NSString::from_str("cgs.page-filter");
+                let item =
+                    NSToolbarItem::initWithItemIdentifier(NSToolbarItem::alloc(ui.mtm()), &id);
+                item.setLabel(&NSString::from_str(&controls.label));
+                item.setView(Some(content.ns_view()));
+                item.setBordered(false);
+                item.setVisibilityPriority(1000);
+                delegate.ivars().navigation.borrow_mut().push(item);
+                self.native
+                    .insertItemWithItemIdentifier_atIndex(&id, self.native.items().len() as isize);
+                return;
+            }
             let search = controls.search.ns_search_field();
-            let item: Retained<NSToolbarItem> = if controls.icon_only {
-                let item = NSMenuToolbarItem::initWithItemIdentifier(
-                    NSMenuToolbarItem::alloc(ui.mtm()),
-                    &NSString::from_str("cgs.page-filter"),
-                );
-                item.setLabel(&NSString::from_str(&controls.label));
-                let content: Retained<NSView> = unsafe {
-                    Retained::retain(filter as *const NSPopUpButton as *mut NSView).unwrap()
+            let item = controls.menu.as_ref().map(|menu| {
+                let filter = menu.ns_popup_button();
+                let item: Retained<NSToolbarItem> = if controls.icon_only {
+                    let item = NSMenuToolbarItem::initWithItemIdentifier(
+                        NSMenuToolbarItem::alloc(ui.mtm()),
+                        &NSString::from_str("cgs.page-filter"),
+                    );
+                    item.setLabel(&NSString::from_str(&controls.label));
+                    let content: Retained<NSView> = unsafe {
+                        Retained::retain(filter as *const NSPopUpButton as *mut NSView).unwrap()
+                    };
+                    let glass = GlassEffectView::new(ui, content).corner_radius(18.0);
+                    glass.width(36.0);
+                    glass.height(36.0);
+                    item.setView(Some(glass.ns_view()));
+                    if let Some(menu) = filter.menu() {
+                        item.setMenu(&menu);
+                    }
+                    item.setShowsIndicator(false);
+                    item.setBordered(false);
+                    item.into_super()
+                } else {
+                    filter.sizeToFit();
+                    let mut frame = filter.frame();
+                    frame.size.width = (frame.size.width + 12.0).max(100.0);
+                    filter.setFrame(frame);
+                    let item = NSToolbarItem::initWithItemIdentifier(
+                        NSToolbarItem::alloc(ui.mtm()),
+                        &NSString::from_str("cgs.page-filter"),
+                    );
+                    item.setLabel(&NSString::from_str(&controls.label));
+                    item.setView(Some(filter));
+                    item.setBordered(false);
+                    item
                 };
-                let glass = GlassEffectView::new(ui, content).corner_radius(18.0);
-                glass.width(36.0);
-                glass.height(36.0);
-                item.setView(Some(glass.ns_view()));
-                if let Some(menu) = filter.menu() {
-                    item.setMenu(&menu);
-                }
-                item.setShowsIndicator(false);
-                item.setBordered(false);
-                item.into_super()
-            } else {
-                filter.sizeToFit();
-                let mut frame = filter.frame();
-                frame.size.width = (frame.size.width + 12.0).max(100.0);
-                filter.setFrame(frame);
-                let item = NSToolbarItem::initWithItemIdentifier(
-                    NSToolbarItem::alloc(ui.mtm()),
-                    &NSString::from_str("cgs.page-filter"),
-                );
-                item.setLabel(&NSString::from_str(&controls.label));
-                item.setView(Some(filter));
-                item.setBordered(false);
+                item.setVisibilityPriority(1000);
                 item
-            };
+            });
             let search_item = NSSearchToolbarItem::initWithItemIdentifier(
                 NSSearchToolbarItem::alloc(ui.mtm()),
                 &NSString::from_str("cgs.page-search"),
@@ -550,9 +597,8 @@ impl Toolbar {
             );
             search_item.setSearchField(search);
             search_item.setPreferredWidthForSearchField(216.0);
-            item.setVisibilityPriority(1000);
             search_item.setVisibilityPriority(-1000);
-            let mut items = vec![item];
+            let mut items: Vec<_> = item.into_iter().collect();
             if let Some(actions) = &controls.actions {
                 let item = NSToolbarItem::initWithItemIdentifier(
                     NSToolbarItem::alloc(ui.mtm()),

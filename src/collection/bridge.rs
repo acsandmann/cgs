@@ -37,7 +37,11 @@ impl CollectionCell {
             self.setImageView(None);
         }
         if let Some(old) = self.ivars().borrow_mut().take() {
-            old.ns_view().removeFromSuperview();
+            if unsafe { old.ns_view().superview() }
+                .is_some_and(|parent| std::ptr::eq(&*parent, &***self))
+            {
+                old.ns_view().removeFromSuperview();
+            }
         }
         self.addSubview(content.ns_view());
         crate::view::pin(self, content.ns_view(), crate::Insets {

@@ -51,6 +51,8 @@ impl NavigationSplitView {
         let split = SplitView::new(ui).pane(ui, sidebar, true).pane(ui, detail, false);
         let items = split.native.splitViewItems();
         items.objectAtIndex(0).setMinimumThickness(Metrics::SIDEBAR_MIN_WIDTH);
+        // Let detail scroll views extend beneath native window chrome.
+        items.objectAtIndex(1).setAllowsFullHeightLayout(true);
         Self(split)
     }
 

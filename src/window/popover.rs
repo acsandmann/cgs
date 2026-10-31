@@ -35,6 +35,13 @@ impl Popover {
         );
     }
 
+    /// Refit when an option reveals or hides additional controls.
+    pub fn fit_content(&self) {
+        let content = self.controller.ns_view_controller().view();
+        content.layoutSubtreeIfNeeded();
+        self.native.setContentSize(content.fittingSize());
+    }
+
     pub fn close(&self) { self.native.close(); }
 
     pub fn on_close(mut self, mut f: impl FnMut() + 'static) -> Self {

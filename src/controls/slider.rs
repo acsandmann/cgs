@@ -185,12 +185,13 @@ pub struct NumberSlider {
 }
 impl NumberSlider {
     pub fn new(ui: &Ui, slider: std::rc::Rc<Slider>, field: std::rc::Rc<NumberField>) -> Self {
+        field.hide_stepper();
         Self {
             stack: HStack::new(ui).spacing(12.0).push(slider).push(field),
         }
     }
 
-    /// A standard-length slider and a compact field with its unit inside the bezel.
+    /// A standard-length slider with an external unit and no redundant stepper.
     pub fn with_unit(
         ui: &Ui,
         slider: std::rc::Rc<Slider>,
@@ -198,8 +199,9 @@ impl NumberSlider {
         unit: &str,
     ) -> Self {
         slider.width(crate::view::Metrics::SLIDER_WIDTH);
+        field.hide_stepper();
         let value = field.unit_field(ui, unit);
-        value.width(crate::view::Metrics::VALUE_FIELD_WIDTH);
+        field.min_width(crate::view::Metrics::VALUE_FIELD_WIDTH);
         Self {
             // The bezel hosts the field's view; keep its Rust owner with the row.
             stack: HStack::new(ui).spacing(8.0).push(slider).push(value).keep(field),

@@ -188,3 +188,27 @@ pub struct EditorPage {
 impl NativeView for EditorPage {
     fn ns_view(&self) -> &NSView { &self.native }
 }
+
+/// A transparent fixed header over edge-to-edge scrolling content.
+/// The scroll view measures this header and reserves its height at the origin.
+pub struct ScrollHeader {
+    root: View,
+}
+impl ScrollHeader {
+    pub fn new(ui: &Ui, header: impl NativeView, content: impl NativeView) -> Self {
+        crate::layout::set_scroll_header(content.ns_view(), header.ns_view());
+        let root = View::settings_color(ui, 0).content(content, crate::layout::uniform_insets(0.0));
+        root.ns_view().addSubview(header.ns_view());
+        crate::view::prepare(header.ns_view());
+        header.ns_view().topAnchor()
+            .constraintEqualToAnchor(&root.ns_view().safeAreaLayoutGuide().topAnchor()).setActive(true);
+        header.ns_view().leadingAnchor().constraintEqualToAnchor(&root.ns_view().leadingAnchor()).setActive(true);
+        header.ns_view().trailingAnchor().constraintEqualToAnchor(&root.ns_view().trailingAnchor()).setActive(true);
+        // Retain Rust callbacks as well as the native view.
+        root.retain_child(header);
+        Self { root }
+    }
+}
+impl NativeView for ScrollHeader {
+    fn ns_view(&self) -> &NSView { self.root.ns_view() }
+}

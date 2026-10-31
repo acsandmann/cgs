@@ -12,6 +12,6 @@ impl Metrics {
     pub const SIDEBAR_WIDTH: f64 = 200.0;
     /// A continuous slider beside a value field, as in System Settings.
     pub const SLIDER_WIDTH: f64 = 160.0;
-    /// A short numeric field with its unit inside the bezel.
-    pub const VALUE_FIELD_WIDTH: f64 = 60.0;
+    /// A short numeric input; any unit label sits outside this width.
+    pub const VALUE_FIELD_WIDTH: f64 = 64.0;
 }

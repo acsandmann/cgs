@@ -31,7 +31,6 @@ pub struct SettingsRow {
     pub(super) label: Rc<dyn NativeView>,
     value: VStack,
     line: OnceCell<Rc<HStack>>,
-    unit: Option<crate::input::UnitField>,
     control: Box<dyn NativeView>,
     validation: Rc<ValidationMessage>,
     pub(super) wide: bool,
@@ -75,7 +74,6 @@ impl SettingsRow {
             label,
             value,
             line: OnceCell::new(),
-            unit: None,
             control: Box::new(control),
             validation,
             wide: false,
@@ -136,43 +134,12 @@ impl SettingsRow {
         self
     }
 
-    pub fn suffix(mut self, text: &str) -> Self {
-        fn input(view: &NSView) -> Option<Retained<NSTextField>> {
-            if let Some(field) = view.downcast_ref::<NSTextField>() {
-                if field.isEditable() {
-                    return Some(field.retain());
-                }
-            }
-            view.subviews().iter().find_map(|child| input(&child))
-        }
-        if let Some(field) = input(self.control.ns_view()) {
-            if let Some(parent) = unsafe { field.superview() }
-                .and_then(|view| view.downcast::<objc2_app_kit::NSStackView>().ok())
-            {
-                let index = parent
-                    .arrangedSubviews()
-                    .iter()
-                    .position(|view| std::ptr::eq::<NSView>(&*view, &***field))
-                    .unwrap_or(0);
-                parent.removeArrangedSubview(&field);
-                field.removeFromSuperview();
-                let unit = crate::input::UnitField::new(&self.ui, &field, text);
-                parent.insertArrangedSubview_atIndex(unit.ns_view(), index as isize);
-                if parent.orientation() == objc2_app_kit::NSUserInterfaceLayoutOrientation::Vertical
-                {
-                    unit.ns_view()
-                        .widthAnchor()
-                        .constraintEqualToAnchor(&parent.widthAnchor())
-                        .setActive(true);
-                }
-                self.unit = Some(unit);
-                return self;
-            }
-        }
+    pub fn suffix(self, text: &str) -> Self {
         let line = self.line.get_or_init(|| {
             self.value.ns_stack_view().removeArrangedSubview(self.control.ns_view());
             self.control.ns_view().removeFromSuperview();
-            let line = Rc::new(HStack::new(&self.ui).push(self.control.ns_view().retain()));
+            let line =
+                Rc::new(HStack::new(&self.ui).spacing(6.0).push(self.control.ns_view().retain()));
             self.value.ns_stack_view().insertArrangedSubview_atIndex(line.ns_view(), 0);
             line.ns_view()
                 .widthAnchor()

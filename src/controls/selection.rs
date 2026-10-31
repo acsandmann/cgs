@@ -1,6 +1,6 @@
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::*;
 use objc2_foundation::{NSArray, NSString};
 
@@ -20,30 +20,102 @@ pub(crate) fn header_menu_style(button: &NSPopUpButton) {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PopupStyle {
+    #[default]
+    Standard,
+    Settings,
+    Inline,
+}
+
+#[derive(Default)]
+pub(crate) struct PopupState {
+    style: std::cell::Cell<PopupStyle>,
+    hovered: std::cell::Cell<bool>,
+    tracking: std::cell::RefCell<Option<Retained<NSTrackingArea>>>,
+}
 define_class!(
     #[unsafe(super(NSPopUpButton))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgsPopup"]
-    #[ivars = std::cell::Cell<bool>]
+    #[ivars = PopupState]
     pub(crate) struct SettingsPopup;
     impl SettingsPopup {
         #[unsafe(method(intrinsicContentSize))]
         fn intrinsic_size(&self) -> crate::CGSize {
             let mut size: crate::CGSize = unsafe { msg_send![super(self), intrinsicContentSize] };
-            if self.ivars().get() { size.width += 12.0; }
+            match self.ivars().style.get() {
+                PopupStyle::Settings => size.width += 12.0,
+                PopupStyle::Inline => size.width += 18.0,
+                PopupStyle::Standard => {},
+            }
             size
+        }
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking(&self) {
+            unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
+            if self.ivars().tracking.borrow().is_some() { return; }
+            let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(), crate::CGRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveAlways | NSTrackingAreaOptions::InVisibleRect,
+                Some(self), None,
+            ) };
+            self.addTrackingArea(&area);
+            *self.ivars().tracking.borrow_mut() = Some(area);
+        }
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(true);
+            NSView::setNeedsDisplay(self, true);
+        }
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hovered.set(false);
+            NSView::setNeedsDisplay(self, true);
         }
         #[unsafe(method(drawRect:))]
         fn draw(&self, dirty: crate::CGRect) {
-            if self.ivars().get() {
+            let style = self.ivars().style.get();
+            if style == PopupStyle::Inline {
+                unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
+                let bounds = self.bounds();
+                let (x, y) = (bounds.size.width - 8.0, bounds.size.height / 2.0);
+                let circle = crate::CGRect::new(crate::CGPoint::new(x - 8.0, y - 8.0), crate::CGSize::new(16.0, 16.0));
+                let hovered = self.ivars().hovered.get() && self.isEnabled();
+                NSColor::labelColor().colorWithAlphaComponent(if hovered { 0.11 } else { 0.05 }).setFill();
+                NSBezierPath::bezierPathWithOvalInRect(circle).fill();
+                let chevrons = NSBezierPath::bezierPath();
+                for direction in [-1.0, 1.0] {
+                    chevrons.moveToPoint(crate::CGPoint::new(x - 2.5, y + direction * 1.5));
+                    chevrons.lineToPoint(crate::CGPoint::new(x, y + direction * 4.0));
+                    chevrons.lineToPoint(crate::CGPoint::new(x + 2.5, y + direction * 1.5));
+                }
+                chevrons.setLineWidth(1.3);
+                chevrons.setLineCapStyle(NSLineCapStyle::Round);
+                chevrons.setLineJoinStyle(NSLineJoinStyle::Round);
+                NSColor::labelColor().colorWithAlphaComponent(if self.isEnabled() { 0.75 } else { 0.3 }).setStroke();
+                chevrons.stroke();
+                return;
+            }
+            if style != PopupStyle::Standard {
                 let bounds = self.bounds();
                 let size = 20.0;
                 let circle = crate::CGRect::new(
                     crate::CGPoint::new(bounds.size.width - size, (bounds.size.height - size) / 2.0),
                     crate::CGSize::new(size, size),
                 );
+                let hovered = self.ivars().hovered.get() && self.isEnabled();
                 NSColor::labelColor().colorWithAlphaComponent(0.09).setFill();
-                NSBezierPath::bezierPathWithOvalInRect(circle).fill();
+                if hovered {
+                    let capsule = crate::CGRect::new(
+                        crate::CGPoint::new(0.0, (bounds.size.height - size) / 2.0),
+                        crate::CGSize::new(bounds.size.width, size),
+                    );
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(capsule, size / 2.0, size / 2.0).fill();
+                } else {
+                    NSBezierPath::bezierPathWithOvalInRect(circle).fill();
+                }
+
             }
             unsafe { let _: () = msg_send![super(self), drawRect: dirty]; }
         }
@@ -51,7 +123,10 @@ define_class!(
 );
 impl SettingsPopup {
     pub(crate) fn settings_style(&self) {
-        self.ivars().set(true);
+        // SettingsRow also applies this to nested controls; preserve explicit inline styling.
+        if self.ivars().style.get() != PopupStyle::Inline {
+            self.ivars().style.set(PopupStyle::Settings);
+        }
         self.setBordered(false);
         self.setControlSize(NSControlSize::Regular);
         self.invalidateIntrinsicContentSize();
@@ -70,7 +145,7 @@ impl Popup {
     pub fn new(ui: &Ui) -> Self {
         let native: Retained<SettingsPopup> = unsafe {
             msg_send![
-                super(SettingsPopup::alloc(ui.mtm()).set_ivars(std::cell::Cell::new(false))),
+                super(SettingsPopup::alloc(ui.mtm()).set_ivars(PopupState::default())),
                 init
             ]
         };
@@ -124,6 +199,27 @@ impl Popup {
         popup.accessibility_label(label);
         popup.menu = Some(menu);
         popup
+    }
+
+    /// Match the compact selectors in settings cards, including their hover treatment.
+    pub fn settings_style(self) -> Self {
+        if let Some(native) = self.native.downcast_ref::<SettingsPopup>() {
+            native.settings_style();
+        }
+        self
+    }
+
+    /// Compact command parameter with a close chevron and chevron-only hover feedback.
+    pub fn inline_style(self) -> Self {
+        if let Some(native) = self.native.downcast_ref::<SettingsPopup>() {
+            native.ivars().style.set(PopupStyle::Inline);
+            native.setAlignment(NSTextAlignment::Left);
+            if let Some(cell) = native.cell().and_then(|cell| cell.downcast::<NSPopUpButtonCell>().ok()) {
+                cell.setArrowPosition(NSPopUpArrowPosition::NoArrow);
+            }
+            native.settings_style();
+        }
+        self
     }
 
     pub fn toolbar_style(self) -> Self {

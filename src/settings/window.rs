@@ -32,6 +32,8 @@ impl SettingsWindow {
         window
             .native
             .setBackgroundColor(Some(&crate::style::Color::window_background()));
+        // The scroll views provide the shared progressive backdrop. Keep the
+        // native toolbar transparent so a second, opaque system backing cannot cover it.
         window.native.setTitlebarAppearsTransparent(true);
         window.native.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
         window.native.setToolbarStyle(NSWindowToolbarStyle::Automatic);

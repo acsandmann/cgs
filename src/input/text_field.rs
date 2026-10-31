@@ -248,54 +248,25 @@ impl Drop for TextArea {
 }
 
 /// Native text-field bezel with an editable value and a separate, read-only unit.
+/// A numeric input with its unit outside the editable bezel.
 pub struct UnitField {
-    bezel: Retained<NSTextField>,
-    _content: crate::layout::HStack,
+    content: crate::layout::HStack,
 }
 impl UnitField {
     pub fn new(ui: &Ui, field: &NSTextField, unit: &str) -> Self {
-        let bezel = NSTextField::new(ui.mtm());
-        bezel.setEditable(false);
-        bezel.setSelectable(false);
-        bezel.setAccessibilityElement(true);
-        bezel.setAccessibilityRole(Some(unsafe { NSAccessibilityGroupRole }));
-        field.setBezeled(false);
-        field.setDrawsBackground(false);
-        // Units must retain their natural width while the editable value yields.
+        Self::with_content(ui, field.retain().into_super().into_super(), unit)
+    }
+
+    pub(crate) fn with_content(ui: &Ui, field: impl NativeView, unit: &str) -> Self {
         let label =
             crate::text::Label::new(ui, unit).color(&crate::style::Color::secondary_label());
         label.compression_resistance(1000.0, NSLayoutConstraintOrientation::Horizontal);
         label.hugging_priority(1000.0, NSLayoutConstraintOrientation::Horizontal);
-        label.ns_text_field().setSelectable(false);
-        let value_object: &AnyObject = field;
-        let unit_object: &AnyObject = label.ns_text_field();
-        unsafe {
-            bezel.setAccessibilityChildren(Some(&objc2_foundation::NSArray::from_slice(&[
-                value_object,
-                unit_object,
-            ])));
+        Self {
+            content: crate::layout::HStack::new(ui).spacing(6.0).push(field).push(label),
         }
-        let content = crate::layout::HStack::new(ui)
-            .spacing(4.0)
-            .insets(crate::Insets {
-                top: 3.0,
-                left: 6.0,
-                bottom: 3.0,
-                right: 8.0,
-            })
-            .push(field.retain().into_super().into_super())
-            .push(label);
-        bezel.addSubview(content.ns_view());
-        crate::view::prepare(content.ns_view());
-        crate::view::pin(&bezel, content.ns_view(), crate::Insets {
-            top: 0.0,
-            left: 0.0,
-            bottom: 0.0,
-            right: 0.0,
-        });
-        Self { bezel, _content: content }
     }
 }
 impl NativeView for UnitField {
-    fn ns_view(&self) -> &NSView { &self.bezel }
+    fn ns_view(&self) -> &NSView { self.content.ns_view() }
 }

@@ -76,20 +76,57 @@ impl Stack {
         self
     }
 
-    pub fn add(&self, view: impl NativeView) {
-        prepare(view.ns_view());
-        self.native.addArrangedSubview(view.ns_view());
+    fn prepare_child(&self, view: &NSView) {
+        prepare(view);
         if self.native.orientation() == NSUserInterfaceLayoutOrientation::Vertical {
             let insets = self.native.edgeInsets();
-            view.ns_view()
-                .widthAnchor()
+            view.widthAnchor()
                 .constraintEqualToAnchor_constant(
                     &self.native.widthAnchor(),
                     -insets.left - insets.right,
                 )
                 .setActive(true);
         }
+    }
+
+    pub fn add(&self, view: impl NativeView) {
+        self.native.addArrangedSubview(view.ns_view());
+        self.prepare_child(view.ns_view());
         self.children.borrow_mut().push(Box::new(view));
+    }
+
+    /// Reconcile a caller-owned list without detaching unchanged views from their window.
+    /// This preserves first responders, field editors, and scroll anchors across edits.
+    pub fn set_children(&self, children: Vec<impl NativeView>) {
+        let mut current: Vec<_> = self.native.arrangedSubviews().iter().collect();
+        current.retain(|view| {
+            if children.iter().any(|child| std::ptr::eq(&**view, child.ns_view())) {
+                return true;
+            }
+            self.native.removeArrangedSubview(view);
+            view.removeFromSuperview();
+            false
+        });
+        for (index, child) in children.iter().enumerate() {
+            let view = child.ns_view();
+            let existing = current.iter().position(|old| std::ptr::eq(&**old, view));
+            if existing == Some(index) {
+                continue;
+            }
+            if let Some(old) = existing {
+                self.native.removeArrangedSubview(view);
+                current.remove(old);
+            }
+            self.native.insertArrangedSubview_atIndex(view, index as isize);
+            if existing.is_none() {
+                self.prepare_child(view);
+            }
+            current.insert(index, view.retain());
+        }
+        *self.children.borrow_mut() = children
+            .into_iter()
+            .map(|child| Box::new(child) as Box<dyn NativeView>)
+            .collect();
     }
 
     pub fn clear(&self) {
@@ -129,6 +166,10 @@ macro_rules! stack {
             pub fn add(&self, view: impl NativeView) { self.0.add(view); }
 
             pub fn clear(&self) { self.0.clear(); }
+
+            pub fn set_children(&self, children: Vec<impl NativeView>) {
+                self.0.set_children(children);
+            }
 
             pub fn spacer(self, ui: &Ui) -> Self { Self(self.0.spacer(ui)) }
 
@@ -311,17 +352,46 @@ impl NativeView for GroupBox {
     fn ns_view(&self) -> &NSView { &self.native }
 }
 
+#[derive(Default)]
+struct ScrollState {
+    defer: Cell<bool>,
+    header: RefCell<Option<objc2::rc::Weak<NSView>>>,
+    effect: RefCell<Option<crate::view::ProgressiveBlur>>,
+    initialized: Cell<bool>,
+    updating: Cell<bool>,
+}
+
 define_class!(
     #[unsafe(super(NSScrollView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgUiScrollView"]
-    #[ivars = Cell<bool>]
+    #[ivars = ScrollState]
     struct NativeScrollView;
 
     impl NativeScrollView {
+        #[unsafe(method(layout))]
+        fn layout(&self) {
+            unsafe { let _: () = msg_send![super(self), layout]; }
+            self.update_header();
+        }
+        #[unsafe(method(viewDidMoveToWindow))]
+        fn moved(&self) {
+            unsafe { let _: () = msg_send![super(self), viewDidMoveToWindow]; }
+            self.update_header();
+        }
+        #[unsafe(method(viewDidUnhide))]
+        fn unhidden(&self) {
+            unsafe { let _: () = msg_send![super(self), viewDidUnhide]; }
+            self.update_header();
+        }
+        #[unsafe(method(reflectScrolledClipView:))]
+        fn reflect(&self, clip: &NSClipView) {
+            unsafe { let _: () = msg_send![super(self), reflectScrolledClipView: clip]; }
+            self.update_header();
+        }
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            if self.ivars().get() {
+            if self.ivars().defer.get() {
                 if let Some(parent) = unsafe { self.superview() } {
                     parent.scrollWheel(event);
                 }
@@ -332,6 +402,82 @@ define_class!(
     }
 );
 
+impl NativeScrollView {
+    fn update_header(&self) {
+        if self.ivars().updating.replace(true) { return; }
+        self.layout_header();
+        self.ivars().updating.set(false);
+    }
+
+    fn layout_header(&self) {
+        if self.ivars().defer.get() || self.isHiddenOrHasHiddenAncestor() { return; }
+        let (Some(window), Some(document)) = (self.window(), self.documentView()) else { return };
+        let bounds = self.bounds();
+        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0
+            || document.frame().size.width <= 0.0 || document.frame().size.height <= 0.0 { return; }
+        let frame = self.convertRect_toView(bounds, None);
+        let layout = window.contentLayoutRect();
+        let mut top = (frame.origin.y + frame.size.height - layout.origin.y - layout.size.height).max(0.0);
+        if let Some(header) = self.ivars().header.borrow().as_ref().and_then(|header| header.load()) {
+            let rect = header.convertRect_toView(header.bounds(), Some(self));
+            top = top.max(if self.isFlipped() {
+                rect.origin.y + rect.size.height - bounds.origin.y
+            } else {
+                bounds.origin.y + bounds.size.height - rect.origin.y
+            });
+        }
+        top = top.clamp(0.0, bounds.size.height);
+        if top == 0.0 && !self.ivars().initialized.get() { return; }
+        let clip = self.contentView();
+        let mut insets = self.contentInsets();
+        let old_top = insets.top;
+        let first_layout = !self.ivars().initialized.replace(true);
+        self.setAutomaticallyAdjustsContentInsets(false);
+        if first_layout || (top - old_top).abs() > 0.5 {
+            let mut position = clip.bounds().origin;
+            insets.top = top;
+            self.setContentInsets(insets);
+            if document.isFlipped() {
+                position.y = if first_layout { -top } else { position.y + old_top - top };
+            } else {
+                position.y = if first_layout {
+                    document.bounds().origin.y + document.bounds().size.height - clip.bounds().size.height + top
+                } else { position.y + top - old_top };
+            }
+            clip.scrollToPoint(position);
+            self.reflectScrolledClipView(&clip);
+        }
+        let visible = clip.bounds();
+        let distance = if document.isFlipped() { visible.origin.y + top } else {
+            document.bounds().origin.y + document.bounds().size.height - visible.origin.y - visible.size.height + top
+        };
+        let height = (top + 48.0).min(bounds.size.height);
+        let rect = crate::CGRect::new(crate::CGPoint::new(bounds.origin.x,
+            if self.isFlipped() { bounds.origin.y } else { bounds.origin.y + bounds.size.height - height }),
+            crate::CGSize::new(bounds.size.width, height));
+        let mut effect = self.ivars().effect.borrow_mut();
+        if effect.is_none() && top > 0.0 {
+            let overlay = crate::view::ProgressiveBlur::new(&Ui::new(self.mtm()));
+            self.addSubview_positioned_relativeTo(overlay.ns_view(), NSWindowOrderingMode::Above, Some(&clip));
+            *effect = Some(overlay);
+        }
+        if let Some(effect) = &*effect {
+            effect.update(rect, top, if top > 0.0 { (distance / 24.0).clamp(0.0, 1.0) } else { 0.0 }, window.backingScaleFactor());
+        }
+    }
+}
+
+/// Associate the one fixed header with its scrolling viewport. Header positioning
+/// stays in Auto Layout; the scroll view reserves the measured height explicitly.
+pub(crate) fn set_scroll_header(view: &NSView, header: &NSView) -> bool {
+    if let Some(scroll) = view.downcast_ref::<NativeScrollView>() {
+        *scroll.ivars().header.borrow_mut() = Some(objc2::rc::Weak::new(header));
+        scroll.setNeedsLayout(true);
+        return true;
+    }
+    view.subviews().iter().any(|child| set_scroll_header(&child, header))
+}
+
 pub struct ScrollView {
     native: Retained<NativeScrollView>,
     content: Box<dyn NativeView>,
@@ -340,7 +486,7 @@ impl ScrollView {
     pub fn new(ui: &Ui, content: impl NativeView) -> Self {
         let native: Retained<NativeScrollView> = unsafe {
             msg_send![
-                super(NativeScrollView::alloc(ui.mtm()).set_ivars(Cell::new(false))),
+                super(NativeScrollView::alloc(ui.mtm()).set_ivars(ScrollState::default())),
                 init
             ]
         };
@@ -358,7 +504,7 @@ impl ScrollView {
 
     /// Forward wheel input to the enclosing scroll view when content is fully expanded.
     pub fn defer_scrolling(&self) {
-        self.native.ivars().set(true);
+        self.native.ivars().defer.set(true);
         self.native.setHasVerticalScroller(false);
         self.native.setHasHorizontalScroller(false);
         self.native.setVerticalScrollElasticity(NSScrollElasticity::None);

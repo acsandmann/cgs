@@ -96,16 +96,22 @@ fn numeric_fields_reject_invalid_commits(ui: &Ui) {
             .range(1.0, 10.0)
             .on_change(move |value| copy.borrow_mut().push(value)),
     );
-    let _row = SettingsRow::new(ui, "Offset", number.clone()).suffix("pt");
+    let row = SettingsRow::new(ui, "Offset", number.clone()).suffix("pt");
     number.set_value(4.0);
     assert_eq!(number.ns_text_field().stringValue().to_string(), "4");
-    let unit = unsafe { number.ns_text_field().superview() }
-        .unwrap()
-        .subviews()
-        .iter()
-        .filter_map(|view| view.downcast_ref::<NSTextField>().map(|field| field.retain()))
-        .find(|field| field.stringValue().to_string() == "pt")
-        .unwrap();
+    fn unit_label(view: &objc2_app_kit::NSView) -> Option<Retained<NSTextField>> {
+        if let Some(field) = view.downcast_ref::<NSTextField>()
+            && field.stringValue().to_string() == "pt"
+        {
+            return Some(field.retain());
+        }
+        view.subviews().iter().find_map(|view| unit_label(&view))
+    }
+    let unit = unit_label(row.ns_view()).unwrap();
+    assert!(
+        !unit.isDescendantOf(number.ns_view()),
+        "the unit belongs outside the input bezel"
+    );
     assert!(!unit.isEditable());
     assert!(!unit.isSelectable());
     let field = number.ns_text_field();
@@ -120,8 +126,115 @@ fn numeric_fields_reject_invalid_commits(ui: &Ui) {
         field.delegate().unwrap().controlTextDidEndEditing(&note);
     }
     assert_eq!(*values.borrow(), [4.0]);
+    number.set_value(4.0);
+    let stepper = find::<objc2_app_kit::NSStepper>(number.ns_view()).unwrap();
+    stepper.setDoubleValue(1.0);
+    action(&stepper);
+    assert_eq!(number.get_value(), Some(5.0));
+    assert_eq!(*values.borrow(), [4.0, 5.0]);
+    number.set_value(10.0);
+    stepper.setDoubleValue(1.0);
+    action(&stepper);
+    assert_eq!(number.get_value(), Some(10.0));
+    cgs::view::NativeControl::set_enabled(&number, false);
+    assert!(!stepper.isEnabled());
+    let count = values.borrow().len();
+    stepper.setDoubleValue(-1.0);
+    action(&stepper);
+    assert_eq!(values.borrow().len(), count, "disabled inputs cannot be stepped");
+    cgs::view::NativeControl::set_enabled(&number, true);
+    assert!(stepper.isEnabled());
+    let slider = Rc::new(cgs::controls::Slider::new(ui).range(1.0, 10.0));
+    let slider_field = Rc::new(NumberField::new(ui).value(10.0));
+    slider_field.width(64.0);
+    let slider_row = cgs::controls::NumberSlider::new(ui, slider, slider_field.clone());
+    let stepper = find::<objc2_app_kit::NSStepper>(slider_field.ns_view()).unwrap();
+    assert!(stepper.isHidden(), "a slider replaces the numeric stepper");
+    let host = Window::new(ui).content(slider_row);
+    host.ns_window().setContentSize(CGSize::new(300.0, 30.0));
+    host.ns_window().contentView().unwrap().layoutSubtreeIfNeeded();
+    let box_width = slider_field.ns_view().bounds().size.width;
+    let value = slider_field.ns_text_field().convertRect_toView(
+        slider_field.ns_text_field().bounds(),
+        Some(slider_field.ns_view()),
+    );
+    let right_padding = box_width - value.origin.x - value.size.width;
+    assert!(
+        (value.origin.x - right_padding).abs() < 0.5,
+        "slider fields should have balanced padding, not empty caret space: {value:?}, box width {box_width}"
+    );
     let number = NumberField::new(ui).range(0.0, 1.0).value(0.25);
     assert_eq!(number.get_value(), Some(0.25));
+    let stepper = find::<objc2_app_kit::NSStepper>(number.ns_view()).unwrap();
+    stepper.setDoubleValue(1.0);
+    action(&stepper);
+    assert_eq!(number.get_value(), Some(0.26));
+    let optional = Rc::new(RefCell::new(Vec::new()));
+    let copy = optional.clone();
+    let inherited =
+        NumberField::new(ui).on_change_optional(move |value| copy.borrow_mut().push(value));
+    inherited.set_inherited("6");
+    let stepper = find::<objc2_app_kit::NSStepper>(inherited.ns_view()).unwrap();
+    stepper.setDoubleValue(1.0);
+    action(&stepper);
+    assert_eq!(*optional.borrow(), [Some(7.0)]);
+}
+
+fn tables_materialize_only_the_viewport(ui: &Ui) {
+    let configured = Rc::new(Cell::new(0));
+    let count = configured.clone();
+    let ui_copy = *ui;
+    let table = Rc::new(
+        Table::new(ui)
+            .column("value", "", 300.0)
+            .cells(move |row: &usize, _| {
+                count.set(count.get() + 1);
+                Box::new(Label::new(&ui_copy, &row.to_string()))
+            })
+            .rows((0..1000).collect()),
+    );
+    table.ns_table_view().setHeaderView(None);
+    table.ns_table_view().setRowHeight(38.0);
+    table.ns_table_view().setUsesAutomaticRowHeights(true);
+    let window = Window::new(ui).content(table.clone());
+    window.ns_window().setContentSize(CGSize::new(400.0, 300.0));
+    let root = window.ns_window().contentView().unwrap();
+    root.layoutSubtreeIfNeeded();
+    let image = root.bitmapImageRepForCachingDisplayInRect(root.bounds()).unwrap();
+    root.cacheDisplayInRect_toBitmapImageRep(root.bounds(), &image);
+    assert!(
+        configured.get() > 0 && configured.get() < 128,
+        "first paint should create viewport cells, not the entire inventory: {}",
+        configured.get()
+    );
+    table.scroll_to(900);
+    root.layoutSubtreeIfNeeded();
+    root.cacheDisplayInRect_toBitmapImageRep(root.bounds(), &image);
+    assert!(configured.get() < 256, "scrolling must not instantiate all rows");
+    let cell = table.ns_table_view().viewAtColumn_row_makeIfNecessary(0, 900, true).unwrap();
+    assert_eq!(
+        find::<NSTextField>(&cell).unwrap().stringValue().to_string(),
+        "900"
+    );
+    table.set_selected(Some(10));
+    table.reconcile_rows((1..1000).collect());
+    assert_eq!(
+        table.selected_row(),
+        Some(10),
+        "unrelated removal must preserve the selected item"
+    );
+    let cell = table.ns_table_view().viewAtColumn_row_makeIfNecessary(0, 0, true).unwrap();
+    assert_eq!(
+        find::<NSTextField>(&cell).unwrap().stringValue().to_string(),
+        "1"
+    );
+    table.reconcile_rows((0..1000).collect());
+    assert_eq!(table.selected_row(), Some(10));
+    let cell = table.ns_table_view().viewAtColumn_row_makeIfNecessary(0, 0, true).unwrap();
+    assert_eq!(
+        find::<NSTextField>(&cell).unwrap().stringValue().to_string(),
+        "0"
+    );
 }
 
 fn delegates_and_selection_use_current_data(ui: &Ui) {
@@ -2070,6 +2183,7 @@ fn main() {
         symbol_segments_name_each_choice(&ui);
         thumbnail_pickers_are_one_radio_group(&ui);
         numeric_fields_reject_invalid_commits(&ui);
+        tables_materialize_only_the_viewport(&ui);
         delegates_and_selection_use_current_data(&ui);
         recording_is_scoped_and_cancellable(&ui);
         local_reordering_uses_final_indices_and_rejects_other_tables(&ui);

@@ -593,8 +593,9 @@ impl Inner {
                 .value(start)
                 .on_change(move |value| field_commit(value)),
         );
+        field.hide_stepper();
         field.accessibility_label(&self.label);
-        field.width(56.0);
+        field.width(crate::view::Metrics::VALUE_FIELD_WIDTH);
         let weak_field = Rc::downgrade(&field);
         let app = Application::shared(&self.ui);
         let slide = commit.clone();
