@@ -37,3 +37,16 @@ outside the bezel: use `NumberField::unit_field` or `SettingsRow::suffix`.
 `NumberSlider` hides the redundant stepper automatically. When composing a slider
 and field manually, call `field.hide_stepper()`. Size the numeric field itself,
 not the combined field-and-unit wrapper, so units retain their natural width.
+
+## Settings presentation ownership
+
+Keep fonts, colors, spacing, control sizing, glass treatments, and native bezel
+configuration in CGS. Applications supply labels, action data, state, and persistence.
+For shortcut managers use `settings::ActionPicker`, `ShortcutEditor`, `ShortcutRow`,
+and `ShortcutPresentation` rather than recreating their layout or styling with
+AppKit setters in the application. Complex option forms retain their own labels;
+single parameter controls use the editor's compact label/value row.
+
+Use `CommandForm` for structured command arguments. Keep raw syntax in
+`AdvancedCommandEditor`, which provides an explicit disclosure and multiline
+editor; do not show serialized commands in a single-line options field.

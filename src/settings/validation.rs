@@ -53,6 +53,15 @@ impl ValidationMessage {
         self.label.ns_text_field().setTextColor(Some(&color));
         self.set_hidden(matches!(value, Validation::None));
         self.accessibility_label(value.message().unwrap_or(""));
+        // Inline feedback must not push a sheet's actions outside its content.
+        if let Some(window) = self.ns_view().window() {
+            if window.sheetParent().is_some() {
+                if let Some(content) = window.contentView() {
+                    content.layoutSubtreeIfNeeded();
+                    window.setContentSize(content.fittingSize());
+                }
+            }
+        }
     }
 
     pub fn ns_text_field(&self) -> &NSTextField { self.label.ns_text_field() }

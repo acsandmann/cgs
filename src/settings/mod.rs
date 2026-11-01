@@ -13,3 +13,6 @@ pub use page::*;
 pub use row::*;
 pub use validation::*;
 pub use window::*;
+
+mod shortcut;
+pub use shortcut::*;

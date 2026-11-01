@@ -245,7 +245,12 @@ impl<T: 'static> Table<T> {
         self
     }
 
-    pub fn on_double_click(self, mut f: impl FnMut(usize) + 'static) -> Self {
+    pub fn on_double_click(self, f: impl FnMut(usize) + 'static) -> Self {
+        self.set_on_double_click(f);
+        self
+    }
+
+    pub fn set_on_double_click(&self, mut f: impl FnMut(usize) + 'static) {
         self.double.set(move |sender| {
             if let Some(table) = sender.downcast_ref::<NSTableView>() {
                 if let Ok(row) = usize::try_from(if table.clickedRow() >= 0 {
@@ -257,7 +262,6 @@ impl<T: 'static> Table<T> {
                 }
             }
         });
-        self
     }
 
     pub fn context_menu(self, menu: crate::menu::Menu) -> Self {

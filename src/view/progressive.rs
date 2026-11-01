@@ -32,7 +32,6 @@ thread_local! { static MASK: Option<CFRetained<CGImage>> = mask(); }
 struct State {
     backdrop: Option<Retained<CALayer>>,
     tint: Retained<CAGradientLayer>,
-    dark: Cell<Option<bool>>,
 }
 define_class!(
     #[unsafe(super(NSView))]
@@ -62,11 +61,17 @@ impl BlurView {
         let names = NSArray::from_slice(&[unsafe { NSAppearanceNameAqua }, unsafe { NSAppearanceNameDarkAqua }]);
         let dark = self.effectiveAppearance().bestMatchFromAppearancesWithNames(&names)
             .is_some_and(|name| &*name == unsafe { NSAppearanceNameDarkAqua });
-        if self.ivars().dark.replace(Some(dark)) == Some(dark) { return; }
-        let value = if dark { 0.0 } else { 1.0 };
-        let colors = [0.65, 0.35, 0.0].map(|a| CGColor::new_generic_rgb(value, value, value, a));
-        let colors: Vec<&AnyObject> = colors.iter().map(|color| unsafe { &*((&**color as *const CGColor).cast()) }).collect();
-        unsafe { self.ivars().tint.setColors(Some(&NSArray::from_slice(&colors))) };
+        // Resolve semantic colors in this view's appearance, including when the
+        // window overrides the system theme. Black creates a conspicuous dark
+        // band; matching the pane keeps the fade neutral and hides ghost text.
+        let _tx = LayerTransaction::disabled();
+        self.effectiveAppearance().performAsCurrentDrawingAppearance(&block2::RcBlock::new(|| {
+            let surface = if dark { crate::style::Color::settings_background() } else { NSColor::whiteColor() };
+            let alpha = if dark { [0.98, 0.90, 0.0] } else { [0.65, 0.35, 0.0] };
+            let colors = alpha.map(|alpha| surface.colorWithAlphaComponent(alpha).CGColor());
+            let colors: Vec<&AnyObject> = colors.iter().map(|color| unsafe { &*((&**color as *const CGColor).cast()) }).collect();
+            unsafe { self.ivars().tint.setColors(Some(&NSArray::from_slice(&colors))) };
+        }));
     }
 }
 
@@ -85,7 +90,7 @@ impl ProgressiveBlur {
         tint.setStartPoint(CGPoint::new(0.5, 1.0));
         tint.setEndPoint(CGPoint::new(0.5, 0.0));
         let native: Retained<BlurView> = unsafe { msg_send![super(BlurView::alloc(ui.mtm()).set_ivars(State {
-            backdrop, tint, dark: Cell::new(None),
+            backdrop, tint,
         })), init] };
         native.setWantsLayer(true);
         native.setAccessibilityElement(false);
