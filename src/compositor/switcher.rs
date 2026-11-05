@@ -1,10 +1,7 @@
 //! A held-open window switcher: carousel, stack and grid arrangements of live window previews.
 //!
-//! Like Mission Control, every preview is its own window. WindowServer places each one in 3D
-//! (`SLSTransactionSetWindowTransform3D`, with perspective), so moving a card never re-renders
-//! its content: one transaction per display frame carries every card's transform, alpha and
-//! stacking, driven by critically damped springs that keep their velocity when retargeted.
-//! A full-screen backdrop window below them holds the blurred desktop, floor and title.
+//! All cards share one WindowServer surface above the backdrop. Core Animation applies
+//! the card transforms directly to the live IOSurface layers in one display transaction.
 //! Callers supply window descriptors with an opaque payload, forward semantic commands, decide
 //! what activation means, and call `pump` on each display frame while `animating` is true.
 use std::time::{Duration, Instant};
@@ -24,17 +21,20 @@ use objc2_quartz_core::{
 };
 
 use super::preview::{
-    CaptureMode, CaptureResolution, PreviewCompositor, PreviewFrame, PreviewLayer, PreviewSource,
+    CaptureMode, CaptureResolution, PreviewCaptureSession, PreviewSurfaceFrame, PreviewLayer, PreviewSource,
 };
 use super::{
-    CgsWindow, LayerTransaction, WindowSurface, WindowTransaction, backdrop_blur, blur_filters,
+    CgsWindow, LayerTransaction, WindowSurface, backdrop_blur, blur_filters,
     release_layer_tree,
 };
 
 /// Spring response in seconds: how long a card takes to reach a new target.
 const RESPONSE: f64 = 0.3;
+const REPEAT_RESPONSE: f64 = 0.15;
+const REPEAT_INTERVAL: Duration = Duration::from_millis(140);
 /// Backdrop, title and reflection fades.
 const FADE: f64 = 0.3;
+const WRAP_FADE: f64 = 0.075;
 const CORNER: f64 = 10.;
 /// Margin around a card inside its window, so transformed edges stay antialiased.
 const PAD: f64 = 2.;
@@ -109,8 +109,7 @@ pub enum SwitcherOutcome {
 
 /// A warm capture host kept between invocations.
 pub struct SwitcherCache {
-    key: (u32, CGRect, f64),
-    captures: PreviewCompositor,
+    captures: PreviewCaptureSession,
 }
 
 /// A card's place on the stage, in display-local points. `key` is its stacking order.
@@ -127,7 +126,6 @@ struct Pose {
     scale: f64,
     opacity: f32,
     reflect: f32,
-    border: bool,
 }
 fn flat(center: CGPoint, scale: f64, z: f64, key: f64) -> Pose {
     Pose {
@@ -139,7 +137,6 @@ fn flat(center: CGPoint, scale: f64, z: f64, key: f64) -> Pose {
         scale,
         opacity: 1.,
         reflect: 0.,
-        border: false,
     }
 }
 
@@ -234,7 +231,6 @@ fn carousel(st: Stage, sizes: &[CGSize], sel: usize) -> Vec<Pose> {
             center: CGPoint::new(w / 2., floor - sizes[i].height * fit[i] / 2.),
             scale: fit[i],
             reflect: 1.,
-            border: i == sel,
             ..flat(CGPoint::ZERO, 1., front, 0.)
         })
         .collect();
@@ -254,7 +250,6 @@ fn carousel(st: Stage, sizes: &[CGSize], sel: usize) -> Vec<Pose> {
             p.key = -(m as f64);
             p.center.x = w / 2. + dir * x / fs;
             p.opacity = if m <= 3 { 1. } else { 0. };
-            p.border = false;
             prev = i;
         }
     }
@@ -287,7 +282,6 @@ fn stack(st: Stage, sizes: &[CGSize], sel: usize) -> Vec<Pose> {
             );
             Pose {
                 opacity: 1. - 0.12 * c as f32,
-                border: k == 0,
                 ..flat(center, stack_fit(st, sizes[i]), z, z)
             }
         })
@@ -416,9 +410,8 @@ struct Spring {
     v: f64,
 }
 impl Spring {
-    fn step(&mut self, to: f64, dt: f64) {
-        let w = std::f64::consts::TAU / RESPONSE;
-        let (d, e) = (self.x - to, (-w * dt).exp());
+    fn step(&mut self, to: f64, dt: f64, w: f64, e: f64) {
+        let d = self.x - to;
         let c = self.v + w * d;
         self.x = to + (d + c * dt) * e;
         self.v = (self.v - c * w * dt) * e;
@@ -439,7 +432,7 @@ fn values(p: &Pose, alpha: f32) -> [f64; 7] {
     ]
 }
 
-/// One preview: its own window, placed by WindowServer, holding the live frame and its mirror.
+/// One preview layer and its reflection on the shared stage.
 struct Card {
     window_id: u32,
     process_id: i32,
@@ -452,17 +445,18 @@ struct Card {
     content: f64,
     root: Retained<CALayer>,
     body: Retained<CALayer>,
+    body_center: CGPoint,
     preview: PreviewLayer,
     reflection: Retained<CALayer>,
     mirror: Retained<CALayer>,
-    _surface: WindowSurface,
-    window: CgsWindow,
     pose: Pose,
     motion: Motion,
+    wrapping: bool,
     ready: bool,
+    committed: Option<([f64; 5], f32)>,
 }
 impl Card {
-    fn new<T>(item: &SwitcherItem<T>, stage: Stage, origin: CGPoint, scale: f64) -> Option<Self> {
+    fn new<T>(item: &SwitcherItem<T>, stage: Stage, scale: f64) -> Self {
         let home = rect(
             item.frame.origin.x,
             item.frame.origin.y,
@@ -476,11 +470,12 @@ impl Card {
         let (w, h) = (home.size.width * content, home.size.height * content);
         let bounds = rect(0., 0., w + 2. * PAD, h * (1. + REFLECT) + 2. * PAD);
         let root = layer(bounds, scale);
-        root.setGeometryFlipped(true);
+        root.setAnchorPoint(CGPoint::ZERO);
+        root.setPosition(CGPoint::ZERO);
+        root.setHidden(true);
         let card = rect(PAD, PAD, w, h);
         let body = layer(card, scale);
         body.setCornerRadius(CORNER);
-        body.setBorderColor(Some(&color(0.68, 0.86, 1., 0.95)));
         body.setAllowsEdgeAntialiasing(true);
         root.addSublayer(&body);
         let preview = PreviewLayer::new();
@@ -500,17 +495,8 @@ impl Card {
         mirror.setMasksToBounds(true);
         reflection.addSublayer(&mirror);
         root.addSublayer(&reflection);
-        let window = CgsWindow::new_compositor(
-            rect(origin.x, origin.y, bounds.size.width, bounds.size.height),
-            0.,
-        )
-        .ok()?;
-        window.set_resolution(scale).ok()?;
-        window.set_level(LEVEL).ok()?;
-        window.disable_shadow();
-        let surface = WindowSurface::new_scaled(window.id(), bounds, &root, scale).ok()?;
         let pose = flat(home.mid(), 1., 0., 0.);
-        Some(Self {
+        Self {
             window_id: item.window_id,
             process_id: item.process_id,
             title: item.title.clone(),
@@ -520,25 +506,37 @@ impl Card {
             local: item.local,
             content,
             root,
+            body_center: body.frame().mid(),
             body,
             preview,
             reflection,
             mirror,
-            _surface: surface,
-            window,
             pose: Pose { opacity: 0., ..pose },
             motion: values(&pose, 0.).map(|x| Spring { x, v: 0. }),
+            wrapping: false,
             ready: false,
-        })
+            committed: None,
+        }
     }
 
-    fn set_frame(&mut self, frame: &PreviewFrame) -> bool {
-        if !self.preview.set_frame(frame) {
+    fn set_frame(&mut self, frame: &PreviewSurfaceFrame) -> bool {
+        if !self.preview.set_surface_frame(frame) {
             return false;
         }
-        unsafe { self.mirror.setContents(self.preview.layer().contents().as_deref()) };
-        self.mirror.setContentsRect(self.preview.layer().contentsRect());
+        let reflecting = self.pose.reflect > 0.
+            || unsafe { self.reflection.presentationLayer() }.is_some_and(|layer| layer.opacity() > 0.);
+        if reflecting {
+            self.update_mirror();
+        }
         true
+    }
+
+    fn update_mirror(&self) {
+        unsafe { self.mirror.setContents(self.preview.layer().contents().as_deref()) };
+        let crop = self.preview.layer().contentsRect();
+        if self.mirror.contentsRect() != crop {
+            self.mirror.setContentsRect(crop);
+        }
     }
 
     /// Without capture, an app-icon plate stands in for the window.
@@ -566,30 +564,46 @@ impl Card {
         // A card wrapping around the ring (moving against the turn), or appearing from
         // hidden, cuts and fades in instead of sweeping through the scene.
         let cut = match turn {
-            Some(turn) => (p.slot - old.slot) * turn < -1e-9,
+            Some(turn) => p.slot != 0. && (p.slot - old.slot) * turn < -1e-9,
             None => self.motion[5].x < 0.01,
         };
-        if snap || cut {
-            let alpha = if snap { self.alpha() } else { 0. };
-            self.motion = values(&p, alpha).map(|x| Spring { x, v: 0. });
+        if snap {
+            self.wrapping = false;
+            self.motion = values(&p, self.alpha()).map(|x| Spring { x, v: 0. });
+        } else if cut && turn.is_some() && self.motion[5].x > 0.01 {
+            // Keep the old placement until the card fades out. A visible card
+            // should never jump across the stage when it wraps around the ring.
+            self.wrapping = true;
+        } else if cut {
+            self.wrapping = false;
+            self.motion = values(&p, 0.).map(|x| Spring { x, v: 0. });
+        } else if turn.is_none() || p.slot == 0. {
+            self.wrapping = false;
+        }
+        if p.reflect > 0. && old.reflect == 0. {
+            self.update_mirror();
         }
         fade(&self.reflection, p.reflect, FADE);
-        self.body.setBorderWidth(if p.border {
-            2. * self.content / p.scale.max(0.05)
-        } else {
-            0.
-        });
     }
 
     /// Advance toward the target; true while still moving.
-    fn advance(&mut self, dt: f64) -> bool {
+    fn advance(&mut self, dt: f64, w: f64, e: f64) -> bool {
+        if self.wrapping {
+            self.motion[5].x = (self.motion[5].x - dt / WRAP_FADE).max(0.);
+            self.motion[5].v = 0.;
+            if self.motion[5].x == 0. {
+                self.motion = values(&self.pose, 0.).map(|x| Spring { x, v: 0. });
+                self.wrapping = false;
+            }
+            return self.wrapping || self.alpha() > 0.;
+        }
         let target = values(&self.pose, self.alpha());
         let mut moving = false;
         for ((s, to), tol) in self.motion.iter_mut().zip(target).zip(TOLERANCE) {
             if (s.x - to).abs() < tol && s.v.abs() < tol * 10. {
                 *s = Spring { x: to, v: 0. };
             } else {
-                s.step(to, dt);
+                s.step(to, dt, w, e);
                 moving = true;
             }
         }
@@ -610,16 +624,17 @@ impl Card {
         }
     }
 
-    /// Window-local forward placement: the card's centre sits at the window's content centre.
-    fn placement(&self, stage: Stage, origin: CGPoint) -> CATransform3D {
-        let b = self.body.frame();
-        CATransform3D::new_translation(-b.mid().x, -b.mid().y, 0.)
+    /// Forward placement from card-local points into the shared stage.
+    fn placement(&self, stage: Stage) -> CATransform3D {
+        CATransform3D::new_translation(-self.body_center.x, -self.body_center.y, 0.)
             .concat(stage.place(&self.current(), self.content))
-            .concat(CATransform3D::new_translation(-origin.x, -origin.y, 0.))
     }
 }
 impl Drop for Card {
-    fn drop(&mut self) { release_layer_tree(&self.root); }
+    fn drop(&mut self) {
+        self.root.removeFromSuperlayer();
+        release_layer_tree(&self.root);
+    }
 }
 
 enum Phase {
@@ -636,7 +651,6 @@ enum Phase {
 /// Not Send or Sync; create, drive and drop it on the main thread.
 pub struct WindowSwitcher<T> {
     items: Vec<T>,
-    display_id: u32,
     bounds: CGRect,
     scale: f64,
     stage: Stage,
@@ -650,10 +664,13 @@ pub struct WindowSwitcher<T> {
     scrub: Option<usize>,
     phase: Phase,
     sources: Vec<PreviewSource>,
-    captures: Option<PreviewCompositor>,
+    captures: Option<PreviewCaptureSession>,
     /// Last frame time and the stacking committed to WindowServer.
     clock: Option<Instant>,
+    last_step: Option<Instant>,
+    response: f64,
     order: Vec<usize>,
+    next_order: Vec<usize>,
     moving: bool,
     root: Retained<CALayer>,
     backdrop: Retained<CALayer>,
@@ -664,11 +681,15 @@ pub struct WindowSwitcher<T> {
     title: Retained<CATextLayer>,
     _surface: WindowSurface,
     window: CgsWindow,
+    _cards_surface: WindowSurface,
+    cards_window: CgsWindow,
+    cards_root: Retained<CALayer>,
 }
 impl<T> Drop for WindowSwitcher<T> {
     fn drop(&mut self) {
         let _tx = LayerTransaction::disabled().flush_on_commit();
         self.cards.clear();
+        release_layer_tree(&self.cards_root);
         release_layer_tree(&self.root);
     }
 }
@@ -676,7 +697,7 @@ impl<T> WindowSwitcher<T> {
     /// `bounds` is the switcher display's global frame; `items` must not be empty.
     /// Nothing is shown until `start`.
     pub fn new(
-        display_id: u32,
+        _display_id: u32,
         bounds: CGRect,
         scale: f64,
         layout: SwitcherLayout,
@@ -735,9 +756,15 @@ impl<T> WindowSwitcher<T> {
         title.setOpacity(0.);
         root.addSublayer(&title);
 
+        // Keep the window-aware backdrop filter on a separate surface so
+        // it cannot sample or filter the preview tree.
+        let cards_root = layer(root.bounds(), scale);
+        cards_root.setGeometryFlipped(true);
+        cards_root.setMasksToBounds(true);
         let mut cards = Vec::with_capacity(items.len());
         for item in &items {
-            let mut card = Card::new(item, stage, bounds.origin, scale)?;
+            let mut card = Card::new(item, stage, scale);
+            cards_root.addSublayer(&card.root);
             card.on_screen &= card.home.max().x > 0.
                 && card.home.max().y > 0.
                 && card.home.min().x < w
@@ -750,14 +777,18 @@ impl<T> WindowSwitcher<T> {
         window.set_level(LEVEL).ok()?;
         window.disable_shadow();
         let surface = WindowSurface::new_scaled(window.id(), root.bounds(), &root, scale).ok()?;
+        let cards_window = CgsWindow::new_compositor(bounds, 0.).ok()?;
+        cards_window.set_resolution(scale).ok()?;
+        cards_window.set_level(LEVEL).ok()?;
+        cards_window.disable_shadow();
+        let cards_surface =
+            WindowSurface::new_scaled(cards_window.id(), cards_root.bounds(), &cards_root, scale).ok()?;
         Some(Self {
             items: items.into_iter().map(|i| i.data).collect(),
-            display_id,
             bounds,
             scale,
             stage,
             layout,
-            cards,
             selected: 0,
             opened: Instant::now(),
             navigated: false,
@@ -767,7 +798,11 @@ impl<T> WindowSwitcher<T> {
             sources: Vec::new(),
             captures: None,
             clock: None,
-            order: Vec::new(),
+            last_step: None,
+            response: RESPONSE,
+            order: Vec::with_capacity(cards.len()),
+            next_order: Vec::with_capacity(cards.len()),
+            cards,
             moving: true,
             wallpaper: wallpaper(bounds),
             root,
@@ -777,6 +812,9 @@ impl<T> WindowSwitcher<T> {
             title,
             _surface: surface,
             window,
+            _cards_surface: cards_surface,
+            cards_window,
+            cards_root,
         })
     }
 
@@ -799,27 +837,15 @@ impl<T> WindowSwitcher<T> {
     ) {
         let _tx = LayerTransaction::disabled().flush_on_commit();
         if previews {
-            let key = (self.display_id, self.bounds, self.scale);
-            let cached = cache.take().filter(|c| c.key == key).map(|c| c.captures);
-            self.captures = match cached {
-                Some(mut m) => m.attach_to(self.window.id(), &self.root).ok().map(|()| m),
-                None => PreviewCompositor::new_attached(
-                    self.window.id(),
-                    &self.root,
-                    self.bounds,
-                    self.scale,
-                    wake,
-                )
-                .map_err(|error| tracing::warn!(?error, "Switcher capture unavailable"))
-                .ok(),
-            };
+            self.captures = cache.take().map(|cache| cache.captures).or_else(|| {
+                PreviewCaptureSession::new(wake)
+                    .map_err(|error| tracing::warn!(?error, "Switcher capture unavailable"))
+                    .ok()
+            });
             self.update_sources(true);
-            if let Some(m) = &mut self.captures
-                && let Err(error) = m.set_visual_scene(&[]).and_then(|()| m.show())
-            {
-                tracing::warn!(?error, "Switcher capture startup failed");
-            }
+            self.update_captures();
         }
+
         if self.captures.is_none() {
             for c in &mut self.cards {
                 c.fallback(self.scale);
@@ -838,6 +864,7 @@ impl<T> WindowSwitcher<T> {
         }
         self.update_title();
         let _ = self.window.order_above(None);
+        let _ = self.cards_window.order_above(Some(self.window.id()));
         if self.captures.is_none() {
             self.enter();
         }
@@ -880,37 +907,60 @@ impl<T> WindowSwitcher<T> {
         self.moving = true;
     }
 
-    /// Commit every card's current placement, alpha and stacking in one WindowServer
-    /// transaction, after advancing the springs to `now`.
+    /// Update the shared layer tree after advancing the springs to `now`.
     fn frame(&mut self, now: Instant) {
-        let dt = self.clock.map_or(0., |t| now.duration_since(t).as_secs_f64().min(0.05));
+        let dt = self.clock.map_or(0., |t| now.duration_since(t).as_secs_f64().min(0.25));
         self.clock = Some(now);
         if !self.moving {
             return;
         }
-        let Ok(t) = WindowTransaction::new() else {
-            return;
-        };
+        let w = std::f64::consts::TAU / self.response;
+        let decay = (-w * dt).exp();
         let mut moving = false;
-        for c in &mut self.cards {
-            moving |= c.advance(dt);
-            t.set_transform(&c.window, c.placement(self.stage, self.bounds.origin));
-            t.set_alpha(&c.window, c.motion[5].x.clamp(0., 1.) as f32);
-        }
-        let mut order: Vec<usize> = (0..self.cards.len()).collect();
-        order.sort_by(|a, b| {
-            self.cards[*a].motion[6].x.total_cmp(&self.cards[*b].motion[6].x).then(b.cmp(a))
-        });
-        if order != self.order {
-            let mut below = &self.window;
-            for &i in &order {
-                t.order_above(&self.cards[i].window, below);
-                below = &self.cards[i].window;
+        self.next_order.clear();
+        for (index, c) in self.cards.iter_mut().enumerate() {
+            // A card that is fully transparent has no visible spring motion.
+            if c.wrapping || c.alpha() > 0. || c.motion[5].x > 0. {
+                moving |= c.advance(dt, w, decay);
             }
-            self.order = order;
+            let [x, y, z, turn, scale, alpha, _] = c.motion.map(|spring| spring.x);
+            let alpha = alpha.clamp(0., 1.) as f32;
+            if alpha == 0. {
+                if c.committed.take().is_some() {
+                    c.root.setHidden(true);
+                    c.motion = values(&c.pose, 0.).map(|x| Spring { x, v: 0. });
+                }
+                continue;
+            }
+            let geometry = [x, y, z, turn, scale];
+            self.next_order.push(index);
+            let previous = c.committed.replace((geometry, alpha));
+            if previous.is_none() {
+                c.root.setHidden(false);
+            }
+            if previous.is_none_or(|(old, _)| old != geometry) {
+                c.root.setTransform(c.placement(self.stage));
+            }
+            if previous.is_none_or(|(_, old)| old != alpha) {
+                c.root.setOpacity(alpha);
+            }
         }
-        t.commit();
+        self.next_order.sort_unstable_by(|&a, &b| {
+            self.cards[a].motion[6].x.total_cmp(&self.cards[b].motion[6].x).then(b.cmp(&a))
+        });
+        if self.next_order != self.order {
+            for (rank, &index) in self.next_order.iter().enumerate() {
+                if self.order.get(rank) != Some(&index) {
+                    self.cards[index].root.setZPosition(rank as f64 + 1.);
+                }
+            }
+            std::mem::swap(&mut self.order, &mut self.next_order);
+        }
         self.moving = moving;
+        if !moving {
+            self.clock = None;
+            self.response = RESPONSE;
+        }
     }
 
     fn enter(&mut self) {
@@ -931,12 +981,20 @@ impl<T> WindowSwitcher<T> {
         if self.captures.is_none() {
             return;
         }
-        let targets = self.targets();
         let exiting = matches!(self.phase, Phase::Exiting { .. });
+        let targets = (reset || exiting).then(|| self.targets());
         self.sources.clear();
-        for (i, (c, p)) in self.cards.iter().zip(&targets).enumerate() {
+        // Leave room in the 128 MiB retained-frame cache for row padding
+        // and wallpaper. A large Retina card must not evict unseen cards.
+        let pixels_per_card = ((96 * 1024 * 1024 / 4) / self.cards.len().max(1))
+            .clamp(1, 900_000) as f64;
+        for (i, c) in self.cards.iter().enumerate() {
+            let target = targets.as_ref().map_or(&c.pose, |targets| &targets[i]);
             let selected = i == self.selected;
-            let shown = p.opacity > 0. && !(exiting && !selected);
+            let shown = target.opacity > 0. && !(exiting && !selected);
+            let width = c.size.width * c.content * self.scale;
+            let height = c.size.height * c.content * self.scale;
+            let capture_scale = (pixels_per_card / (width * height)).sqrt().min(1.);
             self.sources.push(PreviewSource {
                 window_id: c.window_id,
                 process_id: c.process_id,
@@ -946,8 +1004,8 @@ impl<T> WindowSwitcher<T> {
                     CaptureMode::Snapshot
                 },
                 resolution: CaptureResolution::Thumbnail {
-                    width: (c.size.width * c.content * self.scale).ceil().max(1.) as usize,
-                    height: (c.size.height * c.content * self.scale).ceil().max(1.) as usize,
+                    width: (width * capture_scale).ceil().max(1.) as usize,
+                    height: (height * capture_scale).ceil().max(1.) as usize,
                 },
                 priority: if selected {
                     3
@@ -984,12 +1042,12 @@ impl<T> WindowSwitcher<T> {
         }
     }
 
-    fn select(&mut self, index: usize) {
+    fn select(&mut self, index: usize, forward: Option<bool>) {
         if index == self.selected {
             return;
         }
         let n = self.cards.len();
-        let forward = (index + n - self.selected) % n <= n / 2;
+        let forward = forward.unwrap_or((index + n - self.selected) % n <= n / 2);
         self.selected = index;
         self.navigated = true;
         self.update_title();
@@ -1003,7 +1061,20 @@ impl<T> WindowSwitcher<T> {
 
     fn step(&mut self, delta: i64) {
         let n = self.cards.len() as i64;
-        self.select((self.selected as i64 + delta).rem_euclid(n) as usize);
+        let index = (self.selected as i64 + delta % n).rem_euclid(n) as usize;
+        if index == self.selected {
+            self.navigated |= n > 1 && delta != 0;
+            return;
+        }
+        let now = Instant::now();
+        let repeated = self
+            .last_step
+            .replace(now)
+            .is_some_and(|last| now.duration_since(last) <= REPEAT_INTERVAL);
+        if repeated || delta.unsigned_abs() > 1 {
+            self.response = REPEAT_RESPONSE;
+        }
+        self.select(index, Some(delta > 0));
     }
 
     fn hit(&self, point: CGPoint) -> Option<usize> {
@@ -1022,6 +1093,7 @@ impl<T> WindowSwitcher<T> {
     }
 
     fn exit(&mut self, commit: bool) {
+        self.response = RESPONSE;
         let selected = &self.cards[self.selected];
         let target = (commit && selected.local).then_some(selected.home);
         let n = self.cards.len();
@@ -1036,7 +1108,6 @@ impl<T> WindowSwitcher<T> {
             c.retarget(
                 Pose {
                     reflect: 0.,
-                    border: false,
                     ..pose
                 },
                 None,
@@ -1094,7 +1165,7 @@ impl<T> WindowSwitcher<T> {
             }
             SwitcherCommand::Hover(point) if self.layout == SwitcherLayout::Grid && !waiting => {
                 if let Some(i) = self.hit(point) {
-                    self.select(i);
+                    self.select(i, None);
                 }
             }
             SwitcherCommand::Click(point) if !waiting => {
@@ -1102,7 +1173,7 @@ impl<T> WindowSwitcher<T> {
                     self.exit(false);
                     return None;
                 };
-                self.select(i);
+                self.select(i, None);
                 self.exit(true);
                 return Some(SwitcherOutcome::Activate);
             }
@@ -1144,27 +1215,43 @@ impl<T> WindowSwitcher<T> {
             return false;
         }
         let _tx = LayerTransaction::disabled().flush_on_commit();
-        self.select(index);
+        self.select(index, None);
         true
     }
 
-    /// Call on every display frame while `animating`, and after `start`'s wake: pulls captured
-    /// frames, advances motion and phase timing.
-    pub fn pump(&mut self) {
+    /// Pull captured frames and advance animation for hosts using a single callback.
+    pub fn pump(&mut self) { self.pump_at(Instant::now()); }
+
+    /// Apply capture updates and animation in the same display transaction.
+    pub fn pump_at(&mut self, presentation: Instant) {
         let _tx = LayerTransaction::disabled().flush_on_commit();
+        self.update_captures();
+        self.advance_frame(presentation);
+    }
+
+    /// Pull captured frames after a capture wake. Motion is driven separately by `tick`.
+    pub fn pump_captures(&mut self) {
+        let _tx = LayerTransaction::disabled().flush_on_commit();
+        self.update_captures();
+    }
+
+    fn update_captures(&mut self) {
         let waiting = matches!(self.phase, Phase::Waiting(_));
         if let Some(m) = &mut self.captures {
-            if let Err(error) = m.render(Instant::now()) {
+            if let Err(error) = m.pump() {
                 tracing::warn!(?error, "Switcher capture update failed");
             }
             if let Some((id, _)) = self.wallpaper
                 && !self.wallpaper_layer.has_frame()
                 && let Some(frame) = m.captured_frame(id)
-                && self.wallpaper_layer.set_frame(&frame)
+                && self.wallpaper_layer.set_surface_frame(&frame)
             {
                 fade(self.wallpaper_layer.layer(), 1., FADE);
             }
             for c in &mut self.cards {
+                if c.ready && c.pose.opacity == 0. && c.motion[5].x <= 0. {
+                    continue;
+                }
                 if let Some(frame) = m.captured_frame(c.window_id)
                     && c.set_frame(&frame)
                     && !c.ready
@@ -1178,6 +1265,18 @@ impl<T> WindowSwitcher<T> {
                 }
             }
         }
+    }
+
+    /// Advance the animation once per host frame.
+    pub fn tick(&mut self) { self.tick_at(Instant::now()); }
+
+    /// Advance animation for the host's predicted display presentation time.
+    pub fn tick_at(&mut self, presentation: Instant) {
+        let _tx = LayerTransaction::disabled().flush_on_commit();
+        self.advance_frame(presentation);
+    }
+
+    fn advance_frame(&mut self, presentation: Instant) {
         // Present once the windows being replaced have previews, or the selection has one
         // and a short wait passed; never an empty stage for a cold capture start.
         if let Phase::Waiting(start) = self.phase
@@ -1188,7 +1287,7 @@ impl<T> WindowSwitcher<T> {
         {
             self.enter();
         }
-        self.frame(Instant::now());
+        self.frame(presentation);
     }
 
     /// Set while a committed choice is animating to its window; identifies that transition.
@@ -1242,13 +1341,8 @@ impl<T> WindowSwitcher<T> {
     /// Keep the warm capture host for the next invocation.
     pub fn retain(mut self, cache: &mut Option<SwitcherCache>) {
         if let Some(mut captures) = self.captures.take() {
-            let _ = captures.hide();
-            let _ = captures.set_visual_scene(&[]);
-            let _ = captures.set_sources(&[]);
-            *cache = Some(SwitcherCache {
-                key: (self.display_id, self.bounds, self.scale),
-                captures,
-            });
+            captures.clear();
+            *cache = Some(SwitcherCache { captures });
         }
     }
 }

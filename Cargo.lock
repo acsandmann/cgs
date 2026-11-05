@@ -29,10 +29,11 @@ dependencies = [
 
 [[package]]
 name = "cgs"
-version = "0.3.17"
+version = "0.5.1"
 dependencies = [
  "block2",
  "dispatch2",
+ "multitouch",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -70,6 +71,15 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "multitouch"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62f941afce817b0c3a8ac770c6f5e4026b581b49cd4092a8f9b10beae1110a1a"
+dependencies = [
+ "objc2-core-foundation",
+]
 
 [[package]]
 name = "objc2"

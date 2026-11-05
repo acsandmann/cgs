@@ -99,7 +99,7 @@ unsafe extern "C" {
         sid: u32,
         bounds: CGRect,
     );
-    pub fn SLSTransactionCommit(transaction: *mut CFType, asynchronous: u32);
+    pub fn SLSTransactionCommit(transaction: *mut CFType, options: u32);
     /// Maps screen points to window points (the inverse of the on-screen placement),
     /// relative to the window origin; perspective is honoured.
     pub fn SLSTransactionSetWindowTransform3D(

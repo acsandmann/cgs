@@ -5,7 +5,7 @@ use objc2::rc::Retained;
 use objc2_core_video::CVPixelBufferGetIOSurface;
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use super::PreviewFrame;
+use super::{PreviewFrame, PreviewSurfaceFrame};
 use super::capture::Sample;
 use crate::compositor::LayerTransaction;
 
@@ -51,10 +51,19 @@ impl PreviewLayer {
     /// Replace pixels only when a new sample arrives. Last-valid pixels survive
     /// paused capture. The previous pool entry lives until this CA commit completes.
     pub fn set_frame(&mut self, frame: &PreviewFrame) -> bool {
-        if self.sequence == frame.frame.sequence {
+        self.set_sample(&frame.frame)
+    }
+
+    /// Present a native capture sample without constructing a Metal texture.
+    pub fn set_surface_frame(&mut self, frame: &PreviewSurfaceFrame) -> bool {
+        self.set_sample(&frame.frame)
+    }
+
+    fn set_sample(&mut self, frame: &super::capture::Frame) -> bool {
+        if self.sequence == frame.sequence {
             return false;
         }
-        let Some(image) = (unsafe { frame.frame.sample.0.image_buffer() }) else {
+        let Some(image) = (unsafe { frame.sample.0.image_buffer() }) else {
             return false;
         };
         let Some(surface) = CVPixelBufferGetIOSurface(Some(&image)) else {
@@ -62,18 +71,21 @@ impl PreviewLayer {
         };
         let _tx = LayerTransaction::disabled();
         surface.increment_use_count();
-        let previous = self.sample.replace(Arc::new(LayerSample(frame.frame.sample.clone())));
+        let previous = self.sample.replace(Arc::new(LayerSample(frame.sample.clone())));
         unsafe {
             self.layer.setContents(Some(
                 &*((&*surface as *const objc2_io_surface::IOSurfaceRef).cast()),
             ));
         }
-        let [x, y, width, height] = frame.frame.uv;
-        self.layer.setContentsRect(objc2_core_foundation::CGRect::new(
+        let [x, y, width, height] = frame.uv;
+        let crop = objc2_core_foundation::CGRect::new(
             objc2_core_foundation::CGPoint::new(x as f64, y as f64),
             objc2_core_foundation::CGSize::new(width as f64, height as f64),
-        ));
-        self.sequence = frame.frame.sequence;
+        );
+        if self.layer.contentsRect() != crop {
+            self.layer.setContentsRect(crop);
+        }
+        self.sequence = frame.sequence;
         unsafe {
             CATransaction::setCompletionBlock(Some(&RcBlock::new(move || {
                 let _ = &previous;

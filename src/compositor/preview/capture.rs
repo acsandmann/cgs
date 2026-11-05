@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::cell::OnceCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -189,7 +192,24 @@ define_class!(
 // queues through a mutex; only read-only framework properties are accessed.
 // Mutable capture state lives in mailboxes, not these shared descriptions.
 #[derive(Clone)]
-struct Content(Retained<SCShareableContent>);
+struct Content {
+    shareable: Retained<SCShareableContent>,
+    windows: Arc<HashMap<u32, WindowDescription>>,
+}
+impl Content {
+    fn new(shareable: Retained<SCShareableContent>) -> Self {
+        let windows = unsafe { shareable.windows() }
+            .iter()
+            .filter_map(WindowDescription::new)
+            .map(|window| (window.id, window))
+            .collect();
+        Self { shareable, windows: Arc::new(windows) }
+    }
+
+    fn contains(&self, id: u32, pid: i32) -> bool {
+        self.windows.get(&id).is_some_and(|window| window.pid == pid)
+    }
+}
 unsafe impl Send for Content {}
 #[derive(Default)]
 struct Discovery {
@@ -217,10 +237,7 @@ fn request_inventory(
         if let Some((time, content)) = &inventory.content {
             let current = time.elapsed() < std::time::Duration::from_secs(5)
                 && requested.iter().all(|p| {
-                    unsafe { content.0.windows() }.iter().any(|w| unsafe {
-                        w.windowID() == p.window_id
-                            && w.owningApplication().is_some_and(|a| a.processID() == p.process_id)
-                    })
+                    content.contains(p.window_id, p.process_id)
                 });
             // Start known identities immediately, even when discovery must
             // refresh. Each source still checks the caller's owning PID. Missing
@@ -248,7 +265,7 @@ fn request_inventory(
     inventory.pending = true;
     drop(inventory);
     let callback = RcBlock::new(|content: *mut SCShareableContent, error: *mut NSError| {
-        let result = unsafe { Retained::retain(content) }.map(Content).ok_or_else(|| {
+        let result = unsafe { Retained::retain(content) }.map(Content::new).ok_or_else(|| {
             unsafe { error.as_ref() }
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "content discovery returned no content".into())
@@ -276,15 +293,54 @@ fn request_inventory(
 
 #[derive(Clone)]
 pub(super) struct Frame {
-    pub texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    texture: Rc<OnceCell<Retained<ProtocolObject<dyn MTLTexture>>>>,
     pub sample: Arc<Sample>,
     pub uv: [f32; 4],
     pub sequence: u64,
     pub display_time: f64,
     pub bytes: usize,
     dimensions: (usize, usize),
-    received: Instant,
+    pub(super) received: Instant,
 }
+impl Frame {
+    pub fn metal_texture(
+        &self,
+        device: &ProtocolObject<dyn MTLDevice>,
+    ) -> PreviewResult<&ProtocolObject<dyn MTLTexture>> {
+        if self.texture.get().is_none() {
+            let image = unsafe { self.sample.0.image_buffer() }
+                .ok_or_else(|| PreviewError::Capture("missing image".into()))?;
+            let surface = CVPixelBufferGetIOSurface(Some(&image))
+                .ok_or_else(|| PreviewError::Capture("frame is not IOSurface-backed".into()))?;
+            let texture = import_texture(device, &image, &surface)?;
+            let _ = self.texture.set(texture);
+        }
+        self.texture
+            .get()
+            .map(|texture| &**texture)
+            .ok_or_else(|| PreviewError::Metal("missing imported texture".into()))
+    }
+}
+
+fn import_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    image: &CVPixelBuffer,
+    surface: &objc2_io_surface::IOSurfaceRef,
+) -> PreviewResult<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let descriptor = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            CVPixelBufferGetWidth(image),
+            CVPixelBufferGetHeight(image),
+            false,
+        )
+    };
+    descriptor.setStorageMode(MTLStorageMode::Shared);
+    descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    device.newTextureWithDescriptor_iosurface_plane(&descriptor, surface, 0)
+        .ok_or_else(|| PreviewError::Metal("IOSurface texture import failed".into()))
+}
+
 static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static WAITERS: Mutex<Vec<std::sync::Weak<Wake>>> = Mutex::new(Vec::new());
 static STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -444,11 +500,11 @@ impl StreamControl {
 }
 
 struct Slot {
+    provisional: bool,
     _lease: Arc<StreamLease>,
     request: PreviewSource,
     native_dimensions: (usize, usize),
     control: Option<Arc<StreamControl>>,
-    bootstrap: Option<Bootstrap>,
     mailbox: Arc<Mutex<Mailbox>>,
     frame: Option<Frame>,
     // Texture views of at most three capture surfaces. These retain IOSurfaces,
@@ -471,14 +527,6 @@ impl Drop for Slot {
 
 impl Slot {
     fn drive(&mut self) {
-        if let Some(initial) = self.bootstrap.take() {
-            DispatchQueue::global_queue(dispatch2::GlobalQueueIdentifier::QualityOfService(
-                dispatch2::DispatchQoS::UserInitiated,
-            ))
-            .exec_async(move || {
-                objc2::rc::autoreleasepool(|_| initial.run());
-            });
-        }
         let Some(control) = &self.control else { return };
         let mut m = self.mailbox.lock().unwrap();
         if m.control_pending {
@@ -637,12 +685,20 @@ fn direct_discovery_supported() -> bool {
 }
 fn direct_windows(requested: &[(u32, i32)]) -> Vec<WindowDescription> {
     use objc2::runtime::AnyObject;
-    use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption, kCGNullWindowID};
+    use objc2_core_foundation::CFArray;
+    use objc2_core_graphics::CGWindowListCreateDescriptionFromArray;
     objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-        let Some(list) = CGWindowListCopyWindowInfo(CGWindowListOption::OptionAll, kCGNullWindowID)
-        else {
-            return Vec::new();
+        // Core Graphics expects an array of integer window IDs stored as
+        // opaque pointer values. Null callbacks keep CF from retaining them.
+        let mut ids: Vec<_> = requested
+            .iter()
+            .map(|&(id, _)| id as usize as *const std::ffi::c_void)
+            .collect();
+        let list = unsafe {
+            CFArray::new(None, ids.as_mut_ptr(), ids.len() as isize, std::ptr::null())
+                .and_then(|ids| CGWindowListCreateDescriptionFromArray(Some(&ids)))
         };
+        let Some(list) = list else { return Vec::new() };
         // CFArray/CFDictionary are toll-free bridged. The retained CF list owns
         // every dictionary throughout this read-only traversal.
         let list =
@@ -741,6 +797,7 @@ struct Opened {
 }
 unsafe impl Send for Opened {}
 struct Opening {
+    provisional: bool,
     window_id: u32,
     process_id: i32,
     result: Arc<Mutex<Option<Result<Opened, String>>>>,
@@ -754,7 +811,7 @@ fn open_source(
     wake: Arc<Wake>,
     native: Option<(usize, usize)>,
     bootstrap: bool,
-) -> Result<Opened, String> {
+) -> Result<(Opened, Option<Bootstrap>), String> {
     let mut setup_us = [0; 3];
     let begin = Instant::now();
     let filter = unsafe {
@@ -829,13 +886,13 @@ fn open_source(
     } else {
         None
     };
-    Ok(Opened {
+    let opened = Opened {
         slot: Slot {
+            provisional: false,
             _lease: lease,
             request,
             native_dimensions,
             control,
-            bootstrap: initial,
             mailbox,
             frame: None,
             textures: Vec::with_capacity(3),
@@ -843,7 +900,8 @@ fn open_source(
             desired: dimensions,
         },
         setup_us,
-    })
+    };
+    Ok((opened, initial))
 }
 
 // Keep one last frame per source until hide/clear, without retaining its stream
@@ -1104,7 +1162,18 @@ impl Captures {
     fn discover(&self) { self.discover_fresh(false); }
 
     fn discover_fresh(&self, fresh: bool) {
-        if self.windows.is_none() && !self.requested.is_empty() && direct_discovery_supported() {
+        let mut discovery = self.discovery.lock().unwrap();
+        let request = !discovery.pending;
+        discovery.pending = true;
+        drop(discovery);
+        if request {
+            request_inventory(Some((&self.discovery, &self.wake)), &self.requested, fresh);
+        }
+        if self.windows.is_none()
+            && !self.requested.is_empty()
+            && !matches!(self.discovery.lock().unwrap().result, Some(Ok(_)))
+            && direct_discovery_supported()
+        {
             let mut direct = self.direct.lock().unwrap();
             if !direct.started {
                 direct.started = true;
@@ -1123,13 +1192,6 @@ impl Captures {
                 });
             }
         }
-        let mut d = self.discovery.lock().unwrap();
-        if d.pending {
-            return;
-        }
-        d.pending = true;
-        drop(d);
-        request_inventory(Some((&self.discovery, &self.wake)), &self.requested, fresh);
     }
 
     pub fn pump(&mut self) -> PreviewResult<()> {
@@ -1149,29 +1211,39 @@ impl Captures {
                 continue;
             };
             let opening = self.opening.swap_remove(i);
-            match result {
-                Ok(opened)
-                    if self.requested.iter().any(|p| {
-                        p.window_id == opening.window_id && p.process_id == opening.process_id
-                    }) =>
-                {
-                    // Accept identity-valid initial pixels even if zoom changed
-                    // their requested quality. Reconciliation upgrades the slot.
-                    for (value, sample) in self.setup_us.iter_mut().zip(opened.setup_us) {
-                        *value = (*value).max(sample);
+            let requested = self.requested.iter().any(|source| {
+                source.window_id == opening.window_id && source.process_id == opening.process_id
+            });
+            if requested {
+                match result {
+                    Ok(mut opened) => {
+                        // Accept identity-valid initial pixels even if zoom changed
+                        // their requested quality. Reconciliation upgrades the slot.
+                        opened.slot.provisional = opening.provisional;
+                        for (value, sample) in self.setup_us.iter_mut().zip(opened.setup_us) {
+                            *value = (*value).max(sample);
+                        }
+                        self.slots.push(opened.slot);
                     }
-                    self.slots.push(opened.slot);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    self.unavailable.insert(opening.window_id, error);
+                    Err(error) if !opening.provisional || self.direct_used => {
+                        self.unavailable.insert(opening.window_id, error);
+                    }
+                    Err(_) => {}
                 }
             }
             self.reconcile = true;
         }
-        for slot in &self.slots {
+        self.slots.retain(|slot| {
             let mailbox = slot.mailbox.lock().unwrap();
             if mailbox.lifecycle == Lifecycle::Failed {
+                if slot.provisional && !self.direct_used && slot.frame.is_none() {
+                    // Retry with the authoritative description after a failed
+                    // first capture. A successful preview stays cached.
+                    self.retired.0 += mailbox.sequence;
+                    self.retired.1 += mailbox.replaced;
+                    self.reconcile = true;
+                    return false;
+                }
                 self.unavailable.entry(slot.request.window_id).or_insert_with(|| {
                     match &mailbox.status {
                         SourceStatus::Failed(message) => message.clone(),
@@ -1180,7 +1252,8 @@ impl Captures {
                 });
                 self.reconcile = true;
             }
-        }
+            true
+        });
         if self.capacity_limit != 0
             && self.slots.len() + self.opening.len() < 8
             && STREAMS.load(Ordering::Acquire) < self.capacity_limit
@@ -1188,29 +1261,25 @@ impl Captures {
             self.reconcile = true;
         }
         if let Some(result) = self.discovery.lock().unwrap().result.take() {
-            let content = result.map_err(PreviewError::Capture)?.0;
+            let content = result.map_err(PreviewError::Capture)?;
+            let valid = |id, pid| content.contains(id, pid);
             if std::mem::take(&mut self.direct_used) {
-                // Any shortcut that has not produced pixels yields to real SCK
-                // descriptions. Already-usable captures continue without churn.
-                self.opening.clear();
-                self.slots
-                    .retain(|s| s.frame.is_some() || s.mailbox.lock().unwrap().latest.is_some());
+                // Keep identity-validated requests in flight. Discarding
+                // them here starts a second screenshot while the first
+                // still occupies WindowServer's capture queue.
+                self.opening.retain(|s| valid(s.window_id, s.process_id));
+                self.slots.retain(|s| valid(s.request.window_id, s.request.process_id));
             }
             self.unavailable.clear();
-            // Copy identity once when discovery changes. Scheduling never sends
-            // Objective-C messages just to compare a window ID or its owning PID.
-            let inventory: Vec<_> =
-                unsafe { content.windows() }.iter().filter_map(WindowDescription::new).collect();
-            let valid = |id, pid| inventory.iter().any(|w| w.id == id && w.pid == pid);
             let cached_count = self.cached.len();
             self.cached.retain(|f| valid(f.window_id, f.process_id));
             self.reused_dirty |= self.cached.len() != cached_count;
             REUSABLE.with(|cache| cache.borrow_mut().retain(|f| valid(f.window_id, f.process_id)));
-            // Retain only requested descriptions after validating cached identities.
             self.windows = Some(
-                inventory
-                    .into_iter()
-                    .filter(|w| self.requested.iter().any(|p| w.id == p.window_id))
+                self.requested
+                    .iter()
+                    .filter_map(|source| content.windows.get(&source.window_id))
+                    .cloned()
                     .collect(),
             );
             self.reconcile = true;
@@ -1247,13 +1316,27 @@ impl Captures {
             .filter(|p| p.mode == CaptureMode::Snapshot)
             .chain(self.requested.iter().filter(|p| p.mode == CaptureMode::Live).skip(6))
             .any(|p| self.needs_sample(p) && !self.unavailable.contains_key(&p.window_id));
-        let live_limit = if pending { 6 } else { 8 };
+        let live_limit = if pending {
+            // Reserve most of the cold pool for first frames. Preserve
+            // established live capacity when a later scene adds snapshots.
+            self.slots.iter().filter(|slot| slot.control.is_some()).count().clamp(2, 6)
+        } else {
+            8
+        };
+        let discovery_pending = self.discovery.lock().unwrap().pending;
         let foreground_ready = self
             .requested
             .iter()
             .filter(|p| p.mode == CaptureMode::Live)
             .take(live_limit)
-            .all(|p| !self.needs_sample(p) || self.unavailable.contains_key(&p.window_id));
+            .all(|p| {
+                // A usable foreground frame is sufficient. Waiting for its
+                // quality upgrade can starve cards with no pixels at all.
+                self.source_frame(p).is_some()
+                    || self.unavailable.contains_key(&p.window_id)
+                    || (!discovery_pending
+                        && !windows.iter().any(|w| w.id == p.window_id && w.pid == p.process_id))
+            });
         let mut live_index = 0;
         for requested in &self.requested {
             if self.unavailable.contains_key(&requested.window_id) {
@@ -1264,10 +1347,7 @@ impl Captures {
                 live_index += 1;
             }
             if request.mode == CaptureMode::Snapshot || live_index > live_limit {
-                if !foreground_ready
-                    || !self.needs_sample(&request)
-                    || self.unavailable.contains_key(&request.window_id)
-                {
+                if !foreground_ready || !self.needs_sample(&request) {
                     continue;
                 }
                 request.mode = CaptureMode::Snapshot;
@@ -1286,7 +1366,7 @@ impl Captures {
                 .iter()
                 .find(|w| w.id == request.window_id && w.pid == request.process_id);
             let Some(window) = window else {
-                if !self.discovery.lock().unwrap().pending {
+                if !discovery_pending {
                     self.unavailable
                         .insert(request.window_id, "window unavailable or owner changed".into());
                 }
@@ -1318,6 +1398,7 @@ impl Captures {
                 };
                 let result = Arc::new(Mutex::new(None));
                 self.opening.push(Opening {
+                    provisional: self.direct_used,
                     window_id: request.window_id,
                     process_id: request.process_id,
                     result: result.clone(),
@@ -1336,8 +1417,8 @@ impl Captures {
                     ),
                 )
                 .exec_async(move || {
-                    let opened = objc2::rc::autoreleasepool(|_| {
-                        open_source(
+                    objc2::rc::autoreleasepool(|_| {
+                        let opened = open_source(
                             window,
                             request,
                             lease,
@@ -1346,10 +1427,19 @@ impl Captures {
                             wake.clone(),
                             native,
                             bootstrap,
-                        )
+                        );
+                        match opened {
+                            Ok((opened, initial)) => {
+                                // The first sample can now reach the owner on its first wake.
+                                *result.lock().unwrap() = Some(Ok(opened));
+                                if let Some(initial) = initial {
+                                    initial.run();
+                                }
+                            }
+                            Err(error) => *result.lock().unwrap() = Some(Err(error)),
+                        }
+                        wake.notify();
                     });
-                    *result.lock().unwrap() = Some(opened);
-                    wake.notify();
                 });
                 continue;
             }
@@ -1457,6 +1547,14 @@ impl Captures {
     /// All canvases share this mailbox drain. Display/geometry wakes alone do
     /// not revisit stream control or acquire every source's mailbox mutex.
     pub fn update(&mut self, gpu: &mut Gpu, scene: &[Preview]) -> PreviewResult<bool> {
+        self.update_inner(Some(gpu), scene)
+    }
+
+    pub fn update_surfaces(&mut self) -> PreviewResult<()> {
+        self.update_inner(None, &[]).map(|_| ())
+    }
+
+    fn update_inner(&mut self, gpu: Option<&mut Gpu>, scene: &[Preview]) -> PreviewResult<bool> {
         if !self.wake.pending.swap(false, Ordering::AcqRel) && !self.reconcile {
             return Ok(false);
         }
@@ -1464,7 +1562,7 @@ impl Captures {
         self.import(gpu, scene)
     }
 
-    fn import(&mut self, gpu: &mut Gpu, scene: &[Preview]) -> PreviewResult<bool> {
+    fn import(&mut self, gpu: Option<&mut Gpu>, scene: &[Preview]) -> PreviewResult<bool> {
         let mut changed = std::mem::take(&mut self.reused_dirty);
         for slot in &mut self.slots {
             let sample = slot.mailbox.lock().unwrap().latest.take();
@@ -1476,30 +1574,21 @@ impl Captures {
             let surface: CFRetained<objc2_io_surface::IOSurfaceRef> =
                 CVPixelBufferGetIOSurface(Some(&image))
                     .ok_or_else(|| PreviewError::Capture("frame is not IOSurface-backed".into()))?;
-            let id = surface.id();
-            let texture = if let Some((_, t)) = slot.textures.iter().find(|(key, _)| *key == id) {
-                t.clone()
-            } else {
-                let descriptor = unsafe {
-                    MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
-                        MTLPixelFormat::BGRA8Unorm,
-                        CVPixelBufferGetWidth(&image),
-                        CVPixelBufferGetHeight(&image),
-                        false,
-                    )
+            let texture = OnceCell::new();
+            if let Some(gpu) = gpu.as_ref() {
+                let id = surface.id();
+                let imported = if let Some((_, texture)) = slot.textures.iter().find(|(key, _)| *key == id) {
+                    texture.clone()
+                } else {
+                    let imported = import_texture(&gpu.device, &image, &surface)?;
+                    if slot.textures.len() == 3 {
+                        slot.textures.remove(0);
+                    }
+                    slot.textures.push((id, imported.clone()));
+                    imported
                 };
-                descriptor.setStorageMode(MTLStorageMode::Shared);
-                descriptor.setUsage(MTLTextureUsage::ShaderRead);
-                let t = gpu
-                    .device
-                    .newTextureWithDescriptor_iosurface_plane(&descriptor, &surface, 0)
-                    .ok_or_else(|| PreviewError::Metal("IOSurface texture import failed".into()))?;
-                if slot.textures.len() == 3 {
-                    slot.textures.remove(0);
-                }
-                slot.textures.push((id, t.clone()));
-                t
-            };
+                let _ = texture.set(imported);
+            }
             let bytes =
                 CVPixelBufferGetBytesPerRow(&image).saturating_mul(CVPixelBufferGetHeight(&image));
             let (uv, native_size) = content_geometry(
@@ -1528,7 +1617,7 @@ impl Captures {
             self.cached.retain(|f| f.window_id != slot.request.window_id);
             slot.frame = Some(Frame {
                 dimensions: (CVPixelBufferGetWidth(&image), CVPixelBufferGetHeight(&image)),
-                texture,
+                texture: Rc::new(texture),
                 sample: Arc::new(sample),
                 bytes,
                 uv,
@@ -1891,7 +1980,7 @@ impl DesktopSnapshot {
                     return;
                 }
             };
-            let display = unsafe { content.0.displays() }
+            let display = unsafe { content.shareable.displays() }
                 .iter()
                 .find(|d| unsafe { d.displayID() } == display_id);
             let Some(display) = display else {
@@ -1919,7 +2008,7 @@ impl DesktopSnapshot {
             let desktop = objc2_core_graphics::CGWindowLevelForKey(
                 objc2_core_graphics::CGWindowLevelKey::DesktopWindowLevelKey,
             ) as isize;
-            let desktop_windows: Vec<_> = unsafe { content.0.windows() }
+            let desktop_windows: Vec<_> = unsafe { content.shareable.windows() }
                 .iter()
                 .filter(|w| unsafe { w.windowLayer() } <= desktop)
                 .collect();
@@ -1975,7 +2064,7 @@ impl DesktopSnapshot {
         // Unlock/display changes can leave a recent inventory without this
         // display. An empty source list must not make that cache look usable.
         let missing_display = INVENTORY.lock().unwrap().content.as_ref().is_none_or(|(_, c)| {
-            !unsafe { c.0.displays() }.iter().any(|d| unsafe { d.displayID() } == display_id)
+            !unsafe { c.shareable.displays() }.iter().any(|d| unsafe { d.displayID() } == display_id)
         });
         request_inventory(Some((&discovery, &wake)), &[], missing_display);
         let pending = Arc::downgrade(&state);

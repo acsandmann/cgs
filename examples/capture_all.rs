@@ -1,11 +1,11 @@
 //! Capture first-frame latency for every normal application window. No titles logged.
-//! cargo run --release --example capture_all -- [thumbnail|native] [CONCURRENCY] [TIMEOUT_SECONDS] [WINDOW_IDS_FILE] [FOREGROUND_COUNT]
+//! cargo run --release --example capture_all -- [thumbnail|native] [CONCURRENCY] [TIMEOUT_SECONDS] [WINDOW_IDS_FILE] [FOREGROUND_COUNT] [reuse|warm] [capture-only]
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cgs::compositor::preview::{
-    CaptureMode, CaptureResolution, Preview, PreviewCompositor, SourceStatus,
+    CaptureMode, CaptureResolution, Preview, PreviewCompositor, PreviewSource,
 };
 use objc2_core_graphics::{CGDisplayBounds, CGMainDisplayID};
 use objc2_foundation::{NSDate, NSRunLoop};
@@ -13,7 +13,7 @@ use objc2_screen_capture_kit::{SCShareableContent, SCWindow};
 
 struct Batch {
     start: Instant,
-    windows: Vec<(u32, Option<f64>)>,
+    windows: Vec<(u32, i32, Option<f64>)>,
 }
 thread_local! {
     static COMPOSITOR: RefCell<Option<PreviewCompositor>> = const { RefCell::new(None) };
@@ -28,13 +28,13 @@ fn render() {
         }
         BATCH.with(|batch| {
             if let Some(batch) = batch.borrow_mut().as_mut() {
-                for (id, elapsed) in &mut batch.windows {
-                    if elapsed.is_none() && c.has_frame(*id)
-                        && matches!(c.source_status(*id),
-                            Some(SourceStatus::Complete { age } | SourceStatus::Idle { age: Some(age) })
-                            if age <= batch.start.elapsed())
+                for (id, pid, elapsed) in &mut batch.windows {
+                    if elapsed.is_none()
+                        && let Some(frame) = c.captured_frame(*id)
+                        && frame.process_id() == *pid
+                        && let Some(age) = frame.received_at().checked_duration_since(batch.start)
                     {
-                        *elapsed = Some(batch.start.elapsed().as_secs_f64() * 1000.);
+                        *elapsed = Some(age.as_secs_f64() * 1000.);
                     }
                 }
             }
@@ -94,13 +94,56 @@ fn scene_for(
         })
         .collect()
 }
+fn set_workload(
+    compositor: &mut PreviewCompositor,
+    scene: &[Preview],
+    capture_only: bool,
+) -> Result<(), cgs::compositor::preview::PreviewError> {
+    if !capture_only {
+        return compositor.set_scene(scene);
+    }
+    let sources: Vec<_> = scene
+        .iter()
+        .enumerate()
+        .map(|(index, p)| PreviewSource {
+            window_id: p.window_id,
+            process_id: p.process_id,
+            mode: p.mode,
+            resolution: p.resolution,
+            priority: if index == 0 {
+                3
+            } else if p.mode == CaptureMode::Live {
+                1
+            } else {
+                -1
+            },
+            frame_interval: Duration::from_secs_f64(if index == 0 { 1. / 30. } else { 1. / 8. }),
+        })
+        .collect();
+    compositor.set_sources(&sources)
+}
+
+fn count_retained(windows: &[(u32, i32, Option<f64>)]) -> usize {
+    COMPOSITOR.with(|slot| {
+        let slot = slot.borrow();
+        let compositor = slot.as_ref().unwrap();
+        windows
+            .iter()
+            .filter(|(id, pid, _)| {
+                compositor.captured_frame(*id).is_some_and(|frame| frame.process_id() == *pid)
+            })
+            .count()
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let _ = CGDisplayBounds(CGMainDisplayID());
     if args.first().is_some_and(|s| s == "sample") {
         return sample_benchmark(&args);
     }
-    let present = args.iter().any(|s| s == "present");
+    let capture_only = args.iter().any(|s| s == "capture-only");
+    let present = !capture_only && args.iter().any(|s| s == "present");
     let native = args.first().is_some_and(|s| s == "native");
     let mixed = args.first().is_some_and(|s| s == "mixed");
     let foreground: Option<usize> = args.get(4).map(|s| s.parse()).transpose()?;
@@ -185,13 +228,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dispatch2::DispatchQueue::main().exec_async(render);
     })?;
     c.set_level(if present { 25 } else { -1 })?; // Optional on-screen presentation measurement.
-    c.set_scene(&[])?;
+    set_workload(&mut c, &[], capture_only)?;
     let cold_setup_ms = start.elapsed().as_secs_f64() * 1000.;
     c.show()?;
     COMPOSITOR.with(|slot| slot.replace(Some(c)));
     let mut latencies = Vec::new();
     let mut failed = 0;
     let mut ready_times = Vec::new();
+    let mut lost = 0;
     let mut foreground_ms = 0f64;
     let capture_start = Instant::now();
     for chunk in windows.chunks(if foreground.is_some() {
@@ -203,15 +247,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BATCH.with(|b| {
             b.replace(Some(Batch {
                 start: Instant::now(),
-                windows: chunk.iter().map(|&(id, _)| (id, None)).collect(),
+                windows: chunk.iter().map(|&(id, pid)| (id, pid, None)).collect(),
             }))
         });
-        COMPOSITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().set_scene(&scene))?;
+        COMPOSITOR.with(|slot| set_workload(slot.borrow_mut().as_mut().unwrap(), &scene, capture_only))?;
         run_until(Instant::now() + Duration::from_secs_f64(timeout), || {
-            BATCH.with(|b| b.borrow().as_ref().unwrap().windows.iter().all(|(_, t)| t.is_some()))
+            BATCH.with(|b| b.borrow().as_ref().unwrap().windows.iter().all(|(_, _, t)| t.is_some()))
         });
         let batch = BATCH.with(|b| b.take().unwrap());
-        for (index, (id, elapsed)) in batch.windows.into_iter().enumerate() {
+        lost += batch.windows.iter().filter(|(_, _, t)| t.is_some()).count()
+            .saturating_sub(count_retained(&batch.windows));
+        for (index, (id, _, elapsed)) in batch.windows.into_iter().enumerate() {
             if let Some(ms) = elapsed {
                 latencies.push(ms);
                 if foreground.is_some_and(|n| index < n) {
@@ -265,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.max_capture_pump_us
     );
     println!(
-        "summary quality={} concurrency={} windows={} captured={} failed={} discovery_ms={discovery_ms:.3} total_ms={total_ms:.3} first_frame_p50_ms={:.3} first_frame_p95_ms={:.3} first_frame_max_ms={:.3} cached_frame_bytes={bytes} last_valid_frame_ms={last_valid_frame_ms:.3} capture_ms={capture_ms:.3} foreground_ms={foreground_ms:.3}",
+        "summary quality={} concurrency={} windows={} captured={} failed={} lost={lost} discovery_ms={discovery_ms:.3} total_ms={total_ms:.3} first_frame_p50_ms={:.3} first_frame_p95_ms={:.3} first_frame_max_ms={:.3} cached_frame_bytes={bytes} last_valid_frame_ms={last_valid_frame_ms:.3} capture_ms={capture_ms:.3} foreground_ms={foreground_ms:.3}",
         if native {
             "native"
         } else if mixed {
@@ -294,8 +340,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !reuse_context {
         retained = None;
     }
+    let mut warm_failed = false;
     if args.get(5).is_some_and(|s| s == "warm" || s == "reuse") {
-        if let Some(delay) = args.get(6).filter(|s| s.as_str() != "present") {
+        if let Some(delay) = args.get(6).filter(|s| s.as_str() != "present" && s.as_str() != "capture-only") {
             let seconds: f64 = delay.parse()?;
             if !seconds.is_finite() || seconds < 0. {
                 return Err("reopen delay must be nonnegative".into());
@@ -323,20 +370,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?
         };
         c.set_level(if present { 25 } else { -1 })?;
-        c.set_scene(&scene_for(&windows, foreground, native, mixed))?;
+        set_workload(&mut c, &scene_for(&windows, foreground, native, mixed), capture_only)?;
         BATCH.with(|b| {
             b.replace(Some(Batch {
                 start: warm_start,
-                windows: windows.iter().map(|&(id, _)| (id, None)).collect(),
+                windows: windows.iter().map(|&(id, pid)| (id, pid, None)).collect(),
             }))
         });
         let setup_ms = warm_start.elapsed().as_secs_f64() * 1000.;
         c.show()?;
-        let ready = windows.iter().filter(|(id, _)| c.has_frame(*id)).count();
+        let ready = windows.iter().filter(|(id, _)| c.captured_frame(*id).is_some()).count();
         let foreground_ready = windows
             .iter()
             .take(foreground.unwrap_or(0))
-            .filter(|(id, _)| c.has_frame(*id))
+            .filter(|(id, _)| c.captured_frame(*id).is_some())
             .count();
         let ready_ms = warm_start.elapsed().as_secs_f64() * 1000.;
         COMPOSITOR.with(|slot| slot.replace(Some(c)));
@@ -355,19 +402,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 + slot.borrow().as_ref().unwrap().stats().first_present_us as f64 / 1000.)
         );
         run_until(Instant::now() + Duration::from_secs_f64(timeout), || {
-            BATCH.with(|b| b.borrow().as_ref().unwrap().windows.iter().all(|(_, t)| t.is_some()))
+            BATCH.with(|b| b.borrow().as_ref().unwrap().windows.iter().all(|(_, _, t)| t.is_some()))
         });
         let batch = BATCH.with(|b| b.take().unwrap());
+        let warm_retained = count_retained(&batch.windows);
+        warm_failed = warm_retained != batch.windows.len()
+            || batch.windows.iter().any(|(_, _, t)| t.is_none());
         let visible: Vec<_> = batch
             .windows
             .iter()
             .take(foreground.unwrap_or(0))
-            .filter_map(|(_, t)| *t)
+            .filter_map(|(_, _, t)| *t)
             .collect();
         println!(
-            "warm_summary windows={} captured={} all_ms={:.3} foreground_ms={:.3} first_ms={:.3}",
+            "warm_summary windows={} captured={} retained={warm_retained} all_ms={:.3} foreground_ms={:.3} first_ms={:.3}",
             windows.len(),
-            batch.windows.iter().filter(|(_, t)| t.is_some()).count(),
+            batch.windows.iter().filter(|(_, _, t)| t.is_some()).count(),
             warm_start.elapsed().as_secs_f64() * 1000.,
             visible.iter().copied().fold(0., f64::max),
             visible.iter().copied().fold(f64::INFINITY, f64::min)
@@ -375,7 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         COMPOSITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().hide())?;
         COMPOSITOR.with(|slot| slot.take());
     }
-    if failed != 0 {
+    if failed != 0 || lost != 0 || warm_failed {
         return Err("some windows did not produce a valid frame; see statuses above".into());
     }
     Ok(())

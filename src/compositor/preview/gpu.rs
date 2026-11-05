@@ -338,7 +338,14 @@ impl Gpu {
             let Some(frame) = captures.frame(p) else {
                 continue;
             };
-            self.encode_preview(&encoder, p, camera, &frame.texture, frame.uv, size);
+            let texture = match frame.metal_texture(&self.device) {
+                Ok(texture) => texture,
+                Err(error) => {
+                    encoder.endEncoding();
+                    return Err(error);
+                }
+            };
+            self.encode_preview(&encoder, p, camera, texture, frame.uv, size);
             if !self
                 .last_sources
                 .iter()
