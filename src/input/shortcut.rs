@@ -4,7 +4,7 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
 use objc2_app_kit::*;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSMutableAttributedString, NSNumber, NSRange, NSString};
 
 use crate::Ui;
 use crate::bridge::callback;
@@ -87,14 +87,83 @@ fn key_display(event: &NSEvent) -> String {
             .unwrap_or_default(),
     }
 }
+fn track_hover(view: &NSView) -> Retained<NSTrackingArea> {
+    let options = NSTrackingAreaOptions::MouseEnteredAndExited
+        | NSTrackingAreaOptions::ActiveInKeyWindow
+        | NSTrackingAreaOptions::InVisibleRect;
+    let area = unsafe {
+        NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            crate::CGRect::ZERO,
+            options,
+            Some(view),
+            None,
+        )
+    };
+    view.addTrackingArea(&area);
+    area
+}
+
+struct RecordingActionState {
+    removes_binding: bool,
+    tracking: OnceCell<Retained<NSTrackingArea>>,
+}
+
+define_class!(
+    #[unsafe(super(NSButton))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "CgsRecordingAction"]
+    #[ivars = RecordingActionState]
+    struct RecordingAction;
+    impl RecordingAction {
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking(&self) {
+            unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
+            self.ivars().tracking.get_or_init(|| track_hover(self));
+        }
+        #[unsafe(method(mouseEntered:))]
+        fn entered(&self, _: &NSEvent) {
+            if !self.isEnabled() {
+                return;
+            }
+            let draw = block2::StackBlock::new(|| {
+                let neutral = NSColor::secondaryLabelColor();
+                let accent = if self.ivars().removes_binding {
+                    NSColor::systemRedColor()
+                } else {
+                    NSColor::systemOrangeColor()
+                };
+                let tint = neutral.blendedColorWithFraction_ofColor(0.45, &accent)
+                    .unwrap_or(neutral);
+                self.setContentTintColor(Some(&tint));
+            });
+            self.effectiveAppearance().performAsCurrentDrawingAppearance(&draw);
+        }
+        #[unsafe(method(mouseExited:))]
+        fn exited(&self, _: &NSEvent) { self.reset_tint(); }
+        #[unsafe(method(viewDidHide))]
+        fn hidden(&self) {
+            unsafe { let _: () = msg_send![super(self), viewDidHide]; }
+            self.reset_tint();
+        }
+    }
+);
+
+impl RecordingAction {
+    fn reset_tint(&self) { self.setContentTintColor(Some(&NSColor::secondaryLabelColor())); }
+}
+
 type ShortcutCallback = Box<dyn FnMut(Option<KeyShortcut>)>;
 type ConflictCallback = Box<dyn FnMut(&KeyShortcut) -> Option<String>>;
 struct RecorderState {
     recording: Cell<bool>,
     hovered: Cell<bool>,
+    focused: Cell<bool>,
+    placeholder: RefCell<Option<String>>,
     surface: RefCell<Option<objc2::rc::Weak<NSBox>>>,
     tracking: OnceCell<Retained<NSTrackingArea>>,
     actions: RefCell<Option<objc2::rc::Weak<NSView>>>,
+    remove: OnceCell<objc2::rc::Weak<NSButton>>,
     modifiers_only: bool,
     modifiers: Cell<Modifiers>,
     value: RefCell<Option<KeyShortcut>>,
@@ -136,15 +205,7 @@ define_class!(
         #[unsafe(method(updateTrackingAreas))]
         fn update_tracking(&self) {
             unsafe { let _: () = msg_send![super(self), updateTrackingAreas]; }
-            self.ivars().tracking.get_or_init(|| {
-                let area = unsafe { NSTrackingArea::initWithRect_options_owner_userInfo(
-                    NSTrackingArea::alloc(), crate::CGRect::ZERO,
-                    NSTrackingAreaOptions::MouseEnteredAndExited | NSTrackingAreaOptions::ActiveInKeyWindow | NSTrackingAreaOptions::InVisibleRect,
-                    Some(self), None,
-                ) };
-                self.addTrackingArea(&area);
-                area
-            });
+            self.ivars().tracking.get_or_init(|| track_hover(self));
         }
         #[unsafe(method(mouseEntered:))]
         fn entered(&self, _: &NSEvent) {
@@ -164,8 +225,21 @@ define_class!(
         }
         #[unsafe(method(acceptsFirstResponder))]
         fn accepts_first_responder(&self)->bool{true}
+        #[unsafe(method(becomeFirstResponder))]
+        fn become_first_responder(&self) -> bool {
+            let accepts: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
+            if accepts {
+                self.ivars().focused.set(true);
+                self.refresh_surface();
+            }
+            accepts
+        }
         #[unsafe(method(resignFirstResponder))]
-        fn resign_first_responder(&self)->bool{self.cancel();unsafe{msg_send![super(self),resignFirstResponder]}}
+        fn resign_first_responder(&self) -> bool {
+            self.ivars().focused.set(false);
+            self.cancel();
+            unsafe { msg_send![super(self), resignFirstResponder] }
+        }
         #[unsafe(method(beginRecording:))]
         fn begin_action(&self,_sender:&AnyObject){self.begin();}
         #[unsafe(method(performKeyEquivalent:))]
@@ -182,8 +256,7 @@ define_class!(
                 let flags = shortcut_modifiers(event.modifierFlags());
                 if !self.ivars().modifiers_only || !flags.is_empty() { self.ivars().modifiers.set(flags); }
                 let flags = self.ivars().modifiers.get();
-                let text = if flags.is_empty() { "Press keys…".into() } else { modifier_glyphs(flags) };
-                self.setTitle(&NSString::from_str(&text));
+                self.show_modifiers(flags);
             }else{unsafe{let _:()=msg_send![super(self),flagsChanged:event];}}
         }
     }
@@ -225,9 +298,12 @@ impl RecorderButton {
         let this = Self::alloc(ui.mtm()).set_ivars(RecorderState {
             recording: Cell::new(false),
             hovered: Cell::new(false),
+            focused: Cell::new(false),
+            placeholder: RefCell::new(None),
             surface: RefCell::new(None),
             tracking: OnceCell::new(),
             actions: RefCell::new(None),
+            remove: OnceCell::new(),
             modifiers_only,
             modifiers: Cell::new(Modifiers::empty()),
             value: RefCell::new(None),
@@ -263,34 +339,48 @@ impl RecorderButton {
         if !stack.arrangedSubviews().is_empty() {
             return;
         }
-        for (symbol, label, help, action, color) in [
+        for (symbol, label, help, action) in [
             (
-                "arrow.uturn.forward.circle.fill",
+                "arrow.uturn.backward.circle.fill",
                 "Cancel recording and restore previous shortcut",
                 "Restore previous shortcut (Escape)",
                 sel!(cancelRecording:),
-                NSColor::systemGreenColor(),
             ),
             (
-                "xmark.circle.fill",
+                "minus.circle.fill",
                 "Clear shortcut",
                 "Remove this binding (Delete)",
                 sel!(clearRecordedShortcut:),
-                NSColor::secondaryLabelColor(),
             ),
         ] {
-            let button = NSButton::new(self.mtm());
+            let removes_binding = action == sel!(clearRecordedShortcut:);
+            let button = RecordingAction::alloc(self.mtm()).set_ivars(RecordingActionState {
+                removes_binding,
+                tracking: OnceCell::new(),
+            });
+            let button: Retained<RecordingAction> = unsafe { msg_send![super(button), init] };
             button.setBordered(false);
+            button.setRefusesFirstResponder(true);
+            button.setFocusRingType(NSFocusRingType::None);
             button.setImage(crate::image::Symbol::named(symbol).as_deref());
             button.setImagePosition(NSCellImagePosition::ImageOnly);
-            button.setContentTintColor(Some(&color));
+            button.reset_tint();
+            button.setSymbolConfiguration(Some(
+                &NSImageSymbolConfiguration::configurationWithPointSize_weight(14., unsafe {
+                    NSFontWeightMedium
+                }),
+            ));
             button.setAccessibilityLabel(Some(&NSString::from_str(label)));
             button.setToolTip(Some(&NSString::from_str(help)));
             button.setTranslatesAutoresizingMaskIntoConstraints(false);
-            button.widthAnchor().constraintEqualToConstant(16.0).setActive(true);
+            button.widthAnchor().constraintEqualToConstant(22.0).setActive(true);
+            button.heightAnchor().constraintEqualToConstant(22.0).setActive(true);
             unsafe {
                 button.setTarget(Some(self));
                 button.setAction(Some(action));
+            }
+            if removes_binding {
+                let _ = self.ivars().remove.set(objc2::rc::Weak::new(&*button));
             }
             stack.addArrangedSubview(&button);
         }
@@ -326,11 +416,7 @@ impl RecorderButton {
         self.ensure_actions();
         self.ivars().recording.set(true);
         self.ivars().modifiers.set(Modifiers::empty());
-        self.setTitle(&NSString::from_str(if self.ivars().modifiers_only {
-            "Press modifiers, then Return"
-        } else {
-            "Press keys…"
-        }));
+        self.show_modifiers(Modifiers::empty());
         self.setToolTip(Some(&NSString::from_str(
             "Press the new keys. Escape cancels; Delete removes the shortcut.",
         )));
@@ -380,53 +466,122 @@ impl RecorderButton {
         let recording = self.ivars().recording.get();
         let hovered = self.ivars().hovered.get();
         if let Some(actions) = self.ivars().actions.borrow().as_ref().and_then(|view| view.load()) {
+            let reveal = recording && actions.isHidden();
+            if reveal
+                && let Some(remove) = self.ivars().remove.get().and_then(|button| button.load())
+            {
+                remove.setHidden(!bound);
+            }
             actions.setHidden(!recording);
+            if reveal && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion() {
+                actions.setAlphaValue(0.);
+                NSAnimationContext::beginGrouping();
+                NSAnimationContext::currentContext().setDuration(0.14);
+                let animator: Retained<NSView> = unsafe { msg_send![&*actions, animator] };
+                animator.setAlphaValue(1.);
+                NSAnimationContext::endGrouping();
+            } else if !recording {
+                actions.setAlphaValue(1.);
+            }
         }
         self.setAlignment(if recording {
             NSTextAlignment::Left
         } else {
             NSTextAlignment::Center
         });
-        let base = if bound {
-            NSColor::quaternaryLabelColor()
-        } else {
-            NSColor::tertiarySystemFillColor()
-        };
         let fill = if recording {
             NSColor::controlBackgroundColor()
-        } else if hovered {
-            base.blendedColorWithFraction_ofColor(0.10, &NSColor::labelColor())
-                .unwrap_or(base)
+        } else if self.isEnabled() && self.ivars().focused.get() {
+            NSColor::systemFillColor()
+        } else if self.isEnabled() && hovered {
+            NSColor::secondarySystemFillColor()
+        } else if bound {
+            NSColor::tertiarySystemFillColor()
         } else {
-            base
+            NSColor::quaternarySystemFillColor()
         };
         surface.setFillColor(&fill);
-        surface.setBorderColor(&NSColor::controlAccentColor().colorWithAlphaComponent(0.65));
-        surface.setBorderWidth(if recording { 3.0 } else { 0.0 });
-        self.setContentTintColor(Some(&*if bound || hovered || recording {
-            NSColor::labelColor()
+    }
+
+    fn show_modifiers(&self, modifiers: Modifiers) {
+        if modifiers.is_empty() {
+            self.display_title(
+                if self.ivars().modifiers_only {
+                    "Press modifiers, then Return"
+                } else {
+                    "Press keys…"
+                },
+                None,
+            );
         } else {
-            NSColor::secondaryLabelColor()
-        }));
+            self.display_title(&modifier_glyphs(modifiers), Some(modifiers));
+        }
+    }
+
+    fn display_title(&self, value: &str, modifiers: Option<Modifiers>) {
+        let title = NSString::from_str(value);
+        if self.ivars().surface.borrow().is_none() {
+            self.setTitle(&title);
+            return;
+        }
+        let text =
+            NSMutableAttributedString::initWithString(NSMutableAttributedString::alloc(), &title);
+        let range = NSRange::new(0, title.length());
+        let (font, color) = if modifiers.is_some() {
+            (
+                NSFont::systemFontOfSize_weight(14., unsafe { NSFontWeightMedium }),
+                NSColor::labelColor().colorWithAlphaComponent(0.82),
+            )
+        } else {
+            (NSFont::systemFontOfSize(12.5), NSColor::secondaryLabelColor())
+        };
+        unsafe {
+            text.addAttribute_value_range(NSFontAttributeName, &font, range);
+            text.addAttribute_value_range(NSForegroundColorAttributeName, &color, range);
+            if let Some(modifiers) = modifiers {
+                let count =
+                    (shortcut_modifiers(modifiers).bits().count_ones() as usize).min(range.length);
+                if count > 0 {
+                    text.addAttribute_value_range(
+                        NSKernAttributeName,
+                        &NSNumber::new_f64(1.5),
+                        NSRange::new(0, count),
+                    );
+                }
+            }
+        }
+        self.setAttributedTitle(&text);
     }
 
     fn refresh(&self) {
-        let value = self
-            .ivars()
-            .value
-            .borrow()
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "Record Shortcut".into());
-        self.setTitle(&NSString::from_str(&value));
-        let help = if self.ivars().modifiers_only {
-            "Click and press modifiers, then Return. Escape cancels."
-        } else if self.ivars().value.borrow().is_some() {
-            "Click to change this shortcut. Escape cancels; Delete while recording removes it."
+        let binding = self.ivars().value.borrow();
+        let modifiers = binding.as_ref().map(|binding| binding.modifiers);
+        let value = binding.as_ref().map(ToString::to_string).unwrap_or_else(|| {
+            self.ivars()
+                .placeholder
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "Record Shortcut".into())
+        });
+        drop(binding);
+        self.display_title(&value, modifiers);
+        let (tooltip, help) = if self.ivars().modifiers_only {
+            (
+                "Click to record modifiers.",
+                "Click and press modifiers, then Return. Escape cancels.",
+            )
+        } else if modifiers.is_some() {
+            (
+                "Click to record a different shortcut.",
+                "Click to change this shortcut. Escape cancels; Delete while recording removes it.",
+            )
         } else {
-            "Click to record the keys for this command. Escape cancels."
+            (
+                "Click to record a shortcut.",
+                "Click to record the keys for this command. Escape cancels.",
+            )
         };
-        self.setToolTip(Some(&NSString::from_str(help)));
+        self.setToolTip(Some(&NSString::from_str(tooltip)));
         self.setAccessibilityHelp(Some(&NSString::from_str(help)));
         self.refresh_surface();
         unsafe {
@@ -473,18 +628,22 @@ impl KeyRecorder {
         self.native.refresh();
     }
 
-    /// A quiet shortcut field, with hover feedback and an accent outline while recording.
+    /// A compact shortcut field with fill-based focus and inline recording actions.
     pub fn flat_field(self: &std::rc::Rc<Self>, ui: &Ui) -> crate::layout::GroupBox {
         self.native.setBordered(false);
-        let actions = crate::layout::HStack::new(ui).spacing(2.0);
+        self.native.setFocusRingType(NSFocusRingType::None);
+        self.native.setContentTintColor(Some(&NSColor::secondaryLabelColor()));
+        self.native.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+        self.min_height(22.);
+        let actions = crate::layout::HStack::new(ui).spacing(1.0);
         *self.native.ivars().actions.borrow_mut() = Some(objc2::rc::Weak::new(actions.ns_view()));
         actions.set_hidden(true);
         self.hugging_priority(1.0, NSLayoutConstraintOrientation::Horizontal);
         let content = crate::layout::HStack::new(ui)
-            .spacing(4.0)
+            .spacing(7.0)
             .insets(crate::Insets {
-                left: 8.0,
-                right: 8.0,
+                left: 10.0,
+                right: 10.0,
                 top: 0.0,
                 bottom: 0.0,
             })
@@ -493,11 +652,22 @@ impl KeyRecorder {
         let field =
             crate::layout::GroupBox::with_insets(ui, content, crate::layout::uniform_insets(0.0));
         if let Some(surface) = field.ns_view().downcast_ref::<NSBox>() {
-            surface.setCornerRadius(6.0);
+            surface.setCornerRadius(7.0);
             *self.native.ivars().surface.borrow_mut() = Some(objc2::rc::Weak::new(surface));
         }
+        field.height(26.);
+        field.min_width(42.);
+        let modifiers =
+            self.native.ivars().value.borrow().as_ref().map(|binding| binding.modifiers);
+        self.native.display_title(&self.native.title().to_string(), modifiers);
         self.native.refresh_surface();
         field
+    }
+
+    pub fn placeholder(self, title: &str) -> Self {
+        *self.native.ivars().placeholder.borrow_mut() = Some(title.into());
+        self.native.refresh();
+        self
     }
 
     pub fn get_value(&self) -> Option<KeyShortcut> { self.native.ivars().value.borrow().clone() }

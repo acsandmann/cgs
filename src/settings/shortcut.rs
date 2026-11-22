@@ -249,8 +249,7 @@ impl ShortcutPresentation {
     }
     pub fn recorder(ui: &Ui, recorder: &Rc<KeyRecorder>) -> impl NativeView {
         let field = recorder.flat_field(ui);
-        field.width(148.0);
-        field.height(24.0);
+        field.width(160.0);
         field
     }
     pub fn option(ui: &Ui, label: &str, control: Box<dyn NativeView>) -> HStack {
