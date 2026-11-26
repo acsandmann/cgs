@@ -530,11 +530,12 @@ impl RecorderButton {
         let (font, color) = if modifiers.is_some() {
             (
                 NSFont::systemFontOfSize_weight(14., unsafe { NSFontWeightMedium }),
-                NSColor::labelColor().colorWithAlphaComponent(0.82),
+                NSColor::labelColor(),
             )
         } else {
             (NSFont::systemFontOfSize(12.5), NSColor::secondaryLabelColor())
         };
+        self.setAlphaValue(if modifiers.is_some() { 0.8 } else { 1.0 });
         unsafe {
             text.addAttribute_value_range(NSFontAttributeName, &font, range);
             text.addAttribute_value_range(NSForegroundColorAttributeName, &color, range);
