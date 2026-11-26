@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use objc2::Message;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSTextField, NSView};
+use objc2_app_kit::{NSSlider, NSTextField, NSView};
 
 use crate::Ui;
 use crate::controls::{Button, Checkbox, InfoButton};
@@ -27,6 +27,8 @@ impl NativeView for Badge {
 pub struct SettingsRow {
     pub(super) ui: Ui,
     title: String,
+    pub(super) title_label: Rc<WrappingLabel>,
+    pub(super) fill_slider: Option<Retained<NSSlider>>,
     grid: OnceCell<Grid>,
     pub(super) label: Rc<dyn NativeView>,
     value: VStack,
@@ -71,6 +73,8 @@ impl SettingsRow {
             ui: *ui,
             title: title.to_owned(),
             grid: OnceCell::new(),
+            title_label: label.clone(),
+            fill_slider: None,
             label,
             value,
             line: OnceCell::new(),
@@ -79,6 +83,12 @@ impl SettingsRow {
             wide: false,
             baseline: None,
         }
+    }
+
+    /// Let this slider stretch in an aligned form.
+    pub fn stretch_slider(mut self, slider: &NSSlider) -> Self {
+        self.fill_slider = Some(slider.retain());
+        self
     }
 
     /// Line the label up with `view`’s first baseline, rather than centering it on the

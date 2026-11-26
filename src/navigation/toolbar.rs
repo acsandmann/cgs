@@ -461,20 +461,13 @@ impl Toolbar {
             frame.size.width = (frame.size.width + 12.0).max(80.0);
             popup.setFrame(frame);
         }
-        let index = self
-            .native
-            .items()
-            .iter()
-            .position(|item| item.itemIdentifier().to_string() == "cgs.page-menu");
+        let menu_id = NSString::from_str("cgs.page-menu");
+        let items = self.native.items();
+        let index = items.iter().position(|item| item.itemIdentifier() == menu_id);
         if has_menu && index.is_none() {
-            self.native.insertItemWithItemIdentifier_atIndex(
-                &NSString::from_str("cgs.page-menu"),
-                self.native.items().len() as isize,
-            );
-        } else if !has_menu {
-            if let Some(index) = index {
-                self.native.removeItemAtIndex(index as isize);
-            }
+            self.native.insertItemWithItemIdentifier_atIndex(&menu_id, items.len() as isize);
+        } else if !has_menu && let Some(index) = index {
+            self.native.removeItemAtIndex(index as isize);
         }
     }
 

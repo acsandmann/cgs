@@ -94,3 +94,21 @@ impl<T: NativeControl> NativeView for Validated<T> {
 impl<T: NativeControl> NativeControl for Validated<T> {
     fn ns_control(&self) -> &objc2_app_kit::NSControl { self.input.ns_control() }
 }
+
+/// Apply a projected model value only when it changes and the control is live.
+pub fn observe<C: NativeView, M: 'static, V: PartialEq + 'static>(
+    control: &std::rc::Rc<C>,
+    project: impl Fn(&M) -> V + 'static,
+    apply: impl Fn(&C, &V) + 'static,
+) -> impl Fn(&M) + 'static {
+    let control = std::rc::Rc::downgrade(control);
+    let last = std::cell::RefCell::new(None);
+    move |model| {
+        let Some(control) = control.upgrade() else { return };
+        let value = project(model);
+        if last.borrow().as_ref() != Some(&value) {
+            apply(&control, &value);
+            last.replace(Some(value));
+        }
+    }
+}

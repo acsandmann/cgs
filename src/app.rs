@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
+
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -123,4 +126,33 @@ impl Clipboard {
             .stringForType(unsafe { NSPasteboardTypeString })
             .map(|s| s.to_string())
     }
+}
+
+/// Main-thread cache for application icons used by views. Treat returned images
+/// as read-only and clear the cache when the installed application inventory changes.
+#[derive(Default)]
+pub struct ApplicationIcons(RefCell<VecDeque<(String, Option<Image>)>>);
+
+impl ApplicationIcons {
+    pub fn get(&self, bundle_id: &str) -> Option<Image> {
+        const CAPACITY: usize = 64;
+        {
+            let mut entries = self.0.borrow_mut();
+            if let Some(index) = entries.iter().position(|(key, _)| key == bundle_id) {
+                let entry = entries.remove(index).unwrap();
+                let icon = entry.1.clone();
+                entries.push_back(entry);
+                return icon;
+            }
+        }
+        let icon = Application::icon_for_bundle(bundle_id);
+        let mut entries = self.0.borrow_mut();
+        if entries.len() == CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((bundle_id.to_owned(), icon.clone()));
+        icon
+    }
+
+    pub fn clear(&self) { self.0.borrow_mut().clear(); }
 }

@@ -184,6 +184,29 @@ pub struct NumberSlider {
     stack: HStack,
 }
 impl NumberSlider {
+    /// Show a tracked value in the exact field and save it once tracking ends.
+    /// The sample callback can normalize the value or update a live preview.
+    pub fn track(
+        ui: &Ui,
+        slider: Slider,
+        field: &std::rc::Rc<NumberField>,
+        mut sample: impl FnMut(f64, bool) -> Option<f64> + 'static,
+        mut commit: impl FnMut(f64) + 'static,
+    ) -> Slider {
+        let field = std::rc::Rc::downgrade(field);
+        let app = crate::app::Application::shared(ui);
+        slider.on_change(move |value| {
+            let dragging = app.is_mouse_dragging();
+            let Some(value) = sample(value, dragging) else { return };
+            if let Some(field) = field.upgrade() {
+                field.set_value(value);
+            }
+            if !dragging {
+                commit(value);
+            }
+        })
+    }
+
     pub fn new(ui: &Ui, slider: std::rc::Rc<Slider>, field: std::rc::Rc<NumberField>) -> Self {
         field.hide_stepper();
         Self {

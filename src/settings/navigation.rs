@@ -1,12 +1,47 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use objc2::rc::{Retained, Weak};
 use objc2_app_kit::*;
 use objc2_foundation::{NSArray, NSString};
 
-use crate::view::{NativeControl, NativeView};
-use crate::{CGSize, Ui};
+use crate::collection::Table;
+use crate::input::SearchField;
+use crate::layout::{VStack, uniform_insets};
+use crate::text::{Caption, Label, SubsectionTitle};
+use crate::view::{NativeControl, NativeView, PageHost, View};
+use crate::{CGSize, Insets, Ui};
+
+/// Back and forward history for typed settings destinations.
+pub struct SettingsHistory<T> {
+    destinations: Vec<T>,
+    index: usize,
+}
+
+impl<T: Copy + PartialEq> SettingsHistory<T> {
+    pub fn new(initial: T) -> Self { Self { destinations: vec![initial], index: 0 } }
+
+    pub fn current(&self) -> T { self.destinations[self.index] }
+
+    pub fn navigate(&mut self, destination: T) {
+        if destination != self.current() {
+            self.destinations.truncate(self.index + 1);
+            self.destinations.push(destination);
+            self.index += 1;
+        }
+    }
+
+    pub fn step(&mut self, offset: isize) -> Option<T> {
+        let index = self.index.checked_add_signed(offset)?;
+        let destination = *self.destinations.get(index)?;
+        self.index = index;
+        Some(destination)
+    }
+
+    pub fn can_go_back(&self) -> bool { self.index > 0 }
+
+    pub fn can_go_forward(&self) -> bool { self.index + 1 < self.destinations.len() }
+}
 
 /// A muted badge color for a destination in a settings sidebar.
 #[derive(Clone, Copy)]
@@ -282,4 +317,135 @@ pub fn settings_sidebar_pane(
         .push(content);
     let background = crate::view::View::settings_color(ui, 1).safe_area_content(pane);
     background
+}
+
+
+/// A grouped result displayed in the settings sidebar.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SettingsSearchRow<T> {
+    Heading(&'static str),
+    Setting { destination: T, title: &'static str, description: &'static str },
+}
+
+struct SettingsSearchCell {
+    content: VStack,
+    heading: Option<Rc<SubsectionTitle>>,
+    result: Option<(Rc<Label>, Rc<Caption>)>,
+}
+
+impl SettingsSearchCell {
+    fn new(ui: &Ui, is_heading: bool) -> Self {
+        let content = VStack::new(ui).spacing(3.0).insets(Insets {
+            top: 6.0,
+            left: 12.0,
+            bottom: 6.0,
+            right: 12.0,
+        });
+        if is_heading {
+            let heading = Rc::new(SubsectionTitle::new(ui, ""));
+            content.add(heading.clone());
+            Self { content, heading: Some(heading), result: None }
+        } else {
+            let label = Rc::new(Label::new(ui, ""));
+            let caption = Rc::new(Caption::new(ui, "").max_lines(2));
+            content.add(label.clone());
+            content.add(caption.clone());
+            Self { content, heading: None, result: Some((label, caption)) }
+        }
+    }
+}
+
+impl NativeView for SettingsSearchCell {
+    fn ns_view(&self) -> &NSView { self.content.ns_view() }
+}
+
+/// Replace the settings navigation with grouped results while searching.
+/// The first destination returned by the lookup is opened when Return is pressed.
+pub fn searchable_settings_sidebar<T: Copy + PartialEq + 'static>(
+    ui: Ui,
+    sidebar: Rc<impl NativeView>,
+    lookup: impl Fn(&str) -> (Option<T>, Vec<SettingsSearchRow<T>>) + 'static,
+    key: impl Fn(T) -> usize + 'static,
+    open: impl Fn(T) + 'static,
+) -> View {
+    let content = Rc::new(PageHost::new(&ui));
+    content.set_cached_page(sidebar.clone());
+    let open = Rc::new(open);
+    let mut results = None;
+    let mut empty = None;
+    let first = Rc::new(Cell::new(None::<T>));
+    let top = first.clone();
+    let open_results = open.clone();
+    let weak_content = Rc::downgrade(&content);
+    let search = SearchField::new(&ui)
+        .placeholder("Search")
+        .on_change(move |query| {
+            let Some(content) = weak_content.upgrade() else {
+                return;
+            };
+            let (first, rows) = lookup(&query);
+            top.set(first);
+            if rows.is_empty() {
+                content.set_cached_page(if query.trim().is_empty() {
+                    sidebar.clone()
+                } else {
+                    empty
+                        .get_or_insert_with(|| {
+                            Rc::new(
+                                VStack::new(&ui)
+                                    .insets(uniform_insets(12.0))
+                                    .push(Caption::new(&ui, "No matching settings")),
+                            )
+                        })
+                        .clone()
+                });
+                return;
+            }
+            let results = results.get_or_insert_with(|| {
+                let pick = open_results.clone();
+                Rc::new(
+                    Table::new(&ui)
+                        .source_list()
+                        .column("setting", "", 0.0)
+                        .reusable_cells(
+                        |row: &SettingsSearchRow<T>, _| usize::from(matches!(row, SettingsSearchRow::Heading(_))),
+                        |ui, _, kind| SettingsSearchCell::new(ui, kind == 1),
+                        |cell, row, _, _| match row {
+                            SettingsSearchRow::Heading(title) => cell.heading.as_ref().unwrap().set_text(title),
+                            SettingsSearchRow::Setting { title, description, .. } => {
+                                let (label, caption) = cell.result.as_ref().unwrap();
+                                label.set_text(title);
+                                caption.set_text(description);
+                            }
+                        },
+                    )
+                    .group_rows(|row| matches!(row, SettingsSearchRow::Heading(_)))
+                        .selectable(|row| matches!(row, SettingsSearchRow::Setting { .. }))
+                        .row_heights(|row| {
+                            if matches!(row, SettingsSearchRow::Heading(_)) {
+                                30.0
+                            } else {
+                                54.0
+                            }
+                        })
+                        .on_select_item(move |row| {
+                            if let Some(SettingsSearchRow::Setting { destination, .. }) = row {
+                                pick(destination);
+                            }
+                        }),
+                )
+            });
+            results.set_keyed_rows(rows, |row| match *row {
+                SettingsSearchRow::Heading(title) => Ok(title),
+                SettingsSearchRow::Setting { destination, .. } => Err(key(destination)),
+            });
+            results.scroll_to(0);
+            content.set_cached_page(results.clone());
+        })
+        .on_commit(move |_| {
+            if let Some(entry) = first.get() {
+                open(entry);
+            }
+        });
+    settings_sidebar_pane(&ui, search, content)
 }

@@ -102,9 +102,9 @@ impl PageHost {
                 view.leadingAnchor().constraintEqualToAnchor(&parent.leadingAnchor()),
                 view.trailingAnchor().constraintEqualToAnchor(&parent.trailingAnchor()),
             ];
-            for edge in &edges {
-                edge.setActive(true);
-            }
+            objc2_app_kit::NSLayoutConstraint::activateConstraints(
+                &objc2_foundation::NSArray::from_retained_slice(&edges),
+            );
             *constraints.borrow_mut() = edges;
             return;
         }
@@ -164,49 +164,65 @@ impl PageHost {
     /// Scroll to and focus the visible control labelled `title`, preferring one inside the
     /// section headed `section`. Parked pages are hidden and never match.
     pub fn reveal(&self, section: &str, title: &str) {
-        use objc2_app_kit::{NSAccessibility, NSTextField};
-        fn find(view: &NSView, title: &str, labels: bool) -> Option<Retained<NSView>> {
+        self.reveal_setting(section, title, None);
+    }
+
+    /// Reveal an identified control, falling back to the visible setting title.
+    pub fn reveal_setting(&self, section: &str, title: &str, identifier: Option<&str>) {
+        use objc2_app_kit::{NSAccessibility, NSTextField, NSUserInterfaceItemIdentification};
+        use objc2_foundation::NSString;
+
+        fn labelled(view: &NSView, title: &str, text_fields: bool) -> bool {
+            view.accessibilityLabel().is_some_and(|name| {
+                let name = name.to_string();
+                name == title || name.strip_prefix(title).is_some_and(|rest| rest.starts_with(" ("))
+            }) || (text_fields && view.downcast_ref::<NSTextField>()
+                .is_some_and(|field| field.stringValue().to_string() == title))
+        }
+        fn find(view: &NSView, matches: &impl Fn(&NSView) -> bool) -> Option<Retained<NSView>> {
             if view.isHidden() {
                 return None;
             }
-            if let Some(control) = view.downcast_ref::<NSControl>() {
-                let name = control.accessibilityLabel().map(|value| value.to_string());
-                let matches = name
-                    .as_deref()
-                    .is_some_and(|name| name == title || name.starts_with(&format!("{title} (")))
-                    || (labels
-                        && view
-                            .downcast_ref::<NSTextField>()
-                            .is_some_and(|field| field.stringValue().to_string() == title));
-                if matches {
-                    return Some(view.retain());
+            if matches(view) {
+                return Some(view.retain());
+            }
+            view.subviews().iter().find_map(|child| find(&child, matches))
+        }
+        let identifier = identifier.map(NSString::from_str);
+        let identified = |view: &NSView| identifier.as_ref().is_some_and(|id| {
+            view.identifier().as_deref() == Some(id)
+        });
+        let control = |view: &NSView| view.downcast_ref::<NSControl>().is_some();
+        let title_control = |view: &NSView| control(view) && labelled(view, title, false);
+        let title_label = |view: &NSView| control(view) && labelled(view, title, true);
+        let reveal = |scope: &NSView| {
+            if identifier.is_some() {
+                crate::layout::reveal_disclosures(scope, &identified);
+                if let Some(view) = find(scope, &identified) {
+                    return find(&view, &title_control).or(Some(view));
                 }
             }
-            view.subviews().iter().find_map(|child| find(&child, title, labels))
-        }
+            crate::layout::reveal_disclosures(scope, &|view| labelled(view, title, true));
+            find(scope, &title_control).or_else(|| find(scope, &title_label))
+        };
         let root = self.view.ns_view();
         root.layoutSubtreeIfNeeded();
         // A disclosure or composite header may wrap its title separately from
         // its controls. Walk out to the nearest containing section before falling
         // back to the whole visible page.
-        let heading = find(root, section, true);
+        let heading = find(root, &|view| control(view) && labelled(view, section, true));
         let mut scope = heading.as_ref().and_then(|heading| unsafe { heading.superview() });
         let mut target = None;
         while let Some(parent) = scope {
-            crate::layout::reveal_disclosures(&parent, title);
-            target = find(&parent, title, false).or_else(|| find(&parent, title, true));
+            target = reveal(&parent);
             if target.is_some() || std::ptr::eq(&*parent, root) {
                 break;
             }
             scope = unsafe { parent.superview() };
         }
-        if target.is_none() {
-            crate::layout::reveal_disclosures(root, title);
-        }
+        let target = target.or_else(|| reveal(root));
         root.layoutSubtreeIfNeeded();
-        let Some(view) =
-            target.or_else(|| find(root, title, false)).or_else(|| find(root, title, true))
-        else {
+        let Some(view) = target else {
             // A setting edited elsewhere, such as in a sheet: show the section that opens it.
             if let Some(heading) = heading {
                 heading.scrollRectToVisible(heading.bounds());

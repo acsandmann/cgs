@@ -12,7 +12,7 @@ use crate::bridge::{DelegateBridge, Event};
 use crate::settings::Validation;
 use crate::view::{NativeControl, NativeView};
 
-type TextCallback = Box<dyn FnMut(String)>;
+type TextCallback = Box<dyn FnMut(Retained<NSString>)>;
 type TextCallbacks = Rc<RefCell<[Option<TextCallback>; 2]>>;
 
 define_class!(
@@ -134,7 +134,7 @@ macro_rules! text_input {
                 }
             }
 
-            fn listen(mut self, event: Event, f: impl FnMut(String) + 'static) -> Self {
+            fn listen(mut self, event: Event, f: impl FnMut(Retained<NSString>) + 'static) -> Self {
                 let index = usize::from(event == Event::TextCommitted);
                 self.callbacks.borrow_mut()[index] = Some(Box::new(f));
                 if self.delegate.is_none() {
@@ -149,7 +149,7 @@ macro_rules! text_input {
                             if let Some(control) = sender.downcast_ref::<$native>() {
                                 if let Ok(mut callbacks) = callbacks.try_borrow_mut() {
                                     if let Some(f) = callbacks[index].as_mut() {
-                                        f(control.stringValue().to_string());
+                                        f(control.stringValue());
                                     }
                                 }
                             }
@@ -162,12 +162,12 @@ macro_rules! text_input {
                 self
             }
 
-            pub fn on_change(self, f: impl FnMut(String) + 'static) -> Self {
-                self.listen(Event::TextChanged, f)
+            pub fn on_change(self, mut f: impl FnMut(String) + 'static) -> Self {
+                self.listen(Event::TextChanged, move |text| f(text.to_string()))
             }
 
-            pub fn on_commit(self, f: impl FnMut(String) + 'static) -> Self {
-                self.listen(Event::TextCommitted, f)
+            pub fn on_commit(self, mut f: impl FnMut(String) + 'static) -> Self {
+                self.listen(Event::TextCommitted, move |text| f(text.to_string()))
             }
 
             pub fn set_validation(&self, validation: &Validation) {
@@ -187,6 +187,14 @@ macro_rules! text_input {
 }
 text_input!(TextField, NSTextField, ns_text_field, natural_text_field);
 impl TextField {
+    pub(crate) fn on_native_edit(
+        self,
+        event: Event,
+        mut f: impl FnMut(&NSString) + 'static,
+    ) -> Self {
+        self.listen(event, move |text| f(&text))
+    }
+
     pub fn with_validation(self, ui: &Ui) -> crate::settings::Validated<Self> {
         crate::settings::Validated::new(ui, self)
     }

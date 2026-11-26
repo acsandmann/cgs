@@ -1,4 +1,8 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 
 use objc2::rc::{Retained, Weak};
@@ -7,7 +11,7 @@ use objc2::{DefinedClass, MainThreadOnly};
 use objc2_app_kit::*;
 use objc2_foundation::{NSArray, NSIndexSet, NSString};
 
-use super::bridge::{CollectionBridge, Selection, drag_type};
+use super::bridge::{CollectionBridge, CollectionCell, Selection, drag_type};
 use crate::Ui;
 use crate::bridge::ActionTarget;
 use crate::collection::SettingsList;
@@ -90,24 +94,110 @@ impl<T: 'static> Table<T> {
         if prefix == old_end && prefix == new_end {
             return;
         }
+        self.replace_span(rows, prefix..old_end, prefix..new_end);
+    }
+
+    /// Reconcile unique row identities and preserve the selected identity.
+    /// Multi-span structural changes fall back to a native reload. Use stable keys
+    /// independent of display labels, and a reusable cell factory for recycled content.
+    pub fn set_keyed_rows<K: Eq + Hash>(
+        &self,
+        rows: Vec<T>,
+        key: impl Fn(&T) -> K,
+    )
+    where T: PartialEq {
+        let old = self.rows.borrow();
+        let old_keys: Vec<_> = old.iter().map(&key).collect();
+        let new_keys: Vec<_> = rows.iter().map(&key).collect();
+        if old_keys == new_keys && *old == rows {
+            return;
+        }
+        let positions: HashMap<_, _> = old_keys.iter().enumerate().map(|(i, id)| (id, i)).collect();
+        let next_positions: HashMap<_, _> =
+            new_keys.iter().enumerate().map(|(i, id)| (id, i)).collect();
+        let unique = positions.len() == old.len() && next_positions.len() == rows.len();
+        let selected = unique.then(|| self.selection()).flatten()
+            .and_then(|index| old_keys.get(index))
+            .and_then(|id| next_positions.get(id).copied());
+        let prefix = old_keys.iter().zip(&new_keys).take_while(|(a, b)| a == b).count();
+        let suffix = old_keys[prefix..].iter().rev().zip(new_keys[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b).count();
+        let old_end = old.len() - suffix;
+        let new_end = rows.len() - suffix;
+        let mut changed = Vec::new();
+        if unique {
+            changed.extend(new_keys.iter().zip(&rows).enumerate().filter_map(|(index, (id, row))| {
+                let before = *positions.get(id)?;
+                (&old[before] != row).then_some(index)
+            }));
+        }
+        let moved = if old_keys.len() == new_keys.len() && old_end - prefix > 1 {
+            if old_keys[prefix] == new_keys[old_end - 1]
+                && old_keys[prefix + 1..old_end] == new_keys[prefix..old_end - 1]
+            {
+                Some((prefix, old_end - 1))
+            } else if old_keys[old_end - 1] == new_keys[prefix]
+                && old_keys[prefix..old_end - 1] == new_keys[prefix + 1..old_end]
+            {
+                Some((old_end - 1, prefix))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(old);
+        // Selection callbacks are suppressed for the batch and the final restoration.
+        let _selection = self.bridge.ivars().selection.try_borrow_mut().ok();
+        if !unique {
+            self.set_rows(rows);
+            return;
+        }
+        if prefix == old_end || prefix == new_end {
+            self.replace_span(rows, prefix..old_end, prefix..new_end);
+        } else if let Some((from, to)) = moved {
+            let _ = self.native.numberOfRows();
+            self.native.beginUpdates();
+            *self.rows.borrow_mut() = rows;
+            self.native.moveRowAtIndex_toIndex(from as isize, to as isize);
+            self.native.endUpdates();
+        } else {
+            self.set_rows(rows);
+            changed.clear();
+        }
+        if !changed.is_empty() {
+            let indexes = objc2_foundation::NSMutableIndexSet::new();
+            for row in changed {
+                indexes.addIndex(row);
+            }
+            if self.bridge.ivars().row_height.borrow().is_some() {
+                self.native.noteHeightOfRowsWithIndexesChanged(&indexes);
+            }
+            let columns = NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(
+                0, self.native.numberOfColumns() as usize,
+            ));
+            self.native.reloadDataForRowIndexes_columnIndexes(&indexes, &columns);
+        }
+        self.set_selected(selected);
+    }
+
+    fn replace_span(&self, rows: Vec<T>, old: Range<usize>, new: Range<usize>) {
+        if old.is_empty() && new.is_empty() {
+            *self.rows.borrow_mut() = rows;
+            return;
+        }
         let _ = self.native.numberOfRows();
         self.native.beginUpdates();
         *self.rows.borrow_mut() = rows;
-        if old_end > prefix {
+        if !old.is_empty() {
             self.native.removeRowsAtIndexes_withAnimation(
-                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(
-                    prefix,
-                    old_end - prefix,
-                )),
+                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(old.start, old.len())),
                 NSTableViewAnimationOptions::EffectNone,
             );
         }
-        if new_end > prefix {
+        if !new.is_empty() {
             self.native.insertRowsAtIndexes_withAnimation(
-                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(
-                    prefix,
-                    new_end - prefix,
-                )),
+                &NSIndexSet::indexSetWithIndexesInRange(objc2_foundation::NSRange::new(new.start, new.len())),
                 NSTableViewAnimationOptions::EffectNone,
             );
         }
@@ -139,6 +229,36 @@ impl<T: 'static> Table<T> {
         *self.bridge.ivars().native_cell.borrow_mut() = None;
         *self.bridge.ivars().cell.borrow_mut() =
             Box::new(move |row, column| f(&rows.borrow()[row], column, row));
+        self.bridge.reload(&self.native);
+        self
+    }
+
+    /// Reuse cell content across rows of the same kind and column.
+    /// Binding must reset item-specific presentation and update any callback target.
+    pub fn reusable_cells<C: NativeView>(
+        self,
+        kind: impl Fn(&T, usize) -> usize + 'static,
+        mut construct: impl FnMut(&Ui, usize, usize) -> C + 'static,
+        mut bind: impl FnMut(&C, &T, usize, usize) + 'static,
+    ) -> Self {
+        static NEXT_FACTORY: AtomicUsize = AtomicUsize::new(0);
+        let factory = NEXT_FACTORY.fetch_add(1, Ordering::Relaxed);
+        let rows = self.rows.clone();
+        let mut identifiers = HashMap::new();
+        *self.bridge.ivars().native_cell.borrow_mut() = Some(Box::new(move |table, row, column| {
+            let rows = rows.borrow();
+            let item = &rows[row];
+            let kind = kind(item, column);
+            let identifier = identifiers.entry((column, kind)).or_insert_with(|| {
+                NSString::from_str(&format!("cgs.reusable.{factory}.{column}.{kind}"))
+            });
+            let cell = CollectionCell::dequeue(table, identifier);
+            cell.configure(
+                || construct(&Ui::new(table.mtm()), column, kind),
+                |cell| bind(cell, item, column, row),
+            );
+            cell.into_super().into_super()
+        }));
         self.bridge.reload(&self.native);
         self
     }
@@ -333,10 +453,13 @@ impl<T: 'static> Drop for Table<T> {
 pub struct List<T: 'static>(Table<T>);
 impl<T: 'static> List<T> {
     pub fn new(ui: &Ui, label: impl Fn(&T) -> String + 'static) -> Self {
-        let ui_copy = *ui;
         let table = Table::new(ui)
             .column("item", "", 240.0)
-            .cells(move |item, _| Box::new(Label::new(&ui_copy, &label(item))));
+            .reusable_cells(
+                |_, _| 0,
+                |ui, _, _| Label::new(ui, ""),
+                move |cell, item, _, _| cell.set_text(&label(item)),
+            );
         table.native.setHeaderView(None);
         Self(table)
     }
@@ -446,6 +569,17 @@ impl<T: 'static> EditableList<T> {
             }
         });
         self
+    }
+
+    pub fn on_remove_item(self, mut remove: impl FnMut(usize, T) + 'static) -> Self
+    where T: Clone {
+        let rows = self.list.rows.clone();
+        self.on_remove(move |index| {
+            let item = rows.borrow().get(index).cloned();
+            if let Some(item) = item {
+                remove(index, item);
+            }
+        })
     }
 
     pub fn on_select(self, f: impl FnMut(Option<usize>) + 'static) -> Self {

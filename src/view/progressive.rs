@@ -78,8 +78,7 @@ impl BlurView {
 /// A mouse-transparent, full-width backdrop. No snapshots or image work while scrolling.
 pub(crate) struct ProgressiveBlur {
     native: Retained<BlurView>,
-    stop: Cell<f64>,
-    scale: Cell<f64>,
+    last_update: Cell<Option<(CGRect, f64, f64, f64)>>,
 }
 impl ProgressiveBlur {
     pub(crate) fn new(ui: &Ui) -> Self {
@@ -100,26 +99,50 @@ impl ProgressiveBlur {
             root.addSublayer(&native.ivars().tint);
         }
         native.update_tint();
-        Self { native, stop: Cell::new(-1.0), scale: Cell::new(0.0) }
+        Self { native, last_update: Cell::new(None) }
     }
 
     pub(crate) fn ns_view(&self) -> &NSView { &self.native }
 
     pub(crate) fn update(&self, frame: CGRect, header: f64, amount: f64, scale: f64) {
-        let _tx = LayerTransaction::disabled();
-        if self.native.frame() != frame { self.native.setFrame(frame); }
-        let bounds = CGRect::new(CGPoint::ZERO, frame.size);
-        if let Some(backdrop) = &self.native.ivars().backdrop {
-            if backdrop.frame() != bounds { backdrop.setFrame(bounds); }
-            if self.scale.replace(scale) != scale { backdrop_scale(backdrop, scale); }
-        }
-        if self.native.ivars().tint.frame() != bounds { self.native.ivars().tint.setFrame(bounds); }
         let stop = (header / frame.size.height).clamp(0.0, 0.95);
-        if self.stop.replace(stop) != stop {
+        let current = (frame, stop, amount, scale);
+        let previous = self.last_update.replace(Some(current));
+        if previous == Some(current) {
+            return;
+        }
+        let _tx = LayerTransaction::disabled();
+        if previous.is_none_or(|(old, _, _, _)| old != frame) {
+            if self.native.frame() != frame {
+                self.native.setFrame(frame);
+            }
+            let bounds = CGRect::new(CGPoint::ZERO, frame.size);
+            if let Some(backdrop) = &self.native.ivars().backdrop
+                && backdrop.frame() != bounds
+            {
+                backdrop.setFrame(bounds);
+            }
+            let tint = &self.native.ivars().tint;
+            if tint.frame() != bounds {
+                tint.setFrame(bounds);
+            }
+        }
+        if let Some(backdrop) = &self.native.ivars().backdrop
+            && previous.is_none_or(|(_, _, _, old)| old != scale)
+        {
+            backdrop_scale(backdrop, scale);
+        }
+        if previous.is_none_or(|(_, old, _, _)| old != stop) {
             let locations = [0.0, stop, 1.0].map(NSNumber::new_f64);
             self.native.ivars().tint.setLocations(Some(&NSArray::from_retained_slice(&locations)));
         }
-        self.native.setHidden(amount <= 0.0);
-        if self.native.alphaValue() != amount { self.native.setAlphaValue(amount); }
+        if previous.is_none_or(|(_, _, old, _)| old != amount) {
+            if self.native.isHidden() != (amount <= 0.0) {
+                self.native.setHidden(amount <= 0.0);
+            }
+            if self.native.alphaValue() != amount {
+                self.native.setAlphaValue(amount);
+            }
+        }
     }
 }

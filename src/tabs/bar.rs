@@ -3,6 +3,7 @@
 //! at https://github.com/ZimengXiong/tabbed/tree/9481b628767921bd1af1b90c4d7448282c9757b6/Sources/UI.
 //! Adaptive native material and semantic colors follow the system appearance.
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
@@ -65,6 +66,7 @@ struct ActionState {
 }
 type Action = Rc<ActionState>;
 struct Tab {
+    id: Option<u64>,
     select: Button,
     close: Button,
     title: String,
@@ -1205,27 +1207,42 @@ impl TabBar {
     }
 
     pub fn set_tabs(&self, items: Vec<TabBarItem>, selected: usize) {
+        self.reconcile_tabs(items, selected, |_| None, |item| item, |item| item);
+    }
+
+    /// Update tabs using stable, unique IDs. Callbacks still report current positions.
+    pub fn set_keyed_tabs(&self, items: Vec<(u64, TabBarItem)>, selected: usize) {
+        self.reconcile_tabs(items, selected, |(id, _)| Some(*id), |(_, item)| item, |(_, item)| item);
+    }
+
+    fn reconcile_tabs<T>(
+        &self,
+        items: Vec<T>,
+        selected: usize,
+        key: impl Fn(&T) -> Option<u64>,
+        item_ref: impl Fn(&T) -> &TabBarItem,
+        into_item: impl Fn(T) -> TabBarItem,
+    ) {
         let s = self.content.ivars();
-        {
-            let tabs = s.tabs.borrow();
-            if tabs.len() == items.len()
-                && tabs
-                    .iter()
-                    .zip(&items)
-                    .all(|(tab, item)| tab.title == item.title && tab.icon == item.icon)
-            {
-                drop(tabs);
-                self.set_selected_index(selected);
-                return;
-            }
+        let tabs = s.tabs.borrow();
+        let same_order = tabs.len() == items.len()
+            && tabs.iter().zip(&items).all(|(tab, item)| tab.id == key(item));
+        if same_order && tabs.iter().zip(&items).all(|(tab, item)| {
+            let item = item_ref(item);
+            tab.title == item.title && tab.icon == item.icon
+        }) {
+            drop(tabs);
+            self.set_selected_index(selected);
+            return;
         }
-        // A held or landing tab keeps its place through relabelling, such as a terminal's
-        // animated title. Only a change in the tabs themselves ends the drag.
+        drop(tabs);
+        // A held or landing tab keeps its place through relabelling. Membership
+        // changes end the drag so its index-based gesture can't move another tab.
         let held = s.drag.get().is_some() || s.lifting.get().is_some();
-        if held && s.tabs.borrow().len() == items.len() {
+        if held && same_order {
             let mut tabs = s.tabs.borrow_mut();
             for (tab, item) in tabs.iter_mut().zip(items) {
-                self.update_item(tab, item);
+                self.update_item(tab, into_item(item));
             }
             drop(tabs);
             self.set_selected_index(selected);
@@ -1239,24 +1256,30 @@ impl TabBar {
         }
         let mut tabs = s.tabs.borrow_mut();
         let mut old: Vec<_> = tabs.drain(..).map(Some).collect();
+        let mut by_id = HashMap::new();
+        for (index, tab) in old.iter().enumerate() {
+            if let Some(id) = tab.as_ref().and_then(|tab| tab.id) {
+                by_id.entry(id).or_insert(index);
+            }
+        }
         let mut first_remaining = 0;
         for (i, item) in items.into_iter().enumerate() {
-            while first_remaining < old.len() && old[first_remaining].is_none() {
-                first_remaining += 1;
-            }
-            let existing = old[first_remaining..]
-                .iter()
-                .position(|tab| {
-                    tab.as_ref().is_some_and(|tab| tab.title == item.title && tab.icon == item.icon)
-                })
-                .map(|index| first_remaining + index);
-            if let Some(tab) = existing.and_then(|index| old[index].take()).or_else(|| {
-                if !count_changed {
-                    old.get_mut(i).and_then(Option::take)
-                } else {
-                    None
+            let id = key(&item);
+            let item = into_item(item);
+            let existing = if let Some(id) = id {
+                by_id.remove(&id)
+            } else {
+                while first_remaining < old.len() && old[first_remaining].is_none() {
+                    first_remaining += 1;
                 }
-            }) {
+                old[first_remaining..].iter()
+                    .position(|tab| tab.as_ref().is_some_and(|tab| {
+                        tab.id.is_none() && tab.title == item.title && tab.icon == item.icon
+                    }))
+                    .map(|index| first_remaining + index)
+                    .or_else(|| (!count_changed && old[i].as_ref().is_some_and(|tab| tab.id.is_none())).then_some(i))
+            };
+            if let Some(tab) = existing.and_then(|index| old[index].take()) {
                 tabs.push(tab);
             }
             if i == tabs.len() {
@@ -1311,6 +1334,7 @@ impl TabBar {
                 s.viewport.addSubview(select.ns_view());
                 s.viewport.addSubview(close.ns_view());
                 tabs.push(Tab {
+                    id,
                     select,
                     close,
                     title: String::new(),

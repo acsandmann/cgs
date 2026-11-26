@@ -7,7 +7,7 @@ use objc2_app_kit::*;
 use objc2_foundation::{NSNumber, NSNumberFormatter, NSNumberFormatterStyle, NSString};
 
 use crate::Ui;
-use crate::bridge::ActionTarget;
+use crate::bridge::{ActionTarget, Event};
 use crate::layout::HStack;
 use crate::view::{NativeControl, NativeView};
 
@@ -231,36 +231,28 @@ impl NumberField {
         formatted_number(&self.formatter, &self.field.ns_text_field().stringValue())
     }
 
-    pub fn on_change(mut self, mut f: impl FnMut(f64) + 'static) -> Self {
-        self.changed.borrow_mut()[1] = Some(Box::new(move |value| {
-            if let Some(value) = value {
-                f(value);
-            }
-        }));
-        let (formatter, changed) = (self.formatter.clone(), self.changed.clone());
-        self.field = self.field.on_commit(move |text| {
-            if let Some(value) = formatted_number(&formatter, &NSString::from_str(&text)) {
-                if let Some(f) = changed.borrow_mut()[1].as_mut() {
-                    f(Some(value));
-                }
-            }
-        });
-        self
+    pub fn on_change(self, f: impl FnMut(f64) + 'static) -> Self {
+        self.on_number_edit(Event::TextCommitted, f)
     }
 
     /// Update a local draft as valid numeric input is entered.
-    pub fn on_edit(mut self, mut f: impl FnMut(f64) + 'static) -> Self {
-        self.changed.borrow_mut()[0] = Some(Box::new(move |value| {
+    pub fn on_edit(self, f: impl FnMut(f64) + 'static) -> Self {
+        self.on_number_edit(Event::TextChanged, f)
+    }
+
+    fn on_number_edit(mut self, event: Event, mut f: impl FnMut(f64) + 'static) -> Self {
+        let index = usize::from(event == Event::TextCommitted);
+        self.changed.borrow_mut()[index] = Some(Box::new(move |value| {
             if let Some(value) = value {
                 f(value);
             }
         }));
         let (formatter, changed) = (self.formatter.clone(), self.changed.clone());
-        self.field = self.field.on_change(move |text| {
-            if let Some(value) = formatted_number(&formatter, &NSString::from_str(&text)) {
-                if let Some(f) = changed.borrow_mut()[0].as_mut() {
-                    f(Some(value));
-                }
+        self.field = self.field.on_native_edit(event, move |text| {
+            if let Some(value) = formatted_number(&formatter, text)
+                && let Some(f) = changed.borrow_mut()[index].as_mut()
+            {
+                f(Some(value));
             }
         });
         self
@@ -293,11 +285,11 @@ impl NumberField {
     pub fn on_change_optional(mut self, f: impl FnMut(Option<f64>) + 'static) -> Self {
         self.changed.borrow_mut()[1] = Some(Box::new(f));
         let (formatter, changed) = (self.formatter.clone(), self.changed.clone());
-        self.field = self.field.on_commit(move |text| {
-            let value = if text.trim().is_empty() {
+        self.field = self.field.on_native_edit(Event::TextCommitted, move |text| {
+            let value = if text.is_empty() || text.to_string().trim().is_empty() {
                 None
             } else {
-                let Some(value) = formatted_number(&formatter, &NSString::from_str(&text)) else {
+                let Some(value) = formatted_number(&formatter, text) else {
                     return;
                 };
                 Some(value)
@@ -421,4 +413,25 @@ impl NumberStepper {
 }
 impl NativeView for NumberStepper {
     fn ns_view(&self) -> &NSView { self.stack.ns_view() }
+}
+
+/// Compact fields in a row, each captioned beneath, as in an inspector.
+pub fn number_field_group(ui: &Ui, unit: &str, fields: Vec<(&str, Rc<NumberField>)>) -> HStack {
+    fields.into_iter().fold(
+        HStack::new(ui)
+            .spacing(8.0)
+            .alignment(NSLayoutAttribute::FirstBaseline),
+        |row, (name, field)| {
+            let value = field.unit_field(ui, unit);
+            field.width(crate::view::Metrics::VALUE_FIELD_WIDTH);
+            row.push(
+                crate::layout::VStack::new(ui)
+                    .spacing(3.0)
+                    .alignment(NSLayoutAttribute::CenterX)
+                    .push(value)
+                    .push(crate::text::Caption::single_line(ui, name))
+                    .keep(field),
+            )
+        },
+    )
 }

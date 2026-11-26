@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use objc2::Message;
-use objc2_app_kit::NSView;
+use objc2::rc::Weak;
+use objc2_app_kit::{NSGridCellPlacement, NSGridView, NSLayoutConstraintOrientation, NSView};
 
 use crate::layout::{Divider, Grid, GroupBox, HStack, Spacer, VStack};
 use crate::settings::SettingsRow;
@@ -123,6 +125,36 @@ impl NativeView for SettingsGroup {
     }
 }
 
+/// Share a title width across a set of preference forms.
+pub struct FormAlignment {
+    minimum: f64,
+    titles: RefCell<Vec<Weak<NSView>>>,
+    grids: RefCell<Vec<Weak<NSGridView>>>,
+}
+
+impl FormAlignment {
+    pub fn new(minimum: f64) -> Rc<Self> {
+        Rc::new(Self { minimum, titles: RefCell::default(), grids: RefCell::default() })
+    }
+
+    /// Measure just the titles once the forms have been built.
+    pub fn apply(&self) {
+        let mut titles = self.titles.borrow_mut();
+        titles.retain(|title| title.load().is_some());
+        let width = titles.iter().filter_map(Weak::load)
+            .map(|view| view.fittingSize().width)
+            .fold(self.minimum, f64::max);
+        self.grids.borrow_mut().retain(|grid| {
+            if let Some(grid) = grid.load() {
+                grid.columnAtIndex(0).setWidth(width);
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
 pub struct Section {
     ui: Ui,
     stack: VStack,
@@ -131,6 +163,7 @@ pub struct Section {
     group: Option<SettingsGroup>,
     plain: bool,
     trailing_controls: bool,
+    alignment: Option<Rc<FormAlignment>>,
 }
 impl Section {
     pub fn new(ui: &Ui, title: &str) -> Self {
@@ -158,6 +191,7 @@ impl Section {
             group: None,
             plain: false,
             trailing_controls: true,
+            alignment: None,
         }
     }
 
@@ -168,6 +202,12 @@ impl Section {
             trailing_controls: false,
             ..Self::new(ui, title)
         }
+    }
+
+    /// Register the form with a shared title column. Call before adding rows.
+    pub fn aligned(mut self, alignment: &Rc<FormAlignment>) -> Self {
+        self.alignment = Some(alignment.clone());
+        self
     }
 
     /// Align natural-width controls at the trailing edge of a plain preferences form.
@@ -200,6 +240,9 @@ impl Section {
             } else {
                 SettingsGroup::new(&self.ui)
             };
+            if let Some(alignment) = &self.alignment {
+                alignment.grids.borrow_mut().push(Weak::new(group.grid.ns_grid_view()));
+            }
             self.stack.ns_stack_view().addArrangedSubview(group.ns_view());
             group
                 .ns_view()
@@ -208,7 +251,26 @@ impl Section {
                 .setActive(true);
             group
         });
+        let row = row.into();
+        let placement = if let Some(alignment) = &self.alignment {
+            alignment.titles.borrow_mut().push(Weak::new(row.title_label.ns_view()));
+            if let Some(slider) = &row.fill_slider {
+                slider.widthAnchor().constraintGreaterThanOrEqualToConstant(140.0).setActive(true);
+                slider.setContentHuggingPriority_forOrientation(
+                    1.0, NSLayoutConstraintOrientation::Horizontal,
+                );
+                Some(NSGridCellPlacement::Fill)
+            } else {
+                Some(NSGridCellPlacement::Trailing)
+            }
+        } else {
+            None
+        };
         let group = group.row(row);
+        if let Some(placement) = placement {
+            let grid = group.grid.ns_grid_view();
+            grid.cellAtColumnIndex_rowIndex(1, grid.numberOfRows() - 1).setXPlacement(placement);
+        }
         if self.trailing_controls {
             group
                 .grid
@@ -232,4 +294,40 @@ impl Section {
 }
 impl NativeView for Section {
     fn ns_view(&self) -> &NSView { self.stack.ns_view() }
+}
+
+/// User edits to a native editable string list.
+pub enum StringListEdit {
+    Add(String),
+    Remove(usize, String),
+}
+
+/// Build the add field and native list that make up a settings string editor.
+pub fn editable_strings(
+    ui: &Ui,
+    edit: impl Fn(StringListEdit) + 'static,
+) -> (HStack, Rc<crate::collection::EditableList<String>>) {
+    use crate::collection::EditableList;
+    use crate::controls::Button;
+    use crate::input::TextField;
+
+    let edit = Rc::new(edit);
+    let field = Rc::new(TextField::new(ui).placeholder("Add an entry"));
+    let input = Rc::downgrade(&field);
+    let add_edit = edit.clone();
+    let add = Button::new(ui, "Add").on_click(move || {
+        if let Some(input) = input.upgrade() {
+            let value = input.get_value();
+            if !value.trim().is_empty() {
+                add_edit(StringListEdit::Add(value));
+                input.set_value("");
+            }
+        }
+    });
+    let list = Rc::new(
+        EditableList::new(ui, String::clone)
+            .full_length()
+            .on_remove_item(move |index, item| edit(StringListEdit::Remove(index, item))),
+    );
+    (HStack::new(ui).push(field).push(add), list)
 }

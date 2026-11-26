@@ -98,7 +98,37 @@ impl Stack {
     /// Reconcile a caller-owned list without detaching unchanged views from their window.
     /// This preserves first responders, field editors, and scroll anchors across edits.
     pub fn set_children(&self, children: Vec<impl NativeView>) {
-        let mut current: Vec<_> = self.native.arrangedSubviews().iter().collect();
+        let arranged = self.native.arrangedSubviews();
+        let prefix = arranged
+            .iter()
+            .zip(&children)
+            .take_while(|(view, child)| std::ptr::eq(&**view, child.ns_view()))
+            .count();
+        let simple_resize = prefix == arranged.len().min(children.len())
+            && children[prefix..].iter().enumerate().all(|(offset, child)| {
+                children[..prefix + offset]
+                    .iter()
+                    .all(|earlier| !std::ptr::eq(earlier.ns_view(), child.ns_view()))
+            });
+        if simple_resize {
+            for view in arranged.iter().skip(prefix) {
+                self.native.removeArrangedSubview(&view);
+                view.removeFromSuperview();
+            }
+            for child in &children[prefix..] {
+                self.native.addArrangedSubview(child.ns_view());
+                self.prepare_child(child.ns_view());
+            }
+        } else {
+            self.reconcile_children(arranged.iter().collect(), &children);
+        }
+        // A new wrapper can own callbacks even when it references the same NSView.
+        let mut owners = self.children.borrow_mut();
+        owners.clear();
+        owners.extend(children.into_iter().map(|child| Box::new(child) as Box<dyn NativeView>));
+    }
+
+    fn reconcile_children(&self, mut current: Vec<Retained<NSView>>, children: &[impl NativeView]) {
         current.retain(|view| {
             if children.iter().any(|child| std::ptr::eq(&**view, child.ns_view())) {
                 return true;
@@ -123,10 +153,6 @@ impl Stack {
             }
             current.insert(index, view.retain());
         }
-        *self.children.borrow_mut() = children
-            .into_iter()
-            .map(|child| Box::new(child) as Box<dyn NativeView>)
-            .collect();
     }
 
     pub fn clear(&self) {
@@ -432,7 +458,9 @@ impl NativeScrollView {
         let mut insets = self.contentInsets();
         let old_top = insets.top;
         let first_layout = !self.ivars().initialized.replace(true);
-        self.setAutomaticallyAdjustsContentInsets(false);
+        if self.automaticallyAdjustsContentInsets() {
+            self.setAutomaticallyAdjustsContentInsets(false);
+        }
         if first_layout || (top - old_top).abs() > 0.5 {
             let mut position = clip.bounds().origin;
             insets.top = top;
@@ -740,15 +768,9 @@ impl NativeView for Disclosure {
 
 /// Open only disclosures containing the requested setting. Native clicks run
 /// lazy-content callbacks and keep the header's accessibility state in sync.
-pub(crate) fn reveal_disclosures(view: &NSView, title: &str) {
-    fn contains(view: &NSView, title: &str) -> bool {
-        view.accessibilityLabel().is_some_and(|name| {
-            let name = name.to_string();
-            name == title || name.starts_with(&format!("{title} ("))
-        }) || view
-            .downcast_ref::<NSTextField>()
-            .is_some_and(|field| field.stringValue().to_string() == title)
-            || view.subviews().iter().any(|child| contains(&child, title))
+pub(crate) fn reveal_disclosures(view: &NSView, matches: &impl Fn(&NSView) -> bool) {
+    fn contains(view: &NSView, matches: &impl Fn(&NSView) -> bool) -> bool {
+        matches(view) || view.subviews().iter().any(|child| contains(&child, matches))
     }
     if view.isHidden() {
         return;
@@ -757,13 +779,13 @@ pub(crate) fn reveal_disclosures(view: &NSView, title: &str) {
     if let Some(header) =
         children.iter().find_map(|child| child.downcast::<DisclosureHeader>().ok())
     {
-        if children.iter().any(|child| child.isHidden() && contains(&child, title)) {
+        if children.iter().any(|child| child.isHidden() && contains(&child, matches)) {
             // The mounted disclosure owns its target and content for this call.
             unsafe { header.performClick(None) };
         }
     }
     for child in view.subviews() {
-        reveal_disclosures(&child, title);
+        reveal_disclosures(&child, matches);
     }
 }
 

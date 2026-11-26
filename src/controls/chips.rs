@@ -45,9 +45,14 @@ define_class!(
         #[unsafe(method(intrinsicContentSize))]
         fn intrinsic_size(&self) -> CGSize {
             let children = self.subviews();
-            let width = children.iter().map(|view| view.fittingSize().width).sum::<f64>()
-                + 6.0 * children.len().saturating_sub(1) as f64;
-            let widest = children.iter().map(|view| view.fittingSize().width).fold(0.0, f64::max);
+            let mut width = 0.0;
+            let mut widest: f64 = 0.0;
+            for child in &children {
+                let child_width = child.fittingSize().width;
+                width += child_width;
+                widest = widest.max(child_width);
+            }
+            width += 6.0 * children.len().saturating_sub(1) as f64;
             // A long list grows downward instead of inflating NSGridView's
             // minimum fitting width. Keep a single chip fully readable.
             let ivars = self.ivars();
@@ -76,7 +81,10 @@ define_class!(
                 let mut x = if self.ivars().trailing.get() { (available - width).max(0.0) } else { 0.0 };
                 let height = row.iter().map(|(_, size)| size.height).fold(0.0, f64::max);
                 for (child, size) in row {
-                    child.setFrame(CGRect::new(CGPoint::new(x, y), *size));
+                    let frame = CGRect::new(CGPoint::new(x, y), *size);
+                    if child.frame() != frame {
+                        child.setFrame(frame);
+                    }
                     x += size.width + 6.0;
                 }
                 y += height + 6.0;
@@ -338,7 +346,9 @@ impl ValueChips {
             .map(|chip| chip.button.ns_view().intrinsicContentSize().width)
             .fold(0.0, f64::max);
         for chip in chips.iter() {
-            chip.width.setConstant(width + room);
+            if chip.width.constant() != width + room {
+                chip.width.setConstant(width + room);
+            }
         }
         drop(chips);
         *inner.values.borrow_mut() = values.to_vec();

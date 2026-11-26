@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt;
 use std::ptr::{self, NonNull};
 
@@ -21,6 +22,7 @@ const TAG_BITSET_LEN: i32 = 64;
 const DEFAULT_SUBLEVEL: i32 = 0;
 const COMPOSITOR_WINDOW_OPTIONS: i32 = 13 | (1 << 18);
 
+#[derive(Clone)]
 #[repr(transparent)]
 pub(super) struct CFRegion(CFRetained<CFType>);
 
@@ -34,6 +36,22 @@ impl CFRegion {
 
     pub(super) fn from_rounded_rect(size: CGSize, radius: f64) -> Result<Self, CGError> {
         let radius = radius.max(0.0).min(size.width.max(0.0) / 2.0).min(size.height.max(0.0) / 2.0);
+        thread_local! {
+            static LAST: RefCell<Option<(CGSize, f64, CFRegion)>> = const { RefCell::new(None) };
+        }
+        LAST.with(|last| {
+            if let Some((_, _, region)) = last.borrow().as_ref()
+                .filter(|(old_size, old_radius, _)| *old_size == size && *old_radius == radius)
+            {
+                return Ok(region.clone());
+            }
+            let region = Self::rounded_shape(size, radius)?;
+            last.replace(Some((size, radius, region.clone())));
+            Ok(region)
+        })
+    }
+
+    fn rounded_shape(size: CGSize, radius: f64) -> Result<Self, CGError> {
         if radius == 0.0 {
             return Self::from_rect(&CGRect::new(CGPoint::new(0.0, 0.0), size));
         }

@@ -120,3 +120,41 @@ impl SettingsWindow {
         self.ns_window().center();
     }
 }
+
+/// Build a content-sized settings sheet with ordinary editor spacing and actions.
+pub fn editor_sheet(
+    ui: &Ui,
+    title: &str,
+    body: Rc<dyn NativeView>,
+    scroll_height: Option<f64>,
+    message: impl NativeView,
+    footer: impl NativeView,
+) -> crate::window::Sheet {
+    use crate::layout::{ScrollView, VStack};
+    use crate::text::SectionTitle;
+    use crate::{Insets, window::Sheet};
+
+    let body: Rc<dyn NativeView> = if let Some(height) = scroll_height {
+        let scroll = ScrollView::new(ui, body);
+        scroll.fit_width();
+        scroll.height(height);
+        Rc::new(scroll)
+    } else {
+        body
+    };
+    let content = VStack::new(ui)
+        .insets(Insets {
+            top: 24.0,
+            left: 24.0,
+            bottom: 20.0,
+            right: 24.0,
+        })
+        .spacing(16.0)
+        .push(SectionTitle::new(ui, title))
+        .push(body)
+        .push(message)
+        .push(footer);
+    let sheet = Sheet::new(ui, title, content);
+    sheet.fit_content();
+    sheet
+}

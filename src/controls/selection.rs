@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send};
@@ -477,3 +480,137 @@ impl ComboBox {
     }
 }
 native_control!(ComboBox, NSComboBox, ns_combo_box);
+
+/// A native popup with selections and badges addressed by value.
+pub struct ChoicePopup<T> {
+    popup: Popup,
+    choices: Rc<RefCell<Vec<T>>>,
+}
+
+impl<T: Clone + PartialEq + 'static> ChoicePopup<T> {
+    pub fn new(
+        ui: &Ui,
+        choices: impl IntoIterator<Item = (impl AsRef<str>, T)>,
+        mut change: impl FnMut(T) + 'static,
+    ) -> Self {
+        let values: Rc<RefCell<Vec<T>>> = Rc::default();
+        let callbacks = values.clone();
+        let popup = Popup::new(ui).on_change(move |index| {
+            let value = callbacks.borrow().get(index).cloned();
+            if let Some(value) = value {
+                change(value);
+            }
+        });
+        let control = Self { popup, choices: values };
+        control.set_sections([choices]);
+        control
+    }
+
+    pub fn set_sections<L: AsRef<str>>(
+        &self,
+        sections: impl IntoIterator<Item = impl IntoIterator<Item = (L, T)>>,
+    ) {
+        let selected = self.selected();
+        let mut values = Vec::new();
+        let labels: Vec<Vec<L>> = sections.into_iter().map(|section| {
+            section.into_iter().map(|(label, value)| {
+                values.push(value);
+                label
+            }).collect()
+        }).collect();
+        self.popup.set_sections(labels);
+        *self.choices.borrow_mut() = values;
+        if let Some(selected) = selected {
+            self.select_or_first(&selected);
+        }
+    }
+
+    pub fn selected(&self) -> Option<T> {
+        self.choices.borrow().get(self.popup.selected()?).cloned()
+    }
+
+    pub fn set_selected(&self, value: Option<&T>) {
+        if let Some(index) = value.and_then(|value| self.index(value)) {
+            self.popup.set_selected(index);
+        } else {
+            self.popup.ns_popup_button().selectItem(None);
+        }
+    }
+
+    pub fn select_or_first(&self, value: &T) {
+        self.popup.set_selected(self.index(value).unwrap_or(0));
+    }
+
+    pub fn set_badge(&self, value: &T, label: Option<&str>) {
+        if let Some(index) = self.index(value) {
+            self.popup.set_item_badge(index, label);
+        }
+    }
+
+    fn index(&self, value: &T) -> Option<usize> {
+        self.choices.borrow().iter().position(|choice| choice == value)
+    }
+}
+
+impl<T: 'static> NativeView for ChoicePopup<T> {
+    fn ns_view(&self) -> &NSView { self.popup.ns_view() }
+}
+
+/// A choice that follows a contextual value until the user selects an override.
+pub struct FollowingPopup<T> {
+    content: crate::layout::VStack,
+    popup: Rc<Popup>,
+    caption: Rc<crate::text::Caption>,
+    choices: Rc<[(&'static str, T)]>,
+    badge: &'static str,
+    describe: fn(&str) -> String,
+}
+
+impl<T: Clone + PartialEq + 'static> FollowingPopup<T> {
+    pub fn new(
+        ui: &Ui,
+        title: &str,
+        (source, badge, describe): (&'static str, &'static str, fn(&str) -> String),
+        choices: Vec<(&'static str, T)>,
+        mut change: impl FnMut(Option<T>) + 'static,
+    ) -> Self {
+        use crate::layout::{HStack, Spacer, VStack};
+        use crate::text::Caption;
+
+        let choices: Rc<[_]> = choices.into();
+        let values = choices.clone();
+        let popup = Rc::new(
+            Popup::new(ui)
+                .sections([vec![source], choices.iter().map(|(label, _)| *label).collect()])
+                .on_change(move |index| {
+                    change(index.checked_sub(1).and_then(|index| values.get(index)).map(|(_, value)| value.clone()));
+                }),
+        );
+        popup.accessibility_label(title);
+        let caption = Rc::new(Caption::new(ui, ""));
+        caption.ns_text_field().setAlignment(NSTextAlignment::Right);
+        let content = VStack::new(ui)
+            .spacing(3.0)
+            .push(HStack::new(ui).push(Spacer::new(ui)).push(popup.clone()))
+            .push(caption.clone());
+        Self { content, popup, caption, choices, badge, describe }
+    }
+
+    pub fn set_values(&self, current: Option<&T>, followed: &T) {
+        let position = |value: &T| self.choices.iter().position(|(_, choice)| choice == value);
+        let default = position(followed);
+        for index in 0..self.choices.len() {
+            self.popup.set_item_badge(index + 1, (default == Some(index)).then_some(self.badge));
+        }
+        self.popup.set_selected(current.and_then(position).map_or(0, |index| index + 1));
+        let label = default.map_or("", |index| self.choices[index].0);
+        self.caption.set_text(&(self.describe)(label));
+        self.caption.set_hidden(current.is_some());
+    }
+
+    pub fn popup_view(&self) -> &NSView { self.popup.ns_view() }
+}
+
+impl<T: 'static> NativeView for FollowingPopup<T> {
+    fn ns_view(&self) -> &NSView { self.content.ns_view() }
+}

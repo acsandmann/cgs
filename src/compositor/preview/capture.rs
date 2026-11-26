@@ -121,10 +121,10 @@ define_class!(
     unsafe impl SCStreamOutput for Output {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         unsafe fn sample(&self, _: &SCStream, sample: &CMSampleBuffer, kind: SCStreamOutputType) {
-            let callback_start = Instant::now();
             if kind != SCStreamOutputType::Screen {
                 return;
             }
+            let callback_start = Instant::now();
             // SCK's sample attachments are a CFArray of CFDictionary. Status is
             // an NSNumber; absent/unknown metadata is never treated as a frame.
             let status = unsafe {
@@ -1740,15 +1740,10 @@ impl Captures {
         s.process_streams = LIVE_STREAMS.load(Ordering::Acquire);
         s.captured_frames += self.retired.0;
         s.replaced_frames += self.retired.1;
-        s.streams = self
-            .slots
-            .iter()
-            .filter(|s| {
-                s.control.is_some() && s.mailbox.lock().unwrap().lifecycle != Lifecycle::Stopped
-            })
-            .count();
+        s.streams = 0;
         for slot in &self.slots {
             let m = slot.mailbox.lock().unwrap();
+            s.streams += usize::from(slot.control.is_some() && m.lifecycle != Lifecycle::Stopped);
             s.captured_frames += m.sequence;
             s.replaced_frames += m.replaced;
             s.latest_frame_bytes += slot.frame.as_ref().map_or(0, |f| f.bytes);

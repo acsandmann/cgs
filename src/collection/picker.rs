@@ -19,23 +19,36 @@ pub struct PickerItem<T> {
 #[derive(Clone)]
 enum PickerRow<T> {
     Group(String),
-    Item(PickerItem<T>),
+    Item(Rc<PickerItem<T>>),
 }
-fn picker_rows<T: Clone>(items: &[PickerItem<T>], query: &str) -> Vec<PickerRow<T>> {
+struct SearchItem<T> {
+    item: Rc<PickerItem<T>>,
+    normalized_title: String,
+}
+
+fn indexed<T>(items: Vec<PickerItem<T>>) -> Vec<SearchItem<T>> {
+    items.into_iter().map(|item| SearchItem {
+        normalized_title: item.title.to_lowercase(),
+        item: Rc::new(item),
+    }).collect()
+}
+
+fn picker_rows<T>(items: &[SearchItem<T>], query: &str) -> Vec<PickerRow<T>> {
     let query = query.to_lowercase();
-    let mut groups: Vec<(Option<String>, Vec<PickerItem<T>>)> = Vec::new();
-    for item in items.iter().filter(|i| i.title.to_lowercase().contains(&query)) {
-        if let Some((_, items)) = groups.iter_mut().find(|(g, _)| *g == item.group) {
-            items.push(item.clone());
+    let mut groups: Vec<(Option<&str>, Vec<Rc<PickerItem<T>>>)> = Vec::new();
+    for entry in items.iter().filter(|entry| entry.normalized_title.contains(&query)) {
+        let group = entry.item.group.as_deref();
+        if let Some((_, items)) = groups.iter_mut().find(|(key, _)| *key == group) {
+            items.push(entry.item.clone());
         } else {
-            groups.push((item.group.clone(), vec![item.clone()]));
+            groups.push((group, vec![entry.item.clone()]));
         }
     }
     groups
         .into_iter()
         .flat_map(|(group, items)| {
             group
-                .map(PickerRow::Group)
+                .map(|title| PickerRow::Group(title.to_owned()))
                 .into_iter()
                 .chain(items.into_iter().map(PickerRow::Item))
         })
@@ -45,11 +58,11 @@ pub struct SearchablePicker<T: Clone + 'static> {
     stack: VStack,
     search: crate::input::SearchField,
     table: Table<PickerRow<T>>,
-    items: Rc<RefCell<Vec<PickerItem<T>>>>,
+    items: Rc<RefCell<Vec<SearchItem<T>>>>,
 }
 impl<T: Clone + 'static> SearchablePicker<T> {
     pub fn new(ui: &Ui, items: Vec<PickerItem<T>>) -> Self {
-        let items = Rc::new(RefCell::new(items));
+        let items = Rc::new(RefCell::new(indexed(items)));
         let ui_copy = *ui;
         let table = Table::new(ui)
             .column("item", "", 300.0)
@@ -96,7 +109,7 @@ impl<T: Clone + 'static> SearchablePicker<T> {
     }
 
     pub fn set_items(&self, items: Vec<PickerItem<T>>) {
-        *self.items.borrow_mut() = items;
+        *self.items.borrow_mut() = indexed(items);
         self.table.set_rows(picker_rows(&self.items.borrow(), &self.search.get_value()));
     }
 

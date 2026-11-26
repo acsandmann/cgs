@@ -1,4 +1,7 @@
+use std::any::Any;
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -14,20 +17,51 @@ use crate::view::NativeView;
 
 // The native reuse pool owns the Rust content and its action targets, not the datasource.
 // A legacy arbitrary cell factory can replace content; reusable factories configure it in place.
+#[derive(Default)]
+pub(super) struct CellContent {
+    view: RefCell<Option<Box<dyn NativeView>>>,
+    reusable: std::cell::OnceCell<Box<dyn Any>>,
+}
+
 define_class!(
     #[unsafe(super(NSTableCellView))]
     #[thread_kind = MainThreadOnly]
     #[name = "CgUiCollectionCell"]
-    #[ivars = RefCell<Option<Box<dyn NativeView>>>]
-    struct CollectionCell;
+    #[ivars = CellContent]
+    pub(super) struct CollectionCell;
 );
 impl CollectionCell {
     fn new(ui: &Ui) -> Retained<Self> {
         unsafe {
             msg_send![
-                super(Self::alloc(ui.mtm()).set_ivars(RefCell::new(None))),
+                super(Self::alloc(ui.mtm()).set_ivars(CellContent::default())),
                 init
             ]
+        }
+    }
+
+    pub(super) fn dequeue(table: &NSTableView, identifier: &NSString) -> Retained<Self> {
+        unsafe { table.makeViewWithIdentifier_owner(identifier, None) }
+            .and_then(|view| view.downcast::<Self>().ok())
+            .unwrap_or_else(|| {
+                let cell = Self::new(&Ui::new(table.mtm()));
+                cell.setIdentifier(Some(identifier));
+                cell
+            })
+    }
+
+    pub(super) fn configure<C: NativeView>(
+        &self,
+        construct: impl FnOnce() -> C,
+        bind: impl FnOnce(&C),
+    ) {
+        let content = self.ivars().reusable.get_or_init(|| {
+            let view = Rc::new(construct());
+            self.set_content(Box::new(view.clone()));
+            Box::new(view)
+        });
+        if let Some(view) = content.downcast_ref::<Rc<C>>() {
+            bind(view);
         }
     }
 
@@ -36,7 +70,7 @@ impl CollectionCell {
             self.setTextField(None);
             self.setImageView(None);
         }
-        if let Some(old) = self.ivars().borrow_mut().take() {
+        if let Some(old) = self.ivars().view.borrow_mut().take() {
             if unsafe { old.ns_view().superview() }
                 .is_some_and(|parent| std::ptr::eq(&*parent, &***self))
             {
@@ -56,7 +90,7 @@ impl CollectionCell {
             self.setTextField(cell.and_then(|cell| cell.textField()).as_deref());
             self.setImageView(cell.and_then(|cell| cell.imageView()).as_deref());
         }
-        *self.ivars().borrow_mut() = Some(content);
+        *self.ivars().view.borrow_mut() = Some(content);
     }
 }
 
@@ -72,6 +106,7 @@ pub(super) struct Node {
 pub(super) struct CollectionState {
     pub(super) count: Box<dyn Fn() -> usize>,
     pub(super) cell: RefCell<CellFactory>,
+    identifiers: RefCell<HashMap<usize, Retained<NSString>>>,
     pub(super) native_cell: RefCell<Option<NativeCellFactory>>,
     pub(super) selection: RefCell<Option<Selection>>,
     pub(super) selectable: RefCell<Box<dyn Fn(usize) -> bool>>,
@@ -318,6 +353,7 @@ impl CollectionBridge {
         let this = Self::alloc(ui.mtm()).set_ivars(CollectionState {
             count: Box::new(count),
             cell: RefCell::new(Box::new(cell)),
+            identifiers: RefCell::default(),
             native_cell: RefCell::new(None),
             selection: RefCell::new(None),
             selectable: RefCell::new(Box::new(|_| true)),
@@ -347,14 +383,10 @@ impl CollectionBridge {
             if let Some(make_cell) = self.ivars().native_cell.borrow_mut().as_mut() {
                 result = Some(make_cell(table, row, column));
             } else {
-                let identifier = NSString::from_str(&format!("cgs.cell.{column}"));
-                let native = unsafe { table.makeViewWithIdentifier_owner(&identifier, None) }
-                    .and_then(|view| view.downcast::<CollectionCell>().ok())
-                    .unwrap_or_else(|| {
-                        let cell = CollectionCell::new(&Ui::new(table.mtm()));
-                        cell.setIdentifier(Some(&identifier));
-                        cell
-                    });
+                let identifier = self.ivars().identifiers.borrow_mut().entry(column)
+                    .or_insert_with(|| NSString::from_str(&format!("cgs.cell.{column}")))
+                    .clone();
+                let native = CollectionCell::dequeue(table, &identifier);
                 native.set_content((self.ivars().cell.borrow_mut())(row, column));
                 result = Some(native.into_super().into_super());
             }

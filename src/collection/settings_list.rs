@@ -234,8 +234,8 @@ impl<T: 'static> SettingsList<T> {
         });
         let rows = table.rows.clone();
         let opens = open.clone();
+        let identifier = NSString::from_str("cgs.settings-list");
         *table.bridge.ivars().native_cell.borrow_mut() = Some(Box::new(move |table, row, _| {
-            let identifier = NSString::from_str("cgs.settings-list");
             let cell = unsafe { table.makeViewWithIdentifier_owner(&identifier, None) }
                 .and_then(|view| view.downcast::<SettingsListCell>().ok())
                 .unwrap_or_else(|| {

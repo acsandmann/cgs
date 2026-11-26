@@ -4,6 +4,7 @@
 //! the card transforms directly to the live IOSurface layers in one display transaction.
 //! Callers supply window descriptors with an opaque payload, forward semantic commands, decide
 //! what activation means, and call `pump` on each display frame while `animating` is true.
+use std::cell::OnceCell;
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -656,6 +657,8 @@ pub struct WindowSwitcher<T> {
     stage: Stage,
     layout: SwitcherLayout,
     cards: Vec<Card>,
+    card_sizes: Vec<CGSize>,
+    grid_placement: OnceCell<Vec<(CGPoint, f64)>>,
     selected: usize,
     opened: Instant,
     navigated: bool,
@@ -802,6 +805,8 @@ impl<T> WindowSwitcher<T> {
             response: RESPONSE,
             order: Vec::with_capacity(cards.len()),
             next_order: Vec::with_capacity(cards.len()),
+            card_sizes: cards.iter().map(|card| card.size).collect(),
+            grid_placement: OnceCell::new(),
             cards,
             moving: true,
             wallpaper: wallpaper(bounds),
@@ -874,14 +879,16 @@ impl<T> WindowSwitcher<T> {
     fn targets(&self) -> Vec<Pose> {
         let (st, sel) = (self.stage, self.selected);
         let (w, h, u) = (st.size.width, st.size.height, st.unit);
-        let sizes: Vec<_> = self.cards.iter().map(|c| c.size).collect();
         match self.layout {
-            SwitcherLayout::Carousel => carousel(st, &sizes, sel),
-            SwitcherLayout::Stack => stack(st, &sizes, sel),
+            SwitcherLayout::Carousel => carousel(st, &self.card_sizes, sel),
+            SwitcherLayout::Stack => stack(st, &self.card_sizes, sel),
             SwitcherLayout::Grid => {
-                let homes: Vec<_> = self.cards.iter().map(|c| c.home).collect();
-                grid(&homes, rect(0.05 * w, 0.11 * h, 0.9 * w, 0.84 * h), 0.03 * u)
-                    .into_iter()
+                self.grid_placement.get_or_init(|| {
+                    let homes: Vec<_> = self.cards.iter().map(|card| card.home).collect();
+                    grid(&homes, rect(0.05 * w, 0.11 * h, 0.9 * w, 0.84 * h), 0.03 * u)
+                })
+                    .iter()
+                    .copied()
                     .enumerate()
                     // The selection lifts slightly; nothing is dimmed.
                     .map(|(i, (center, scale))| {
@@ -1079,17 +1086,15 @@ impl<T> WindowSwitcher<T> {
 
     fn hit(&self, point: CGPoint) -> Option<usize> {
         let p = CGPoint::new(point.x - self.bounds.origin.x, point.y - self.bounds.origin.y);
-        let mut hits: Vec<_> = self
-            .cards
+        self.cards
             .iter()
             .enumerate()
             .filter_map(|(i, c)| {
                 let pose = Some(c.pose).filter(|p| p.opacity > 0.)?;
                 contains(self.stage.project(&pose, c.size)?, p).then_some((pose.key, i))
             })
-            .collect();
-        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        hits.first().map(|(_, i)| *i)
+            .min_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)))
+            .map(|(_, i)| i)
     }
 
     fn exit(&mut self, commit: bool) {

@@ -46,6 +46,7 @@ pub(super) struct Gpu {
     stats: PreviewStats,
     metrics: Arc<Mutex<super::timing::Metrics>>,
     last_sources: Vec<(u32, u64)>,
+    next_sources: Vec<(u32, u64)>,
     failure: Arc<Mutex<Option<String>>>,
     scheduled: Arc<Mutex<(u64, Option<Presentation>)>>,
     sequence: u64,
@@ -140,6 +141,7 @@ impl Gpu {
             stats: PreviewStats::default(),
             metrics: Arc::default(),
             last_sources: Vec::with_capacity(8),
+            next_sources: Vec::with_capacity(8),
             failure: Arc::default(),
             scheduled: Arc::default(),
             sequence: 0,
@@ -331,13 +333,17 @@ impl Gpu {
         }
         let mut samples = Vec::with_capacity(scene.len());
         let mut capture_time = f64::INFINITY;
+        let mut scene_complete = true;
+        self.next_sources.clear();
         for p in scene {
+            let Some(frame) = captures.frame(p) else {
+                scene_complete &= p.mode == super::CaptureMode::Inactive || !(p.opacity > 0.);
+                continue;
+            };
+            self.next_sources.push((p.window_id, frame.sequence));
             if p.opacity <= 0.0 {
                 continue;
             }
-            let Some(frame) = captures.frame(p) else {
-                continue;
-            };
             let texture = match frame.metal_texture(&self.device) {
                 Ok(texture) => texture,
                 Err(error) => {
@@ -358,16 +364,7 @@ impl Gpu {
             samples.push(frame.sample.clone());
         }
         encoder.endEncoding();
-        self.last_sources.clear();
-        for p in scene {
-            if let Some(f) = captures.frame(p) {
-                self.last_sources.push((p.window_id, f.sequence));
-            }
-        }
-        let scene_complete = scene
-            .iter()
-            .filter(|p| p.mode != super::CaptureMode::Inactive && p.opacity > 0.)
-            .all(|p| captures.frame(p).is_some());
+        std::mem::swap(&mut self.last_sources, &mut self.next_sources);
         let submitted_time = objc2_quartz_core::CACurrentMediaTime();
         let presentation_metrics = self.metrics.clone();
         let epoch = self.scheduled.lock().unwrap().0;

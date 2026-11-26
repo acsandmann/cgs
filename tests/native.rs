@@ -180,19 +180,32 @@ fn numeric_fields_reject_invalid_commits(ui: &Ui) {
     assert_eq!(*optional.borrow(), [Some(7.0)]);
 }
 
-fn tables_materialize_only_the_viewport(ui: &Ui) {
+fn tables_materialize_only_the_viewport(ui: &Ui, reusable: bool) {
     let configured = Rc::new(Cell::new(0));
     let count = configured.clone();
-    let ui_copy = *ui;
-    let table = Rc::new(
-        Table::new(ui)
-            .column("value", "", 300.0)
-            .cells(move |row: &usize, _| {
+    let constructed = Rc::new(Cell::new(0));
+    let built = constructed.clone();
+    let table = Table::new(ui).column("value", "", 300.0);
+    let table = if reusable {
+        table.reusable_cells(
+            |_, _| 0,
+            move |ui, _, _| {
+                built.set(built.get() + 1);
+                Label::new(ui, "")
+            },
+            move |label, row: &usize, _, _| {
                 count.set(count.get() + 1);
-                Box::new(Label::new(&ui_copy, &row.to_string()))
-            })
-            .rows((0..1000).collect()),
-    );
+                label.set_text(&row.to_string());
+            },
+        )
+    } else {
+        let ui_copy = *ui;
+        table.cells(move |row: &usize, _| {
+            count.set(count.get() + 1);
+            Box::new(Label::new(&ui_copy, &row.to_string()))
+        })
+    };
+    let table = Rc::new(table.rows((0..1000).collect()));
     table.ns_table_view().setHeaderView(None);
     table.ns_table_view().setRowHeight(38.0);
     table.ns_table_view().setUsesAutomaticRowHeights(true);
@@ -216,8 +229,15 @@ fn tables_materialize_only_the_viewport(ui: &Ui) {
         find::<NSTextField>(&cell).unwrap().stringValue().to_string(),
         "900"
     );
+    if reusable {
+        assert!(constructed.get() < configured.get(), "scrolling rebinds pooled cell content");
+    }
     table.set_selected(Some(10));
-    table.reconcile_rows((1..1000).collect());
+    if reusable {
+        table.set_keyed_rows((1..1000).collect(), |row| *row);
+    } else {
+        table.reconcile_rows((1..1000).collect());
+    }
     assert_eq!(
         table.selected_row(),
         Some(10),
@@ -228,7 +248,16 @@ fn tables_materialize_only_the_viewport(ui: &Ui) {
         find::<NSTextField>(&cell).unwrap().stringValue().to_string(),
         "1"
     );
-    table.reconcile_rows((0..1000).collect());
+    if reusable {
+        table.set_keyed_rows((0..1000).collect(), |row| *row);
+        let mut moved: Vec<_> = (0..1000).collect();
+        moved.remove(10);
+        moved.insert(5, 10);
+        table.set_keyed_rows(moved, |row| *row);
+        assert_eq!(table.selection(), Some(5));
+    } else {
+        table.reconcile_rows((0..1000).collect());
+    }
     assert_eq!(table.selected_row(), Some(10));
     let cell = table.ns_table_view().viewAtColumn_row_makeIfNecessary(0, 0, true).unwrap();
     assert_eq!(
@@ -1460,6 +1489,16 @@ fn tab_bar_updates_and_releases_native_owners(ui: &Ui) {
             matches!(actions.borrow().as_slice(), [TabBarAction::Select(0)]),
             "reused controls must dispatch the current index after removal"
         );
+        let keyed = |id, title: &str| (id, TabBarItem { title: title.into(), icon: None });
+        bar.set_keyed_tabs(vec![keyed(1, "Same"), keyed(2, "Same")], 1);
+        let mut buttons = Vec::new();
+        controls(&bar.ns_panel().contentView().unwrap(), &mut buttons);
+        let selected = buttons.iter().find(|button| button.isAccessibilitySelected()).unwrap();
+        bar.set_keyed_tabs(vec![keyed(2, "Renamed"), keyed(1, "Same")], 0);
+        assert_eq!(selected.accessibilityLabel().unwrap().to_string(), "Renamed");
+        actions.borrow_mut().clear();
+        action(selected);
+        assert!(matches!(actions.borrow().as_slice(), [TabBarAction::Select(0)]));
         anchor.ns_window().orderWindow_relativeTo(
             objc2_app_kit::NSWindowOrderingMode::Above,
             bar.ns_panel().windowNumber(),
@@ -2183,7 +2222,8 @@ fn main() {
         symbol_segments_name_each_choice(&ui);
         thumbnail_pickers_are_one_radio_group(&ui);
         numeric_fields_reject_invalid_commits(&ui);
-        tables_materialize_only_the_viewport(&ui);
+        tables_materialize_only_the_viewport(&ui, false);
+        tables_materialize_only_the_viewport(&ui, true);
         delegates_and_selection_use_current_data(&ui);
         recording_is_scoped_and_cancellable(&ui);
         local_reordering_uses_final_indices_and_rejects_other_tables(&ui);

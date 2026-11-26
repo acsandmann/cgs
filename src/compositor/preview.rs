@@ -8,6 +8,7 @@ mod session;
 mod timing;
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -238,6 +239,8 @@ impl Transition {
 struct Animation {
     from: Vec<Preview>,
     to: Vec<Preview>,
+    origins: Vec<Option<usize>>,
+    departing: Vec<usize>,
     start: Instant,
     transition: Transition,
     progress: Option<f32>,
@@ -909,21 +912,32 @@ impl PreviewCompositor {
         let from = self.scene.clone();
         validate_scene(destination)?;
         let to = destination.to_vec();
+        let destinations: HashSet<_> = to.iter().map(|p| p.window_id).collect();
+        let mut by_window = HashMap::with_capacity(from.len());
+        for (index, p) in from.iter().enumerate() {
+            by_window.entry((p.window_id, p.process_id)).or_insert(index);
+        }
+        let origins = to.iter().map(|p| by_window.get(&(p.window_id, p.process_id)).copied()).collect();
+        let departing: Vec<_> = from.iter().enumerate()
+            .filter_map(|(index, p)| (!destinations.contains(&p.window_id)).then_some(index))
+            .collect();
         if self.visible && self.owns_captures && self.sources.is_none() {
             // Compatibility scenes capture their transition union. Explicit
             // inventories are independent of animation geometry.
             let mut union = to.clone();
-            for p in &from {
-                if !union.iter().any(|q| q.window_id == p.window_id) {
-                    union.push(p.clone());
-                }
-            }
+            let mut admitted = destinations;
+            union.extend(departing.iter().filter_map(|&index| {
+                let p = &from[index];
+                admitted.insert(p.window_id).then(|| p.clone())
+            }));
             self.captures.borrow_mut().set_scene(&union)?;
         }
         self.revision += 1;
         self.animation = Some(Animation {
             from,
             to,
+            origins,
+            departing,
             start: Instant::now(),
             transition,
             progress: None,
@@ -981,13 +995,10 @@ impl PreviewCompositor {
         a.sampled = Some(t);
         self.revision += 1;
         self.scene.clear();
-        for to in &a.to {
+        for (to, origin) in a.to.iter().zip(&a.origins) {
             let mut p = to.clone();
-            if let Some(from) = a
-                .from
-                .iter()
-                .find(|p| p.window_id == to.window_id && p.process_id == to.process_id)
-            {
+            if let Some(index) = origin {
+                let from = &a.from[*index];
                 let lerp = |a: f64, b: f64| a + (b - a) * t as f64;
                 p.frame = CGRect::new(
                     CGPoint::new(
@@ -1022,12 +1033,10 @@ impl PreviewCompositor {
             }
             self.scene.push(p);
         }
-        for from in &a.from {
-            if !a.to.iter().any(|p| p.window_id == from.window_id) {
-                let mut p = from.clone();
-                p.opacity *= 1. - t;
-                self.scene.push(p);
-            }
+        for &index in &a.departing {
+            let mut p = a.from[index].clone();
+            p.opacity *= 1. - t;
+            self.scene.push(p);
         }
         self.dirty = true;
         if t >= 1.0 {
